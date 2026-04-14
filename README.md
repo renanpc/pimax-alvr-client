@@ -176,3 +176,9 @@ adb shell cat /sdcard/Android/data/com.pimax.alvr.client/files/PimaxALVR/client.
 2. Note the IP shown in ALVR dashboard
 3. Enter IP in browser UI at http://192.168.x.x:7878/
 4. Click "Connect"
+
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](./LICENSE) file for details.
+
+Some builds, integrations, or features may depend on third-party SDKs, drivers, or platform components that are licensed separately. Those components remain subject to their own respective license terms.
