@@ -37,7 +37,7 @@ A native Rust client for the Pimax Crystal OG standalone headset, implementing t
 
 | Parameter | Range | Description |
 |-----------|-------|-------------|
-| `convergence_shift_ndc` | 0.0 - 0.5 | Pre-shift to cancel Pimax warp (~0.248 default) |
+| `convergence_shift_ndc` | 0.0 - 0.5 | Pre-shift to cancel Pimax warp (~0.124 default) |
 | `ipd_scale` | 0.0 - 2.0 | ALVR stereo strength (1.0 = full physical IPD) |
 | `color_black_crush` | 0.0 - 0.3 | BT.709 black level (0.072 default) |
 | `color_gain` | 0.5 - 2.0 | BT.709 contrast gain (1.22 default) |
@@ -89,7 +89,7 @@ Two-Pass Blit Shader
 Pimax Compositor (sxrSubmitFrame)
 - Lens distortion
 - Chromatic aberration
-- Divergent warp (~0.248 NDC)
+- Divergent warp (~0.124 NDC)
      │
      ▼
 Display (Pimax Crystal lenses)
@@ -135,7 +135,7 @@ adb logcat -v time | findstr PimaxALVR
   "discovery_port": 9943,
   "stream_port": 9944,
   "last_server_ip": "192.168.1.100",
-  "convergence_shift_ndc": 0.248,
+  "convergence_shift_ndc": 0.124,
   "ipd_scale": 1.0,
   "color_black_crush": 0.072,
   "color_gain": 1.22
