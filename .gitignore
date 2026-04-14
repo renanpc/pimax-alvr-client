@@ -1,0 +1,33 @@
+# Rust build artifacts
+/target/
+Cargo.lock
+
+# Temporary files
+.tmp/
+tmp_apks/
+apk_extract/
+jadx_output/
+
+# APK artifacts
+*.apk
+*.idsig
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Build artifacts
+/android/runtime-libs/
+
+
+**__pycache__/

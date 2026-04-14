@@ -1,0 +1,6 @@
+openvr
+PyOpenGL
+PyOpenGL_accelerate
+Pillow
+glfw
+numpy
