@@ -179,6 +179,6 @@ adb shell cat /sdcard/Android/data/com.pimax.alvr.client/files/PimaxALVR/client.
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](./LICENSE) file for details.
+This project is licensed under the MIT License. See the [LICENSE](./LICENSE.md) file for details.
 
 Some builds, integrations, or features may depend on third-party SDKs, drivers, or platform components that are licensed separately. Those components remain subject to their own respective license terms.
