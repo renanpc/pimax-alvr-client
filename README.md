@@ -14,7 +14,7 @@ A native Rust client for the Pimax Crystal OG standalone headset, implementing t
 | **UDP Video Stream** | ✅ | Port 9944 - packet sharding and reassembly |
 | **H.264 Codec** | ✅ | Hardware decoding via Android MediaCodec |
 | **H.265/HEVC Codec** | ✅ | Hardware decoding via Android MediaCodec |
-| **AV1 Codec** | ✅ | Hardware decoding via Android MediaCodec |
+| **AV1 Codec** | ❌ | Codec enum defined but `encoder_av1: false` advertised; server never sends AV1 |
 | **Head Tracking** | ✅ | Send pose updates to server at 90Hz+ |
 | **Stereo Rendering** | ✅ | Left/right eye texture submission |
 | **Foveated Encoding** | ✅ | Receive and un-distort foveated video streams |
@@ -48,8 +48,8 @@ A native Rust client for the Pimax Crystal OG standalone headset, implementing t
 |---------|--------|-------------|
 | **Pimax XR Runtime** | ✅ | Enter VR mode via PxrApi |
 | **Head Tracking** | ✅ | Receive poses from PxrServiceApi |
-| **Proximity Sensor** | ✅ | Detect headset on/off face |
-| **Screen State** | ✅ | Respond to screen on/off events |
+| **Proximity Sensor** | ⚠️ | Callback wired up but log-only; no functional response |
+| **Screen State** | ⚠️ | Callback wired up but log-only; screen-off shutdown disabled for development |
 | **IPD Sync** | ✅ | Receive IPD from Pimax hardware |
 | **EGL Context** | ✅ | Headset-backed context for rendering |
 | **Texture Submission** | ✅ | Submit layers to Pimax compositor |

@@ -25,7 +25,7 @@
 //!      │                                  │
 //!      │───── Discovery Response ────────►│  "ALVR...<hostname>"
 //!      │                                  │
-//!      │◄──── TCP Connect ────────────────│  Port 9944 (control)
+//!      │◄──── TCP Connect ────────────────│  Port 9943 (control)
 //!      │     (server initiates!)          │
 //!      │                                  │
 //!      │───── Handshake ─────────────────►│  Client info, capabilities
