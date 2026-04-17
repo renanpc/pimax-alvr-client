@@ -227,6 +227,62 @@ pub extern "system" fn Java_com_pimax_alvr_client_VrRenderActivity_nativeNotifyS
     info!("Pimax screen state changed: on={}", is_screen_on != 0);
 }
 
+fn jhand_to_controller_hand(hand: jni::sys::jint) -> Option<crate::controller::Hand> {
+    match hand {
+        0 => Some(crate::controller::Hand::Left),
+        1 => Some(crate::controller::Hand::Right),
+        other => {
+            warn!("ignoring controller JNI call with invalid hand index {other}");
+            None
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_pimax_alvr_client_VrRenderActivity_nativeNotifyControllerState(
+    _env: jni::JNIEnv<'_>,
+    _class: JClass<'_>,
+    hand: jni::sys::jint,
+    handle: jni::sys::jint,
+    buttons_pressed: jni::sys::jint,
+    buttons_touched: jni::sys::jint,
+    trigger: jni::sys::jfloat,
+    grip: jni::sys::jfloat,
+    thumbstick_x: jni::sys::jfloat,
+    thumbstick_y: jni::sys::jfloat,
+    battery: jni::sys::jint,
+) {
+    let Some(hand) = jhand_to_controller_hand(hand) else {
+        return;
+    };
+    let state = crate::controller::SingleControllerState {
+        connected: true,
+        handle,
+        buttons_pressed: buttons_pressed as u32,
+        buttons_touched: buttons_touched as u32,
+        trigger,
+        grip,
+        thumbstick_x,
+        thumbstick_y,
+        battery_percent: battery.clamp(0, 100) as u8,
+        last_updated: std::time::Instant::now(),
+    };
+    crate::controller::update_controller_state(hand, state);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_pimax_alvr_client_VrRenderActivity_nativeNotifyControllerConnection(
+    _env: jni::JNIEnv<'_>,
+    _class: JClass<'_>,
+    hand: jni::sys::jint,
+    connected: jni::sys::jboolean,
+) {
+    let Some(hand) = jhand_to_controller_hand(hand) else {
+        return;
+    };
+    crate::controller::update_controller_connection(hand, connected != 0);
+}
+
 // Signal handler setup (platform-specific)
 #[cfg(target_os = "android")]
 extern "C" fn signal_handler(_sig: i32) {
