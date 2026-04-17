@@ -31,3 +31,8 @@ jadx_output/
 
 
 **__pycache__/
+# Added by code-review-graph
+.code-review-graph/
+.claude/
+.mcp.json
+tools/vr-diagnostic-tool/

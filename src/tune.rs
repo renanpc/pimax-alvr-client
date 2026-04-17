@@ -202,7 +202,7 @@ pub fn init(
     // Load server IP from config
     let initial_server_ip = config.as_ref()
         .and_then(|c| c.last_server_ip.clone())
-        .unwrap_or_else(|| String::from("192.168.1.100"));
+        .unwrap_or_else(|| String::from("192.168.8.102"));
     *SERVER_IP.lock().unwrap() = initial_server_ip;
     *SERVER_STATUS.lock().unwrap() = String::from("Not connected - configure below");
 
