@@ -1775,16 +1775,16 @@ impl Default for Fov {
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Default, Debug)]
-struct Pose {
-    orientation: glam::Quat,
-    position: glam::Vec3,
+pub(crate) struct Pose {
+    pub orientation: glam::Quat,
+    pub position: glam::Vec3,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Default, Debug)]
-struct DeviceMotion {
-    pose: Pose,
-    linear_velocity: glam::Vec3,
-    angular_velocity: glam::Vec3,
+pub(crate) struct DeviceMotion {
+    pub pose: Pose,
+    pub linear_velocity: glam::Vec3,
+    pub angular_velocity: glam::Vec3,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -1827,6 +1827,13 @@ fn default_views_config() -> ViewsConfig {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+struct BatteryInfo {
+    device_id: u64,
+    gauge_value: f32,
+    is_plugged: bool,
+}
+
 #[derive(Serialize, Deserialize)]
 enum ClientControlPacket {
     PlayspaceSync(Option<glam::Vec2>),
@@ -1834,6 +1841,9 @@ enum ClientControlPacket {
     KeepAlive,
     StreamReady,
     ViewsConfig(ViewsConfig),
+    Battery(BatteryInfo),
+    VideoErrorReport,
+    Buttons(Vec<crate::controller::ButtonEntry>),
 }
 
 #[cfg(test)]

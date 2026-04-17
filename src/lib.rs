@@ -4,6 +4,7 @@ pub mod android;
 pub mod android_video_decoder;
 pub mod client;
 pub mod config;
+pub mod controller;
 #[cfg(target_os = "android")]
 pub mod tune;
 #[cfg(target_os = "android")]
