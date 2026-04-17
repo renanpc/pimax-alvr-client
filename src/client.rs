@@ -196,6 +196,9 @@ const ALVR_STATISTICS_STREAM_ID: u16 = 4;
 const ALVR_STREAM_LOG_EVERY: u64 = 3_600;
 const ALVR_INITIAL_IDR_REQUESTS: u32 = 5;
 const ALVR_TRACKING_SEND_INTERVAL: Duration = Duration::from_micros(13_889);
+// 30 Hz button send rate. Higher than typical OpenXR sample rate but well
+// below the 90 Hz tracking rate to avoid flooding the control TCP socket.
+const ALVR_BUTTONS_SEND_INTERVAL: Duration = Duration::from_millis(33);
 const ALVR_DEFAULT_FRAME_INTERVAL: Duration = Duration::from_micros(13_889);
 const ALVR_STATISTICS_HISTORY_SIZE: usize = 512;
 const ALVR_DEFAULT_IPD_M: f32 = 0.064;
@@ -1218,19 +1221,27 @@ fn send_minimal_tracking_stream(socket: StdUdpSocket, max_packet_size: usize) {
             timestamp: fallback_timestamp,
         });
         let timestamp = head_pose.timestamp;
+        let mut device_motions = Vec::with_capacity(3);
+        device_motions.push((
+            head_id,
+            DeviceMotion {
+                pose: Pose {
+                    orientation: head_pose.orientation,
+                    position: head_pose.position,
+                },
+                linear_velocity: glam::Vec3::ZERO,
+                angular_velocity: glam::Vec3::ZERO,
+            },
+        ));
+
+        let controller_snapshot = crate::controller::latest_controller_state();
+        device_motions.extend(crate::controller::build_controller_device_motions(
+            &controller_snapshot,
+        ));
+
         let tracking = Tracking {
             target_timestamp: timestamp,
-            device_motions: vec![(
-                head_id,
-                DeviceMotion {
-                    pose: Pose {
-                        orientation: head_pose.orientation,
-                        position: head_pose.position,
-                    },
-                    linear_velocity: glam::Vec3::ZERO,
-                    angular_velocity: glam::Vec3::ZERO,
-                },
-            )],
+            device_motions,
             hand_skeletons: [None, None],
             face_data: FaceData::default(),
         };
@@ -1320,9 +1331,11 @@ fn send_alvr_stream_header_packet<H: Serialize>(
 fn maintain_alvr_control_socket(writer: SharedControlWriter) {
     let mut next_keepalive = Instant::now();
     let mut next_idr_request = Instant::now();
+    let mut next_buttons_send = Instant::now();
     let mut idr_requests_sent = 0_u32;
     let mut last_views_config_version = latest_alvr_views_config().map(|state| state.version);
     let mut keepalives_sent = 0_u64;
+    let mut buttons_sent = 0_u64;
 
     loop {
         let now = Instant::now();
@@ -1370,6 +1383,27 @@ fn maintain_alvr_control_socket(writer: SharedControlWriter) {
                 idr_requests_sent, ALVR_INITIAL_IDR_REQUESTS
             );
             next_idr_request = now + ALVR_IDR_REQUEST_INTERVAL;
+        }
+
+        if now >= next_buttons_send {
+            let snapshot = crate::controller::latest_controller_state();
+            let entries = crate::controller::build_button_entries(&snapshot);
+            if !entries.is_empty() {
+                let entry_count = entries.len();
+                if let Err(err) =
+                    send_framed_locked(&writer, &ClientControlPacket::Buttons(entries))
+                {
+                    warn!("ALVR control maintenance thread exiting after Buttons send failure: {err:#}");
+                    break;
+                }
+                buttons_sent = buttons_sent.wrapping_add(1);
+                if buttons_sent <= 5 || buttons_sent % ALVR_STREAM_LOG_EVERY == 0 {
+                    info!(
+                        "sent ALVR Buttons packet: count={buttons_sent} entries={entry_count}"
+                    );
+                }
+            }
+            next_buttons_send = now + ALVR_BUTTONS_SEND_INTERVAL;
         }
 
         thread::sleep(Duration::from_millis(25));
