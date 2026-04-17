@@ -17,7 +17,13 @@ import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
 import android.util.Log;
+import android.view.InputDevice;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileReader;
+import java.io.IOException;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
@@ -323,6 +329,34 @@ public final class VrRenderActivity extends NativeActivity {
      */
     private static native void nativeNotifyScreen(boolean isScreenOn);
 
+    /**
+     * Pushes a controller state snapshot to the native layer.
+     *
+     * @param hand 0 = left, 1 = right
+     * @param handle opaque handle (currently unused, reserved for shared-mem path)
+     * @param buttonsPressed bitmask — see {@code controller.rs} for bit layout
+     * @param buttonsTouched bitmask of capacitive touches (0 if hardware lacks support)
+     * @param trigger analog trigger value [0.0, 1.0]
+     * @param grip analog grip value [0.0, 1.0]
+     * @param thumbstickX thumbstick X axis [-1.0, 1.0]
+     * @param thumbstickY thumbstick Y axis [-1.0, 1.0]
+     * @param battery battery percentage [0, 100]
+     */
+    private static native void nativeNotifyControllerState(
+            int hand, int handle,
+            int buttonsPressed, int buttonsTouched,
+            float trigger, float grip,
+            float thumbstickX, float thumbstickY,
+            int battery);
+
+    /**
+     * Notifies the native layer that a controller has connected or disconnected.
+     *
+     * @param hand 0 = left, 1 = right
+     * @param connected true on connect, false on disconnect
+     */
+    private static native void nativeNotifyControllerConnection(int hand, boolean connected);
+
     // =========================================================================================
     // Activity lifecycle
     // =========================================================================================
@@ -359,6 +393,7 @@ public final class VrRenderActivity extends NativeActivity {
         nativeNotifyScreen(true);
         registerPimaxHardwareBridge();
         registerProximitySensor();
+        startControllerPoller();
     }
 
     /**
@@ -395,6 +430,7 @@ public final class VrRenderActivity extends NativeActivity {
         nativeNotifyScreen(true);
         registerPimaxHardwareBridge();
         registerProximitySensor();
+        startControllerPoller();
     }
 
     /**
@@ -452,6 +488,7 @@ public final class VrRenderActivity extends NativeActivity {
         paused = true;
         // Signal the native render loop to shut down.
         requestNativeShutdown("onDestroy");
+        stopControllerPoller();
         unregisterProximitySensor();
         unregisterPimaxHardwareBridge();
         unregisterScreenReceiver();
@@ -503,7 +540,18 @@ public final class VrRenderActivity extends NativeActivity {
             shutdownAndFinish("key " + keyName);
             return true;
         }
+        if (event != null && handleControllerKeyEvent(event)) {
+            return true;
+        }
         return super.dispatchKeyEvent(event);
+    }
+
+    @Override
+    public boolean dispatchGenericMotionEvent(MotionEvent event) {
+        if (event != null && handleControllerMotionEvent(event)) {
+            return true;
+        }
+        return super.dispatchGenericMotionEvent(event);
     }
 
     /**
@@ -936,6 +984,261 @@ public final class VrRenderActivity extends NativeActivity {
         } finally {
             proximityRegistered = false;
             proximitySensor = null;
+        }
+    }
+
+    // =========================================================================================
+    // Controller polling
+    //
+    // Pimax controllers ("nrfinput_left" / "nrfinput_right") show up as standard Android
+    // InputDevices. Buttons arrive via KeyEvents, analog axes via MotionEvents — both are
+    // captured in dispatch overrides above. The ControllerPoller thread:
+    //   1. Detects connect/disconnect by enumerating InputDevices.
+    //   2. Reads battery from sysfs (paths reverse-engineered from stock Pimax APK).
+    //   3. Pushes a state snapshot to native at 30 Hz.
+    //
+    // Bit-to-button mapping is provisional — diagnostic logs will validate against hardware.
+    // =========================================================================================
+
+    private static final long CONTROLLER_POLL_INTERVAL_MS = 33;
+    private static final String CONTROLLER_DEVICE_NAME_LEFT = "nrfinput_left";
+    private static final String CONTROLLER_DEVICE_NAME_RIGHT = "nrfinput_right";
+    private static final String CONTROLLER_BATTERY_PATH_LEFT =
+            "/sys/class/pimax_controller/controller_left/battery";
+    private static final String CONTROLLER_BATTERY_PATH_RIGHT =
+            "/sys/class/pimax_controller/controller_right/battery";
+
+    private static final int HAND_LEFT = 0;
+    private static final int HAND_RIGHT = 1;
+
+    // Provisional bit layout — kept in lockstep with controller.rs.
+    private static final int BIT_TRIGGER = 1 << 0;
+    private static final int BIT_THUMBSTICK_CLICK = 1 << 1;
+    private static final int BIT_MENU = 1 << 2;
+    private static final int BIT_GRIP = 1 << 3;
+    private static final int BIT_AX = 1 << 4;
+    private static final int BIT_BY = 1 << 5;
+
+    private static final class ControllerState {
+        volatile boolean connected = false;
+        volatile int handle = 0;
+        volatile int buttonsPressed = 0;
+        volatile float trigger = 0f;
+        volatile float grip = 0f;
+        volatile float thumbstickX = 0f;
+        volatile float thumbstickY = 0f;
+        volatile int battery = 0;
+    }
+
+    private final ControllerState leftController = new ControllerState();
+    private final ControllerState rightController = new ControllerState();
+    private volatile Thread controllerPoller = null;
+    private volatile boolean controllerPollerRunning = false;
+    private long controllerLogCounter = 0L;
+
+    private ControllerState controllerStateForDevice(InputDevice device) {
+        if (device == null) {
+            return null;
+        }
+        String name = device.getName();
+        if (CONTROLLER_DEVICE_NAME_LEFT.equals(name)) {
+            return leftController;
+        }
+        if (CONTROLLER_DEVICE_NAME_RIGHT.equals(name)) {
+            return rightController;
+        }
+        return null;
+    }
+
+    private static int mapKeyCodeToBit(int keyCode) {
+        switch (keyCode) {
+            case KeyEvent.KEYCODE_BUTTON_R1:
+            case KeyEvent.KEYCODE_BUTTON_L1:
+                return BIT_TRIGGER;
+            case KeyEvent.KEYCODE_BUTTON_THUMBL:
+            case KeyEvent.KEYCODE_BUTTON_THUMBR:
+                return BIT_THUMBSTICK_CLICK;
+            case KeyEvent.KEYCODE_MENU:
+            case KeyEvent.KEYCODE_BUTTON_START:
+            case KeyEvent.KEYCODE_BUTTON_SELECT:
+                return BIT_MENU;
+            case KeyEvent.KEYCODE_BUTTON_R2:
+            case KeyEvent.KEYCODE_BUTTON_L2:
+                return BIT_GRIP;
+            case KeyEvent.KEYCODE_BUTTON_A:
+            case KeyEvent.KEYCODE_BUTTON_X:
+                return BIT_AX;
+            case KeyEvent.KEYCODE_BUTTON_B:
+            case KeyEvent.KEYCODE_BUTTON_Y:
+                return BIT_BY;
+            default:
+                return 0;
+        }
+    }
+
+    private boolean handleControllerKeyEvent(KeyEvent event) {
+        ControllerState state = controllerStateForDevice(event.getDevice());
+        if (state == null) {
+            return false;
+        }
+        int bit = mapKeyCodeToBit(event.getKeyCode());
+        if (bit == 0) {
+            // Unknown key on a known controller device — log once for discovery.
+            Log.i(TAG, "unmapped controller key: device=" + event.getDevice().getName()
+                    + " keyCode=" + KeyEvent.keyCodeToString(event.getKeyCode()));
+            return false;
+        }
+        if (event.getAction() == KeyEvent.ACTION_DOWN) {
+            state.buttonsPressed |= bit;
+        } else if (event.getAction() == KeyEvent.ACTION_UP) {
+            state.buttonsPressed &= ~bit;
+        }
+        return true;
+    }
+
+    private boolean handleControllerMotionEvent(MotionEvent event) {
+        ControllerState state = controllerStateForDevice(event.getDevice());
+        if (state == null) {
+            return false;
+        }
+        // Standard joystick mapping. May need per-device tuning once hardware is observed.
+        state.thumbstickX = event.getAxisValue(MotionEvent.AXIS_X);
+        state.thumbstickY = event.getAxisValue(MotionEvent.AXIS_Y);
+        float trig = event.getAxisValue(MotionEvent.AXIS_LTRIGGER);
+        if (trig <= 0f) trig = event.getAxisValue(MotionEvent.AXIS_RTRIGGER);
+        if (trig <= 0f) trig = event.getAxisValue(MotionEvent.AXIS_BRAKE);
+        if (trig <= 0f) trig = event.getAxisValue(MotionEvent.AXIS_GAS);
+        state.trigger = trig;
+        return true;
+    }
+
+    private static int readControllerBattery(boolean left) {
+        File file = new File(left ? CONTROLLER_BATTERY_PATH_LEFT : CONTROLLER_BATTERY_PATH_RIGHT);
+        if (!file.exists()) {
+            return 0;
+        }
+        try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
+            String line = reader.readLine();
+            if (line == null) {
+                return 0;
+            }
+            return Integer.parseInt(line.trim());
+        } catch (IOException | NumberFormatException ignored) {
+            return 0;
+        }
+    }
+
+    private void startControllerPoller() {
+        if (controllerPoller != null) {
+            return;
+        }
+        controllerPollerRunning = true;
+        controllerPoller = new Thread(this::runControllerPoller, "ControllerPoller");
+        controllerPoller.setDaemon(true);
+        controllerPoller.start();
+        Log.i(TAG, "started ControllerPoller @ " + CONTROLLER_POLL_INTERVAL_MS + " ms");
+    }
+
+    private void stopControllerPoller() {
+        controllerPollerRunning = false;
+        Thread t = controllerPoller;
+        controllerPoller = null;
+        if (t != null) {
+            t.interrupt();
+            try {
+                t.join(200);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            Log.i(TAG, "stopped ControllerPoller");
+        }
+    }
+
+    private void runControllerPoller() {
+        while (controllerPollerRunning) {
+            try {
+                pollControllersOnce();
+            } catch (Throwable t) {
+                Log.w(TAG, "ControllerPoller iteration failed", t);
+            }
+            try {
+                Thread.sleep(CONTROLLER_POLL_INTERVAL_MS);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+    }
+
+    private void pollControllersOnce() {
+        boolean leftSeen = false;
+        boolean rightSeen = false;
+        int[] deviceIds = InputDevice.getDeviceIds();
+        for (int id : deviceIds) {
+            InputDevice device = InputDevice.getDevice(id);
+            if (device == null) {
+                continue;
+            }
+            String name = device.getName();
+            if (CONTROLLER_DEVICE_NAME_LEFT.equals(name)) {
+                leftSeen = true;
+            } else if (CONTROLLER_DEVICE_NAME_RIGHT.equals(name)) {
+                rightSeen = true;
+            }
+        }
+        updateConnection(leftController, HAND_LEFT, leftSeen);
+        updateConnection(rightController, HAND_RIGHT, rightSeen);
+
+        controllerLogCounter++;
+        boolean shouldLog = controllerLogCounter <= 5 || controllerLogCounter % 300 == 0;
+
+        if (leftController.connected) {
+            leftController.battery = readControllerBattery(true);
+            pushState(HAND_LEFT, leftController, shouldLog);
+        }
+        if (rightController.connected) {
+            rightController.battery = readControllerBattery(false);
+            pushState(HAND_RIGHT, rightController, shouldLog);
+        }
+    }
+
+    private void updateConnection(ControllerState state, int hand, boolean nowConnected) {
+        if (nowConnected == state.connected) {
+            return;
+        }
+        state.connected = nowConnected;
+        if (!nowConnected) {
+            state.buttonsPressed = 0;
+            state.trigger = 0f;
+            state.grip = 0f;
+            state.thumbstickX = 0f;
+            state.thumbstickY = 0f;
+        }
+        Log.i(TAG, "controller " + (hand == HAND_LEFT ? "left" : "right")
+                + " connected=" + nowConnected);
+        try {
+            nativeNotifyControllerConnection(hand, nowConnected);
+        } catch (UnsatisfiedLinkError error) {
+            Log.w(TAG, "nativeNotifyControllerConnection unavailable", error);
+        }
+    }
+
+    private void pushState(int hand, ControllerState state, boolean shouldLog) {
+        if (shouldLog) {
+            Log.i(TAG, "controller state hand=" + hand
+                    + " buttons=0x" + Integer.toHexString(state.buttonsPressed)
+                    + " trigger=" + state.trigger
+                    + " stick=(" + state.thumbstickX + "," + state.thumbstickY + ")"
+                    + " battery=" + state.battery);
+        }
+        try {
+            nativeNotifyControllerState(hand, state.handle,
+                    state.buttonsPressed, 0,
+                    state.trigger, state.grip,
+                    state.thumbstickX, state.thumbstickY,
+                    state.battery);
+        } catch (UnsatisfiedLinkError error) {
+            Log.w(TAG, "nativeNotifyControllerState unavailable", error);
         }
     }
 
