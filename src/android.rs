@@ -115,7 +115,6 @@ use std::{sync::Once, thread, time::Duration};
 use android_logger::Config as AndroidLoggerConfig;
 use anyhow::{Context, Result};
 use log::{error, info, warn, LevelFilter};
-use tokio::runtime::Builder;
 
 use crate::{config, AlvrClient, ClientConfig};
 use crate::tune::set_server_status;
@@ -189,12 +188,6 @@ fn run_inner() -> Result<()> {
         Err(err) => warn!("debug RGBA TCP frame receiver unavailable: {err:#}"),
     }
 
-    let rt = Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("build tokio runtime")?;
-    let client = AlvrClient::new(config.clone());
-
     match crate::client::start_alvr_control_listener(config.clone()) {
         Ok(()) => info!("ALVR control listener ready for server callback"),
         Err(err) => warn!("ALVR control listener unavailable: {err:#}"),
@@ -204,32 +197,30 @@ fn run_inner() -> Result<()> {
     let server_ip = crate::tune::get_server_ip();
     info!("configured server IP: {}", server_ip);
 
-    // Announce to the configured server (directed) and via broadcast
-    for attempt in 0..6 {
-        if let Err(err) = rt.block_on(client.announce()) {
-            warn!("ALVR discovery announcement attempt {attempt} failed: {err:#}");
-        }
-        thread::sleep(Duration::from_millis(500));
+    // Spawn mDNS discovery thread.
+    //
+    // Registers _alvr._tcp.local. via mDNS on first successful call.
+    // The ServiceDaemon re-announces automatically; subsequent loop iterations
+    // are no-ops unless the first registration failed (e.g. WiFi not yet up).
+    {
+        let discovery_config = config.clone();
+        thread::Builder::new()
+            .name("alvr-discovery".to_string())
+            .spawn(move || {
+                let discovery_client = AlvrClient::new(discovery_config);
+                let mut iteration = 0_u64;
+                loop {
+                    if let Err(err) = discovery_client.announce() {
+                        warn!("mDNS announce #{iteration} failed: {err:#}");
+                    }
+                    iteration = iteration.wrapping_add(1);
+                    thread::sleep(Duration::from_secs(5));
+                }
+            })
+            .context("spawn ALVR discovery thread")?;
     }
 
-    // Also try active connection to the configured server
-    if let Ok(ip) = server_ip.parse::<std::net::IpAddr>() {
-        info!("attempting active connection to server at {}", server_ip);
-        match rt.block_on(client.connect(ip)) {
-            Ok(session) => {
-                info!("successfully connected to ALVR server at {}", server_ip);
-                set_server_status("Connected".to_string());
-                // Keep session alive
-                std::mem::forget(session);
-            }
-            Err(err) => {
-                warn!("active connection to {} failed: {err:#}", server_ip);
-                set_server_status(format!("Waiting for server at {}", server_ip));
-            }
-        }
-    } else {
-        set_server_status(format!("Invalid server IP: {}", server_ip));
-    }
+    set_server_status(format!("Waiting for server at {}", server_ip));
 
     info!("entering Pimax runtime probe");
     let probe = crate::pimax::probe();

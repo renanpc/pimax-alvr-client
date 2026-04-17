@@ -126,6 +126,33 @@ use crate::{
     protocol::{hash_string, DiscoveryPacket, ProtocolId},
 };
 
+/// Returns the WiFi IPv4 address by routing a dummy UDP packet.
+fn wifi_ipv4() -> Result<std::net::Ipv4Addr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").context("bind probe socket")?;
+    socket
+        .connect("8.8.8.8:53")
+        .context("connect probe socket")?;
+    match socket.local_addr()?.ip() {
+        IpAddr::V4(ip) => Ok(ip),
+        IpAddr::V6(_) => anyhow::bail!("only IPv4 supported for mDNS"),
+    }
+}
+
+/// Derives the ALVR protocol string from a semver version string.
+/// Stable releases use only the major version ("20").
+/// Pre-releases append the pre-release tag ("20-alpha.1").
+fn alvr_protocol_string(version_string: &str) -> String {
+    semver::Version::parse(version_string)
+        .map(|v| {
+            if v.pre.is_empty() {
+                v.major.to_string()
+            } else {
+                format!("{}-{}", v.major, v.pre)
+            }
+        })
+        .unwrap_or_else(|_| version_string.to_owned())
+}
+
 /// Shared handle to the ALVR control TCP stream.
 ///
 /// Wrapped in Arc<Mutex<>> because:
@@ -659,56 +686,57 @@ impl SessionHandle {
 
 pub struct AlvrClient {
     pub config: ClientConfig,
+    mdns_daemon: std::sync::Mutex<Option<mdns_sd::ServiceDaemon>>,
 }
 
 impl AlvrClient {
     pub fn new(config: ClientConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            mdns_daemon: std::sync::Mutex::new(None),
+        }
     }
 
-    /// Announce this client to an ALVR v20 server.
+    /// Advertise this client via mDNS so an ALVR v20 server can discover and
+    /// connect back on TCP port 9943.
     ///
-    /// ALVR discovery is one-way: the client broadcasts this packet, then the
-    /// server connects back to the client's TCP control listener if it trusts
-    /// the hostname.
-    pub async fn announce(&self) -> Result<()> {
-        let packet = DiscoveryPacket {
-            protocol_id: self.config.protocol_id(),
-            hostname: self.config.client_name.clone(),
-        };
+    /// First call registers the mDNS service; subsequent calls are no-ops
+    /// because the ServiceDaemon re-announces automatically. Retries on the
+    /// next call if the first attempt fails (e.g. WiFi not yet up).
+    pub fn announce(&self) -> Result<()> {
+        let mut guard = self.mdns_daemon.lock().unwrap();
+        if guard.is_some() {
+            return Ok(());
+        }
 
-        let socket = match TokioUdpSocket::bind((Ipv4Addr::UNSPECIFIED, self.config.discovery_port))
-            .await
-        {
-            Ok(socket) => socket,
-            Err(err) => {
-                warn!(
-                    "failed to bind ALVR discovery socket to source port {}; falling back to an ephemeral port: {err:#}",
-                    self.config.discovery_port
-                );
-                TokioUdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-                    .await
-                    .context("bind fallback ALVR discovery socket")?
-            }
-        };
-        socket.set_broadcast(true).context("enable broadcast")?;
+        let local_ip = IpAddr::V4(wifi_ipv4().context("get local IPv4 for mDNS")?);
+        let protocol_str = alvr_protocol_string(&self.config.version_string);
 
-        let broadcast = SocketAddr::from((Ipv4Addr::BROADCAST, self.config.discovery_port));
-        socket
-            .send_to(&packet.encode(), broadcast)
-            .await
-            .with_context(|| {
-                format!(
-                    "announce ALVR client {} protocol={} to {broadcast}",
-                    self.config.client_name, packet.protocol_id
-                )
-            })?;
+        let daemon =
+            mdns_sd::ServiceDaemon::new().context("create mDNS ServiceDaemon")?;
+
+        let service_info = mdns_sd::ServiceInfo::new(
+            "_alvr._tcp.local.",
+            &format!("alvr-{}", self.config.client_name),
+            &format!("{}.local.", self.config.client_name),
+            local_ip,
+            self.config.discovery_port,
+            &[
+                ("protocol", protocol_str.as_str()),
+                ("device_id", self.config.client_name.as_str()),
+            ][..],
+        )
+        .context("build mDNS ServiceInfo")?;
+
+        daemon
+            .register(service_info)
+            .context("register mDNS service")?;
+
+        *guard = Some(daemon);
 
         info!(
-            "announced ALVR client {} protocol={} ({}) to {broadcast}",
-            self.config.client_name,
-            packet.protocol_id,
-            packet.protocol_id.as_u64()
+            "mDNS: registered _alvr._tcp.local. hostname={} addr={}:{} protocol={}",
+            self.config.client_name, local_ip, self.config.discovery_port, protocol_str
         );
         Ok(())
     }
@@ -857,9 +885,7 @@ fn handle_alvr_server_control(mut stream: StdTcpStream, config: &ClientConfig) -
         .context("set ALVR control write timeout")?;
 
     info!("ALVR server connected to client control listener from {peer}");
-    let capabilities = encode_video_streaming_capabilities(VideoStreamingCapabilities {
-        // Keep the packed foveated layout enabled; the non-foveated compare run
-        // was visibly blurrier on this headset.
+    let capabilities = VideoStreamingCapabilities {
         default_view_resolution: glam::UVec2::new(2880, 2880),
         supported_refresh_rates: vec![72.0, 90.0],
         microphone_sample_rate: 48_000,
@@ -867,12 +893,14 @@ fn handle_alvr_server_control(mut stream: StdTcpStream, config: &ClientConfig) -
         encoder_high_profile: true,
         encoder_10_bits: false,
         encoder_av1: false,
-        multimodal_protocol: true,
+        multimodal_protocol: false,
         prefer_10bit: false,
         prefer_full_range: true,
         preferred_encoding_gamma: 1.0,
         prefer_hdr: false,
-    })?;
+    };
+    let legacy_caps = encode_video_streaming_capabilities(&capabilities)
+        .context("encode ALVR capabilities to legacy format")?;
 
     send_framed(
         &mut stream,
@@ -880,7 +908,7 @@ fn handle_alvr_server_control(mut stream: StdTcpStream, config: &ClientConfig) -
             client_protocol_id: config.protocol_id().as_u64(),
             display_name: "Pimax Crystal OG ALVR Dev".to_string(),
             server_ip: peer.ip(),
-            streaming_capabilities: Some(capabilities),
+            streaming_capabilities: Some(legacy_caps),
         },
     )
     .context("send ALVR ConnectionAccepted")?;
@@ -1658,28 +1686,16 @@ struct VideoStreamingCapabilities {
 }
 
 fn encode_video_streaming_capabilities(
-    caps: VideoStreamingCapabilities,
+    caps: &VideoStreamingCapabilities,
 ) -> Result<VideoStreamingCapabilitiesLegacy> {
-    let caps_json = serde_json::to_value(&caps).context("encode video capabilities to JSON")?;
-    let mut supported_refresh_rates_plus_extra_data = Vec::new();
-
-    for rate in caps_json["supported_refresh_rates"]
-        .as_array()
-        .context("capabilities refresh rates are not an array")?
-    {
-        supported_refresh_rates_plus_extra_data
-            .push(rate.as_f64().context("refresh rate is not a number")? as f32);
+    let mut packed = caps.supported_refresh_rates.clone();
+    let json = serde_json::to_string(caps).context("encode capabilities JSON")?;
+    for byte in json.as_bytes() {
+        packed.push(-(*byte as f32));
     }
-    for byte in serde_json::to_string(&caps)
-        .context("encode video capabilities JSON string")?
-        .as_bytes()
-    {
-        supported_refresh_rates_plus_extra_data.push(-(*byte as f32));
-    }
-
     Ok(VideoStreamingCapabilitiesLegacy {
         default_view_resolution: caps.default_view_resolution,
-        supported_refresh_rates_plus_extra_data,
+        supported_refresh_rates_plus_extra_data: packed,
         microphone_sample_rate: caps.microphone_sample_rate,
     })
 }
@@ -1834,5 +1850,107 @@ mod tests {
         };
         let text = format!("{streamer:?}");
         assert!(text.contains("pimax"));
+    }
+
+    // Regression: ALVR v20 mDNS protocol TXT record uses the major version only
+    // for stable releases ("20"), and "<major>-<pre>" for prereleases. Anything
+    // else and the server filters us out of discovery.
+    #[test]
+    fn alvr_protocol_string_stable_uses_major_only() {
+        assert_eq!(alvr_protocol_string("20.14.1"), "20");
+        assert_eq!(alvr_protocol_string("21.0.0"), "21");
+    }
+
+    #[test]
+    fn alvr_protocol_string_prerelease_appends_pre_tag() {
+        assert_eq!(alvr_protocol_string("20.14.1-alpha.1"), "20-alpha.1");
+        assert_eq!(alvr_protocol_string("21.0.0-rc.2"), "21-rc.2");
+    }
+
+    #[test]
+    fn alvr_protocol_string_unparseable_falls_back_to_input() {
+        assert_eq!(alvr_protocol_string("not-a-version"), "not-a-version");
+    }
+
+    fn sample_capabilities() -> VideoStreamingCapabilities {
+        VideoStreamingCapabilities {
+            default_view_resolution: glam::UVec2::new(2880, 2880),
+            supported_refresh_rates: vec![72.0, 90.0],
+            microphone_sample_rate: 48_000,
+            supports_foveated_encoding: true,
+            encoder_high_profile: true,
+            encoder_10_bits: false,
+            encoder_av1: false,
+            multimodal_protocol: false,
+            prefer_10bit: false,
+            prefer_full_range: true,
+            preferred_encoding_gamma: 1.0,
+            prefer_hdr: false,
+        }
+    }
+
+    // Regression: ALVR v20.14.1 server expects the legacy capabilities wire
+    // format — refresh rates followed by JSON bytes packed as negative floats.
+    // Without this trick the server hangs up after ConnectionAccepted with
+    // "read ALVR frame length: failed to fill whole buffer".
+    #[test]
+    fn encode_capabilities_packs_json_as_negative_floats_after_refresh_rates() {
+        let caps = sample_capabilities();
+        let legacy = encode_video_streaming_capabilities(&caps).unwrap();
+
+        let refresh_rate_count = caps.supported_refresh_rates.len();
+        assert_eq!(
+            &legacy.supported_refresh_rates_plus_extra_data[..refresh_rate_count],
+            &caps.supported_refresh_rates[..],
+            "refresh rates must be at the head of the packed vector",
+        );
+
+        let json_bytes: Vec<u8> = legacy.supported_refresh_rates_plus_extra_data
+            [refresh_rate_count..]
+            .iter()
+            .map(|f| {
+                assert!(*f <= 0.0, "JSON byte floats must be non-positive");
+                (-*f) as u8
+            })
+            .collect();
+        let json_str = std::str::from_utf8(&json_bytes).expect("packed JSON is valid UTF-8");
+        let decoded: serde_json::Value = serde_json::from_str(json_str).expect("packed JSON parses");
+
+        // Must use v20.14.1 field names (not the older "foveated_encoding").
+        assert!(decoded.get("supports_foveated_encoding").is_some());
+        assert!(decoded.get("multimodal_protocol").is_some());
+        assert!(decoded.get("prefer_10bit").is_some());
+        assert!(decoded.get("prefer_hdr").is_some());
+        assert_eq!(decoded["supports_foveated_encoding"], true);
+        assert_eq!(decoded["microphone_sample_rate"], 48_000);
+    }
+
+    #[test]
+    fn encode_capabilities_preserves_resolution_and_sample_rate() {
+        let caps = sample_capabilities();
+        let legacy = encode_video_streaming_capabilities(&caps).unwrap();
+        assert_eq!(legacy.default_view_resolution, caps.default_view_resolution);
+        assert_eq!(legacy.microphone_sample_rate, caps.microphone_sample_rate);
+    }
+
+    // Regression: bincode encodes enum variant index as u32 LE. ALVR v20
+    // server matches by ordinal — reorder the variants and the server
+    // mis-decodes every control packet.
+    #[test]
+    fn client_control_packet_variant_indices_match_alvr_v20() {
+        fn variant_index(packet: ClientControlPacket) -> u32 {
+            let bytes = bincode::serialize(&packet).expect("serialize control packet");
+            assert!(bytes.len() >= 4);
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        }
+
+        assert_eq!(variant_index(ClientControlPacket::PlayspaceSync(None)), 0);
+        assert_eq!(variant_index(ClientControlPacket::RequestIdr), 1);
+        assert_eq!(variant_index(ClientControlPacket::KeepAlive), 2);
+        assert_eq!(variant_index(ClientControlPacket::StreamReady), 3);
+        assert_eq!(
+            variant_index(ClientControlPacket::ViewsConfig(default_views_config())),
+            4,
+        );
     }
 }
