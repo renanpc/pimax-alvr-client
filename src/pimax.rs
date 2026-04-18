@@ -156,6 +156,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Whether to run the expensive reflective Pimax SDK introspection during startup.
+///
+/// This is useful while reverse-engineering the controller/input surface, but it can
+/// take long enough to trip the Android launch timeout on some boots. Keep the
+/// default path lightweight so the headset gets a frame up quickly.
+const PIMAX_VERBOSE_STARTUP_INTROSPECTION: bool = false;
+const ENABLE_NATIVE_PIMAX_CONTROLLER_RUNTIME: bool = false;
+
 type EGLDisplay = *mut c_void;
 type EGLConfig = *mut c_void;
 type EGLContext = *mut c_void;
@@ -169,6 +177,11 @@ type EGLClientBuffer = *mut c_void;
 /// activity is paused, stopped, or destroyed.
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Global flag that asks the render loop to reassert Pimax presentation state.
+///
+/// Raised when the headset comes back on-face or the screen reports itself on again.
+static PRESENTATION_REFRESH_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 /// Check if shutdown has been requested
 fn is_shutdown_requested() -> bool {
     SHUTDOWN_REQUESTED.load(Ordering::SeqCst)
@@ -181,6 +194,15 @@ fn reset_shutdown_requested() {
 fn request_shutdown(reason: &str) {
     SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
     log::info!("Pimax shutdown requested: {reason}");
+}
+
+fn request_presentation_refresh(reason: &str) {
+    PRESENTATION_REFRESH_REQUESTED.store(true, Ordering::SeqCst);
+    log::info!("Pimax presentation refresh requested: {reason}");
+}
+
+fn take_presentation_refresh_requested() -> bool {
+    PRESENTATION_REFRESH_REQUESTED.swap(false, Ordering::SeqCst)
 }
 
 #[no_mangle]
@@ -215,7 +237,11 @@ pub extern "system" fn Java_com_pimax_alvr_client_VrRenderActivity_nativeNotifyP
     _class: JClass<'_>,
     is_near: jni::sys::jboolean,
 ) {
-    info!("Pimax proximity state changed: near={}", is_near != 0);
+    let is_near = is_near != 0;
+    info!("Pimax proximity state changed: near={is_near}");
+    if is_near {
+        request_presentation_refresh("proximity near");
+    }
 }
 
 #[no_mangle]
@@ -224,7 +250,11 @@ pub extern "system" fn Java_com_pimax_alvr_client_VrRenderActivity_nativeNotifyS
     _class: JClass<'_>,
     is_screen_on: jni::sys::jboolean,
 ) {
-    info!("Pimax screen state changed: on={}", is_screen_on != 0);
+    let is_screen_on = is_screen_on != 0;
+    info!("Pimax screen state changed: on={is_screen_on}");
+    if is_screen_on {
+        request_presentation_refresh("screen on");
+    }
 }
 
 fn jhand_to_controller_hand(hand: jni::sys::jint) -> Option<crate::controller::Hand> {
@@ -1282,10 +1312,12 @@ fn read_pimax_head_tracking_pose<'local>(
         get_float_field(env, &rotation, "w").context("get Pimax head rotation.w")?,
     );
 
+    // Pimax reports head height with the opposite vertical sign from ALVR.
+    // Without this, SteamVR places the user's eyes below the floor.
+    let position = glam::vec3(raw_position.x, -raw_position.y, raw_position.z);
     // Conjugate the Pimax quaternion so ALVR receives the correct rotation
     // direction. Without this, yaw and pitch are inverted (looking left
     // turns the camera right, looking down turns it up).
-    let position = raw_position;
     let orientation = raw_orientation.conjugate();
 
     if !position.x.is_finite() || !position.y.is_finite() || !position.z.is_finite() {
@@ -2400,6 +2432,24 @@ fn format_pimax_native_state_changes(
     changed_words.join(", ")
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn controller_grip_pose_offset_uses_tuned_pitch_degrees() {
+        let offset =
+            pimax_native_controller_grip_pose_offset_from_degrees(glam::vec3(45.0, 0.0, 0.0));
+        let grip_up = offset * glam::Vec3::Y;
+        let expected_up = glam::vec3(
+            0.0,
+            std::f32::consts::FRAC_1_SQRT_2,
+            std::f32::consts::FRAC_1_SQRT_2,
+        );
+        assert!((grip_up - expected_up).length() < 1.0e-5);
+    }
+}
+
 fn read_pimax_controller_battery(hand: crate::controller::Hand) -> Option<u8> {
     let path = match hand {
         crate::controller::Hand::Left => "/sys/class/pimax_controller/controller_left/battery",
@@ -2472,24 +2522,54 @@ fn map_pimax_native_buttons(
     (pressed, touched)
 }
 
+fn pimax_native_controller_grip_pose_offset_from_degrees(rotation_deg: glam::Vec3) -> glam::Quat {
+    glam::Quat::from_euler(
+        glam::EulerRot::XYZ,
+        rotation_deg.x.to_radians(),
+        rotation_deg.y.to_radians(),
+        rotation_deg.z.to_radians(),
+    )
+    .normalize()
+}
+
+fn pimax_native_controller_grip_pose_offset() -> glam::Quat {
+    // Native sxrControllerGetState's model basis is pitched forward relative
+    // to ALVR/OpenXR grip poses. A full +90 degree axis swap overcorrects on
+    // Crystal OG, so keep the offset live-tunable while calibrating hardware.
+    pimax_native_controller_grip_pose_offset_from_degrees(crate::tune::controller_rotation_deg())
+}
+
+fn convert_pimax_native_controller_motion(
+    parsed: &PimaxNativeControllerParsed,
+) -> crate::client::DeviceMotion {
+    let grip_orientation =
+        (parsed.orientation * pimax_native_controller_grip_pose_offset()).normalize();
+
+    crate::client::DeviceMotion {
+        pose: crate::client::Pose {
+            orientation: grip_orientation,
+            // The native position stream already tracks the user's motion in
+            // the expected up/down direction; do not mirror Y here.
+            position: parsed.position,
+        },
+        linear_velocity: parsed.linear_velocity,
+        angular_velocity: parsed.angular_velocity,
+    }
+}
+
 fn push_pimax_native_controller_state(
     controller: &PimaxNativeControllerHandle,
     parsed: PimaxNativeControllerParsed,
 ) {
     let (buttons_pressed, buttons_touched) = map_pimax_native_buttons(controller.hand, &parsed);
+    let motion = convert_pimax_native_controller_motion(&parsed);
+
     crate::controller::update_controller_state(
         controller.hand,
         crate::controller::SingleControllerState {
             connected: true,
             handle: controller.handle,
-            motion: Some(crate::client::DeviceMotion {
-                pose: crate::client::Pose {
-                    orientation: parsed.orientation,
-                    position: parsed.position,
-                },
-                linear_velocity: parsed.linear_velocity,
-                angular_velocity: parsed.angular_velocity,
-            }),
+            motion: Some(motion),
             buttons_pressed,
             buttons_touched,
             trigger: parsed.trigger,
@@ -4622,25 +4702,70 @@ fn prepare_solid_color_clear_state() {
     }
 }
 
-fn readback_center_pixel(target: &EyeRenderTarget) -> [u8; 4] {
+struct EyeLumaStats {
+    center_pixel: [u8; 4],
+    samples: u32,
+    average_luma: f32,
+    dark_percent: f32,
+    bright_percent: f32,
+}
+
+fn pixel_luma(pixel: [u8; 4]) -> f32 {
+    (0.2126 * pixel[0] as f32) + (0.7152 * pixel[1] as f32) + (0.0722 * pixel[2] as f32)
+}
+
+fn readback_eye_luma_stats(target: &EyeRenderTarget) -> EyeLumaStats {
+    let sample_steps = [1_i32, 3, 5, 7, 9];
     let mut pixel = [0_u8; 4];
+    let mut center_pixel = [0_u8; 4];
+    let mut samples = 0_u32;
+    let mut dark_samples = 0_u32;
+    let mut bright_samples = 0_u32;
+    let mut total_luma = 0.0_f32;
 
     unsafe {
         let previous_framebuffer = current_framebuffer_binding().max(0) as u32;
         glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
-        glReadPixels(
-            (target.width / 2).max(0),
-            (target.height / 2).max(0),
-            1,
-            1,
-            GL_RGBA,
-            GL_UNSIGNED_BYTE,
-            pixel.as_mut_ptr().cast(),
-        );
+
+        for y_step in sample_steps {
+            for x_step in sample_steps {
+                let x = ((target.width.max(1) - 1) * x_step / 10).max(0);
+                let y = ((target.height.max(1) - 1) * y_step / 10).max(0);
+                glReadPixels(
+                    x,
+                    y,
+                    1,
+                    1,
+                    GL_RGBA,
+                    GL_UNSIGNED_BYTE,
+                    pixel.as_mut_ptr().cast(),
+                );
+                if x_step == 5 && y_step == 5 {
+                    center_pixel = pixel;
+                }
+                let luma = pixel_luma(pixel);
+                total_luma += luma;
+                samples += 1;
+                if luma < 8.0 {
+                    dark_samples += 1;
+                }
+                if luma > 32.0 {
+                    bright_samples += 1;
+                }
+            }
+        }
+
         glBindFramebuffer(GL_FRAMEBUFFER, previous_framebuffer);
     }
 
-    pixel
+    let sample_count = samples.max(1) as f32;
+    EyeLumaStats {
+        center_pixel,
+        samples,
+        average_luma: total_luma / sample_count,
+        dark_percent: (dark_samples as f32 * 100.0) / sample_count,
+        bright_percent: (bright_samples as f32 * 100.0) / sample_count,
+    }
 }
 
 fn current_framebuffer_binding() -> i32 {
@@ -4768,6 +4893,121 @@ fn cleanup_pimax_render_session(
             warn!("failed to release display wake lock during cleanup: {err:#}");
         } else {
             info!("released display wake lock during cleanup");
+        }
+    }
+}
+
+fn refresh_pimax_presentation(
+    env: &mut jni::JNIEnv<'_>,
+    context: &JObject<'_>,
+    pvr_service_client: Option<&GlobalRef>,
+    reason: &str,
+) {
+    info!("refreshing Pimax presentation state: {reason}");
+
+    let mut temp_client_connected = false;
+
+    if let Some(client) = pvr_service_client {
+        cycle_pimax_vr_mode_refresh(env, client, "PvrServiceClient");
+    } else {
+        let temp_client = match create_pvr_service_client(env, context) {
+            Ok(client) => Some(client),
+            Err(err) => {
+                warn!(
+                    "failed to create temporary PvrServiceClient for presentation refresh: {err:#}"
+                );
+                None
+            }
+        };
+        if let Some(client) = temp_client.as_ref() {
+            if let Err(err) = connect_pvr_service_client(env, client) {
+                warn!("temporary PvrServiceClient.Connect failed during refresh: {err:#}");
+            } else {
+                temp_client_connected = true;
+                match wait_for_pvr_service_interface(env, client, Duration::from_secs(1)) {
+                    Ok(()) => {
+                        info!("temporary PvrServiceClient connected for presentation refresh")
+                    }
+                    Err(err) => warn!(
+                        "temporary PvrServiceClient did not connect cleanly during refresh: {err:#}"
+                    ),
+                }
+                cycle_pimax_vr_mode_refresh(env, client, "temporary PvrServiceClient");
+            }
+        }
+        match call_static_int(
+            env,
+            "com/pimax/vrservice/PxrServiceApi",
+            "SetDisplayInterruptCapture",
+            "(II)I",
+            &[JValue::Int(0), JValue::Int(1)],
+        ) {
+            Ok(result) => info!("PxrServiceApi.SetDisplayInterruptCapture(VSYNC, 1) -> {result}"),
+            Err(err) => warn!("PxrServiceApi.SetDisplayInterruptCapture(VSYNC, 1) failed: {err:#}"),
+        }
+
+        if temp_client_connected {
+            if let Some(client) = temp_client.as_ref() {
+                if let Err(err) = disconnect_pvr_service_client(env, client) {
+                    warn!("temporary PvrServiceClient.Disconnect failed after refresh: {err:#}");
+                } else {
+                    info!("temporary PvrServiceClient disconnected after presentation refresh");
+                }
+            }
+        }
+    }
+
+    if let Err(err) = call_static_void(
+        env,
+        "com/pimax/pxrapi/PxrApi",
+        "enablePresentation",
+        "(Landroid/content/Context;Z)V",
+        &[JValue::Object(context), JValue::Bool(1)],
+    ) {
+        warn!("PxrApi.enablePresentation(true) failed while refreshing presentation: {err:#}");
+    } else {
+        info!("PxrApi.enablePresentation(true) requested while refreshing presentation");
+    }
+
+    if let Err(err) = call_static_void(
+        env,
+        "com/pimax/pxrapi/PxrApi",
+        "startVsync",
+        "(Landroid/content/Context;)V",
+        &[JValue::Object(context)],
+    ) {
+        warn!("PxrApi.startVsync failed while refreshing presentation: {err:#}");
+    } else {
+        info!("PxrApi.startVsync requested while refreshing presentation");
+    }
+}
+
+fn cycle_pimax_vr_mode_refresh(env: &mut jni::JNIEnv<'_>, client: &GlobalRef, client_label: &str) {
+    match pvr_service_set_display_interrupt_capture(env, client, 0, 1) {
+        Ok(result) => info!("{client_label}.SetDisplayInterruptCapture(VSYNC, 1) -> {result}"),
+        Err(err) => warn!("{client_label}.SetDisplayInterruptCapture(VSYNC, 1) failed: {err:#}"),
+    }
+    match pvr_service_stop_vr_mode(env, client) {
+        Ok(result) => info!("{client_label}.StopVRMode() during refresh -> {result}"),
+        Err(err) => warn!("{client_label}.StopVRMode() during refresh failed: {err:#}"),
+    }
+    thread::sleep(Duration::from_millis(50));
+    match pvr_service_start_vr_mode(env, client) {
+        Ok(()) => info!("{client_label}.StartVRMode() during refresh succeeded"),
+        Err(err) => {
+            warn!("{client_label}.StartVRMode() during refresh failed (will try resume): {err:#}");
+            match pvr_service_resume_vr_mode(env, client) {
+                Ok(result) => info!("{client_label}.ResumeVRMode() during refresh -> {result}"),
+                Err(err) => warn!("{client_label}.ResumeVRMode() during refresh failed: {err:#}"),
+            }
+        }
+    }
+    for ui_type in ["vr_first_frame_ready", "6dofWarning_low_quality"] {
+        match pvr_service_hide_system_ui(env, client, ui_type) {
+            Ok(()) => info!("{client_label}.HideSystemUI({ui_type}) during refresh"),
+            Err(err) => {
+                warn!("{client_label}.HideSystemUI({ui_type}) during refresh failed: {err:#}")
+            }
         }
     }
 }
@@ -5391,12 +5631,17 @@ fn try_begin_and_submit_frame<'local>(
     if !render_window_surface_mirror_enabled {
         info!("NativeActivity surface mirror disabled for VR texture submission run");
     }
-    let mut native_controller_runtime = match start_pimax_native_controller_runtime() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            warn!("native Pimax controller runtime unavailable: {err:#}");
-            None
+    let mut native_controller_runtime = if ENABLE_NATIVE_PIMAX_CONTROLLER_RUNTIME {
+        match start_pimax_native_controller_runtime() {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                warn!("native Pimax controller runtime unavailable: {err:#}");
+                None
+            }
         }
+    } else {
+        info!("native Pimax controller runtime disabled; using Java/Binder controller runtime");
+        None
     };
     let mut controller_runtime = if native_controller_runtime.is_some() {
         info!("skipping Java/Binder controller runtime because native pxrapi controller runtime is active");
@@ -5414,6 +5659,11 @@ fn try_begin_and_submit_frame<'local>(
         if is_shutdown_requested() {
             info!("Pimax render loop exiting after shutdown request at frame {frame_index}");
             break;
+        }
+        if take_presentation_refresh_requested() {
+            let controller_client = controller_runtime.as_ref().map(|runtime| &runtime.client);
+            let presentation_client = controller_client.or(pvr_service_client);
+            refresh_pimax_presentation(env, context, presentation_client, "near-face wake");
         }
 
         let frame_start = Instant::now();
@@ -5774,16 +6024,23 @@ fn try_begin_and_submit_frame<'local>(
             let phase_start = Instant::now();
             let framebuffer = current_framebuffer_binding();
             let gl_error = current_gl_error();
-            let left_pixel = readback_center_pixel(&current_buffers.left);
-            let right_pixel = readback_center_pixel(&current_buffers.right);
+            let left_stats = readback_eye_luma_stats(&current_buffers.left);
+            let right_stats = readback_eye_luma_stats(&current_buffers.right);
             readback_ms = duration_ms(phase_start.elapsed());
             info!(
-                "Pimax texture frame submitted: frame_index={frame_index} predicted_time={predicted_time:.3} fb={} left_tex={} right_tex={} left_pixel={:?} right_pixel={:?} gl_error=0x{gl_error:04x}",
+                "Pimax texture frame submitted: frame_index={frame_index} predicted_time={predicted_time:.3} fb={} left_tex={} right_tex={} left_pixel={:?} right_pixel={:?} left_luma_avg={:.1} left_dark_pct={:.1} left_bright_pct={:.1} right_luma_avg={:.1} right_dark_pct={:.1} right_bright_pct={:.1} samples={} gl_error=0x{gl_error:04x}",
                 framebuffer,
                 current_buffers.left.texture,
                 current_buffers.right.texture,
-                left_pixel,
-                right_pixel
+                left_stats.center_pixel,
+                right_stats.center_pixel,
+                left_stats.average_luma,
+                left_stats.dark_percent,
+                left_stats.bright_percent,
+                right_stats.average_luma,
+                right_stats.dark_percent,
+                right_stats.bright_percent,
+                left_stats.samples.min(right_stats.samples)
             );
         }
         if should_log_frame {
@@ -5888,119 +6145,124 @@ pub fn probe() -> PimaxProbeReport {
     ) {
         warn!("failed to dump matching PxrApi methods: {err:#}");
     }
-    if let Err(err) = dump_matching_methods(
-        &mut env,
-        "com.pimax.pxrapi.PxrApi",
-        &["Image", "Texture", "Vulkan"],
-    ) {
-        warn!("failed to dump image/texture/vulkan PxrApi methods: {err:#}");
-    }
-    if let Err(err) = dump_matching_methods(
-        &mut env,
-        "com.pimax.vrservice.PxrServiceApi",
-        &["DisplayInterrupt", "VRMode", "TrackingMode"],
-    ) {
-        warn!("failed to dump matching PxrServiceApi methods: {err:#}");
-    }
-    let controller_keywords = &[
-        "Controller",
-        "controller",
-        "Input",
-        "input",
-        "Button",
-        "button",
-        "Key",
-        "key",
-        "Trigger",
-        "trigger",
-        "Grip",
-        "grip",
-        "Joystick",
-        "joystick",
-        "Thumb",
-        "thumb",
-        "Stick",
-        "stick",
-        "Pose",
-        "pose",
-        "Tracking",
-        "tracking",
-        "Query",
-        "query",
-        "State",
-        "state",
-        "Haptic",
-        "haptic",
-        "Vibrator",
-        "vibrator",
-    ];
-    info!("probing Pimax controller/input SDK surface");
-    for class_name in [
-        "com.pimax.pxrapi.PxrApi",
-        "com.pimax.vrservice.PxrServiceApi",
-        "com.pimax.pxrapi.PvrServiceClient",
-        "com.pimax.vrservice.IPvrServiceInterface",
-    ] {
-        if let Err(err) = dump_matching_methods(&mut env, class_name, controller_keywords) {
-            warn!("failed to dump controller/input methods for {class_name}: {err:#}");
+    let default_controller_service = if PIMAX_VERBOSE_STARTUP_INTROSPECTION {
+        if let Err(err) = dump_matching_methods(
+            &mut env,
+            "com.pimax.pxrapi.PxrApi",
+            &["Image", "Texture", "Vulkan"],
+        ) {
+            warn!("failed to dump image/texture/vulkan PxrApi methods: {err:#}");
         }
-        if let Err(err) = dump_matching_fields(&mut env, class_name, controller_keywords) {
-            warn!("failed to dump controller/input fields for {class_name}: {err:#}");
+        if let Err(err) = dump_matching_methods(
+            &mut env,
+            "com.pimax.vrservice.PxrServiceApi",
+            &["DisplayInterrupt", "VRMode", "TrackingMode"],
+        ) {
+            warn!("failed to dump matching PxrServiceApi methods: {err:#}");
         }
-        if let Err(err) = dump_declared_inner_classes(&mut env, class_name) {
-            warn!("failed to dump inner classes for {class_name}: {err:#}");
+        let controller_keywords = &[
+            "Controller",
+            "controller",
+            "Input",
+            "input",
+            "Button",
+            "button",
+            "Key",
+            "key",
+            "Trigger",
+            "trigger",
+            "Grip",
+            "grip",
+            "Joystick",
+            "joystick",
+            "Thumb",
+            "thumb",
+            "Stick",
+            "stick",
+            "Pose",
+            "pose",
+            "Tracking",
+            "tracking",
+            "Query",
+            "query",
+            "State",
+            "state",
+            "Haptic",
+            "haptic",
+            "Vibrator",
+            "vibrator",
+        ];
+        info!("probing Pimax controller/input SDK surface");
+        for class_name in [
+            "com.pimax.pxrapi.PxrApi",
+            "com.pimax.vrservice.PxrServiceApi",
+            "com.pimax.pxrapi.PvrServiceClient",
+            "com.pimax.vrservice.IPvrServiceInterface",
+        ] {
+            if let Err(err) = dump_matching_methods(&mut env, class_name, controller_keywords) {
+                warn!("failed to dump controller/input methods for {class_name}: {err:#}");
+            }
+            if let Err(err) = dump_matching_fields(&mut env, class_name, controller_keywords) {
+                warn!("failed to dump controller/input fields for {class_name}: {err:#}");
+            }
+            if let Err(err) = dump_declared_inner_classes(&mut env, class_name) {
+                warn!("failed to dump inner classes for {class_name}: {err:#}");
+            }
         }
-    }
-    for class_name in [
-        "com.pimax.pxrapi.controller.ControllerStartInfo",
-        "com.pimax.pxrapi.controller.ControllerFd",
-        "com.pimax.pvrapi.controllers.IControllerInterfaceCallback",
-    ] {
-        if let Err(err) = dump_class_schema(&mut env, class_name) {
-            warn!("failed to dump controller class schema for {class_name}: {err:#}");
+        for class_name in [
+            "com.pimax.pxrapi.controller.ControllerStartInfo",
+            "com.pimax.pxrapi.controller.ControllerFd",
+            "com.pimax.pvrapi.controllers.IControllerInterfaceCallback",
+        ] {
+            if let Err(err) = dump_class_schema(&mut env, class_name) {
+                warn!("failed to dump controller class schema for {class_name}: {err:#}");
+            }
+            if let Err(err) = dump_all_methods(&mut env, class_name) {
+                warn!("failed to dump controller class methods for {class_name}: {err:#}");
+            }
         }
-        if let Err(err) = dump_all_methods(&mut env, class_name) {
-            warn!("failed to dump controller class methods for {class_name}: {err:#}");
+        if let Err(err) = dump_enum_constants(&mut env, "com.pimax.pxrapi.PxrApi$sxrTextureType") {
+            warn!("failed to dump sxrTextureType constants: {err:#}");
         }
-    }
-    let default_controller_service = probe_pvr_controller_defaults(&mut env);
-    if let Err(err) = dump_enum_constants(&mut env, "com.pimax.pxrapi.PxrApi$sxrTextureType") {
-        warn!("failed to dump sxrTextureType constants: {err:#}");
-    }
-    if let Err(err) = dump_matching_fields(
-        &mut env,
-        "com.pimax.pxrapi.PxrApi$sxrRenderLayer",
-        &["image", "buffer", "vulkan", "gl"],
-    ) {
-        warn!("failed to dump matching sxrRenderLayer fields: {err:#}");
-    }
-    if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrRenderLayer") {
-        warn!("failed to dump sxrRenderLayer schema: {err:#}");
-    }
-    if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrDeviceInfo") {
-        warn!("failed to dump sxrDeviceInfo schema: {err:#}");
-    }
-    if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrFrameParams") {
-        warn!("failed to dump sxrFrameParams schema: {err:#}");
-    }
-    if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrHeadPoseState") {
-        warn!("failed to dump sxrHeadPoseState schema: {err:#}");
-    }
-    if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrHeadPose") {
-        warn!("failed to dump sxrHeadPose schema: {err:#}");
-    }
-    if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrVector3") {
-        warn!("failed to dump sxrVector3 schema: {err:#}");
-    }
-    if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrQuaternion") {
-        warn!("failed to dump sxrQuaternion schema: {err:#}");
-    }
-    if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrLayoutCoords") {
-        warn!("failed to dump sxrLayoutCoords schema: {err:#}");
-    }
-    if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrVulkanTexInfo") {
-        warn!("failed to dump sxrVulkanTexInfo schema: {err:#}");
-    }
+        if let Err(err) = dump_matching_fields(
+            &mut env,
+            "com.pimax.pxrapi.PxrApi$sxrRenderLayer",
+            &["image", "buffer", "vulkan", "gl"],
+        ) {
+            warn!("failed to dump matching sxrRenderLayer fields: {err:#}");
+        }
+        if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrRenderLayer") {
+            warn!("failed to dump sxrRenderLayer schema: {err:#}");
+        }
+        if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrDeviceInfo") {
+            warn!("failed to dump sxrDeviceInfo schema: {err:#}");
+        }
+        if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrFrameParams") {
+            warn!("failed to dump sxrFrameParams schema: {err:#}");
+        }
+        if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrHeadPoseState") {
+            warn!("failed to dump sxrHeadPoseState schema: {err:#}");
+        }
+        if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrHeadPose") {
+            warn!("failed to dump sxrHeadPose schema: {err:#}");
+        }
+        if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrVector3") {
+            warn!("failed to dump sxrVector3 schema: {err:#}");
+        }
+        if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrQuaternion") {
+            warn!("failed to dump sxrQuaternion schema: {err:#}");
+        }
+        if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrLayoutCoords") {
+            warn!("failed to dump sxrLayoutCoords schema: {err:#}");
+        }
+        if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrVulkanTexInfo") {
+            warn!("failed to dump sxrVulkanTexInfo schema: {err:#}");
+        }
+        probe_pvr_controller_defaults(&mut env)
+    } else {
+        info!("skipping verbose Pimax startup introspection to keep launch responsive");
+        None
+    };
 
     report.pxr_version = call_static_string(
         &mut env,

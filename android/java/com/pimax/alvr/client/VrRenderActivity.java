@@ -8,8 +8,11 @@ import android.content.IntentFilter;
 import android.os.Build;
 import android.os.Binder;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.Parcel;
 import android.os.PowerManager;
+import android.os.SystemClock;
 import android.os.RemoteException;
 import android.provider.Settings;
 import android.hardware.Sensor;
@@ -93,10 +96,13 @@ public final class VrRenderActivity extends NativeActivity {
     private static final int SYSTEM_UI_VISIBILITY_FLAGS = 5894;
 
     /**
-     * Timeout for the activity wake lock in milliseconds. Default 10 minutes.
-     * A timeout prevents battery drain if the activity becomes orphaned.
+     * Timeout for the activity wake lock in milliseconds. Default 6 hours.
+     *
+     * <p>The render loop is meant to run for long sessions, so a short timeout can
+     * let the display dim or sleep even while streaming is still active. We keep a
+     * large timeout as a safety net and also release explicitly during cleanup.
      */
-    private static final long WAKE_LOCK_TIMEOUT_MS = 10 * 60 * 1000L;
+    private static final long WAKE_LOCK_TIMEOUT_MS = 6 * 60 * 60 * 1000L;
 
     /**
      * Custom broadcast action sent by this activity when it receives a shutdown request
@@ -104,6 +110,9 @@ public final class VrRenderActivity extends NativeActivity {
      * cleanup.
      */
     private static final String ACTION_SHUTDOWN = "com.pimax.alvr.client.ACTION_SHUTDOWN";
+
+    /** Pimax vendor setting used by stock WiFi Airlink's HmdSync while streaming. */
+    private static final String PIMAX_EYECHIP_ON_SETTING = "eyechip_on";
 
     // ---- Pimax hardware bridge constants ---------------------------------------------
 
@@ -126,6 +135,13 @@ public final class VrRenderActivity extends NativeActivity {
      */
     private static final int PMX_EVENT_TYPE_MOTOR_AND_LENS = 3;
 
+    /**
+     * Loading {@code libpxrapi.so} explicitly can stall startup on some headset builds even
+     * though the framework already has a usable copy available. Keep this off unless we need
+     * to force the APK-bundled library for debugging.
+     */
+    private static final boolean LOAD_PXRAPI_EAGERLY = false;
+
     // =========================================================================================
     // Fields
     // =========================================================================================
@@ -138,6 +154,35 @@ public final class VrRenderActivity extends NativeActivity {
     /** Tracks whether {@link #screenReceiver} has been registered to avoid duplicate registration. */
     private boolean screenReceiverRegistered;
 
+    /** Main-thread handler used to retry waking the display when the headset is put back on. */
+    private Handler screenWakeHandler;
+
+    /** True while the proximity sensor reports that the headset is near the face. */
+    private boolean headsetNear;
+
+    /** Latest screen-on/off state that should be forwarded to native when it becomes ready. */
+    private boolean pendingNativeScreenOn = true;
+
+    /** Counts the retries for the current near-face wake sequence. */
+    private int screenWakeRetryCount;
+
+    /** Avoids repeatedly logging vendor setting writes that Android has already denied. */
+    private boolean pimaxEyechipWriteDenied;
+
+    /** Avoids repeatedly logging refresh-rate writes that Android has already denied. */
+    private boolean peakRefreshRateWriteDenied;
+
+    /** Hidden PowerManager.wakeUp requires DEVICE_POWER on this headset build. */
+    private boolean powerWakeUpDenied;
+
+    /** Re-pokes display power until the panel reports itself interactive again. */
+    private final Runnable screenWakeRetryRunnable = new Runnable() {
+        @Override
+        public void run() {
+            retryDisplayWakeIfNeeded();
+        }
+    };
+
     // ---- Activity state ------------------------------------------------------------
 
     /** Set to true when the activity is paused/stopped; guards against resume after destroy. */
@@ -148,6 +193,15 @@ public final class VrRenderActivity extends NativeActivity {
      * refuses to resume (finishes instead) to prevent a stale render loop from running.
      */
     private boolean nativeShutdownRequested;
+
+    /** Guards the async native bootstrap so the activity can reach onCreate quickly. */
+    private final Object nativeBootstrapLock = new Object();
+
+    /** True once the native bootstrap thread has been started. */
+    private volatile boolean nativeBootstrapStarted;
+
+    /** True once both native libraries have loaded successfully. */
+    private volatile boolean nativeLibrariesLoaded;
 
     // ---- Pimax hardware bridge (IPD sync) -----------------------------------------
 
@@ -209,7 +263,16 @@ public final class VrRenderActivity extends NativeActivity {
         public void onSensorChanged(SensorEvent event) {
             // The proximity sensor typically returns 0 (near) or 5+ cm (far) on Pimax devices.
             float distance = event != null && event.values.length > 0 ? event.values[0] : Float.NaN;
-            nativeNotifyProximity(distance < 1.0f);
+            boolean isNear = distance < 1.0f;
+            headsetNear = isNear;
+            if (nativeLibrariesLoaded) {
+                nativeNotifyProximity(isNear);
+            }
+            if (isNear) {
+                runOnUiThread(() -> handleHeadsetNear("proximity near"));
+            } else {
+                runOnUiThread(() -> handleHeadsetFar("proximity far"));
+            }
         }
 
         @Override
@@ -217,33 +280,6 @@ public final class VrRenderActivity extends NativeActivity {
             // Not used — proximity changes are binary (near/far), accuracy is irrelevant.
         }
     };
-
-    // =========================================================================================
-    // Static initialization — load native libraries
-    // =========================================================================================
-
-    /**
-     * Loads the native libraries required for VR rendering.
-     *
-     * <p>Two libraries are loaded in order:
-     * <ol>
-     *   <li>{@code libpxrapi.so} — Pimax XR API (hardware abstraction for the Pimax
-     *       hardware bridge). This may already be loaded by the framework; if not, an
-     *       {@link UnsatisfiedLinkError} is caught and logged, and loading is retried
-     *       using the framework's pre-loaded copy.</li>
-     *   <li>{@code libpimax_alvr_client.so} — the actual ALVR client implementation that
-     *       receives the JNI callbacks from this activity.</li>
-     * </ol>
-     */
-    static {
-        try {
-            System.loadLibrary("pxrapi");
-            Log.i(TAG, "loaded pxrapi");
-        } catch (UnsatisfiedLinkError error) {
-            Log.w(TAG, "pxrapi library is not in this APK path; continuing with framework-loaded PxrApi", error);
-        }
-        System.loadLibrary("pimax_alvr_client");
-    }
 
     // =========================================================================================
     // Broadcast receiver — screen state and shutdown
@@ -273,13 +309,26 @@ public final class VrRenderActivity extends NativeActivity {
             Log.i(TAG, "screenReceiver.onReceive(" + action + ")");
             if (Intent.ACTION_SCREEN_ON.equals(action)) {
                 // Screen has turned on — notify native so it can resume rendering.
-                nativeNotifyScreen(true);
-                acquireScreenWakeLock("screen-on broadcast");
+                pendingNativeScreenOn = true;
+                setPimaxEyechipEnabled(false, "screen-on broadcast");
+                if (nativeLibrariesLoaded) {
+                    nativeNotifyScreen(true);
+                }
+                pokeDisplayPower("screen-on broadcast");
+                forceScreenWakeLock("screen-on broadcast");
             } else if (Intent.ACTION_SCREEN_OFF.equals(action)) {
                 // Screen has turned off — notify native but intentionally keep the app
-                // running. Stock AirLink would shut down here, but for development we
-                // keep the render loop alive so the next screen-on is instant.
-                nativeNotifyScreen(false);
+                // running. Re-acquire the wake lock immediately so a transient screen-off
+                // event does not leave the headset blank while streaming continues.
+                pendingNativeScreenOn = false;
+                setPimaxEyechipEnabled(false, "screen-off broadcast");
+                if (nativeLibrariesLoaded) {
+                    nativeNotifyScreen(false);
+                }
+                forceScreenWakeLock("screen-off broadcast");
+                if (headsetNear) {
+                    startDisplayWakeRetry("screen-off broadcast while near");
+                }
                 Log.i(TAG, "screen turned off; keeping app running for development");
             } else if (ACTION_SHUTDOWN.equals(action)) {
                 Log.i(TAG, "received ALVR shutdown broadcast");
@@ -287,6 +336,87 @@ public final class VrRenderActivity extends NativeActivity {
             }
         }
     };
+
+    /**
+     * Starts loading the native libraries on a background thread so the activity can
+     * finish its Java lifecycle setup before the Pimax JNI bootstrap runs.
+     */
+    private void startNativeBootstrapIfNeeded(String reason) {
+        synchronized (nativeBootstrapLock) {
+            if (nativeBootstrapStarted) {
+                return;
+            }
+            nativeBootstrapStarted = true;
+        }
+        Log.i(TAG, "starting native bootstrap asynchronously: " + reason);
+        Thread bootstrapThread = new Thread(() -> {
+            try {
+                if (LOAD_PXRAPI_EAGERLY) {
+                    try {
+                        System.loadLibrary("pxrapi");
+                        Log.i(TAG, "loaded pxrapi");
+                    } catch (UnsatisfiedLinkError error) {
+                        Log.w(TAG, "pxrapi library is not in this APK path; continuing with framework-loaded PxrApi", error);
+                    }
+                }
+                System.loadLibrary("pimax_alvr_client");
+                Log.i(TAG, "loaded pimax_alvr_client");
+                nativeLibrariesLoaded = true;
+                runOnUiThread(() -> flushDeferredNativeState("native bootstrap complete"));
+            } catch (UnsatisfiedLinkError error) {
+                Log.w(TAG, "failed to load native libraries", error);
+            } catch (RuntimeException error) {
+                Log.w(TAG, "native bootstrap failed", error);
+            }
+        }, "PimaxNativeBootstrap");
+        bootstrapThread.setDaemon(true);
+        bootstrapThread.start();
+    }
+
+    /**
+     * Replays the latest screen/proximity state once native libraries are available.
+     */
+    private void flushDeferredNativeState(String reason) {
+        if (!nativeLibrariesLoaded) {
+            return;
+        }
+        Log.i(TAG, "flushing deferred native state: " + reason
+                + " screenOn=" + pendingNativeScreenOn
+                + " headsetNear=" + headsetNear);
+        resetNativeShutdown(reason);
+        nativeNotifyScreen(pendingNativeScreenOn);
+        nativeNotifyProximity(headsetNear);
+        registerPimaxHardwareBridge();
+        registerProximitySensor();
+        startControllerPoller();
+        if (headsetNear) {
+            startDisplayWakeRetry("native bootstrap complete");
+        }
+    }
+
+    /**
+     * Reasserts the display wake path on the UI thread when the headset is put back on.
+     */
+    private void handleHeadsetNear(String reason) {
+        pendingNativeScreenOn = true;
+        setPimaxEyechipEnabled(false, reason);
+        if (nativeLibrariesLoaded) {
+            nativeNotifyScreen(true);
+        }
+        getWindow().addFlags(WINDOW_FLAGS_ON_CREATE | WINDOW_FLAGS_ON_FOCUS);
+        pokeDisplayPower(reason);
+        forceScreenWakeLock(reason);
+        startDisplayWakeRetry(reason);
+    }
+
+    /** Stops the wake retry loop when the headset is removed again. */
+    private void handleHeadsetFar(String reason) {
+        setPimaxEyechipEnabled(false, reason);
+        // Proximity-far means "not currently worn", not "the Android display is off".
+        // Keep the last real screen state intact so launching off-head does not flush
+        // screenOn=false into the native Pimax renderer and leave presentation black.
+        stopDisplayWakeRetry(reason);
+    }
 
     // =========================================================================================
     // JNI native method declarations
@@ -383,17 +513,20 @@ public final class VrRenderActivity extends NativeActivity {
         Log.i(TAG, "VrRenderActivity.onCreate");
         paused = false;
         nativeShutdownRequested = false;
+        pendingNativeScreenOn = true;
         // Clear any stale native shutdown flag from a previous session.
         resetNativeShutdown("onCreate");
         // Apply full-screen, high-keep-awake flags for VR.
         getWindow().addFlags(WINDOW_FLAGS_ON_CREATE);
         createScreenWakeLock();
+        screenWakeHandler = new Handler(Looper.getMainLooper());
+        setPimaxEyechipEnabled(false, "onCreate active streaming");
         registerScreenReceiver();
         acquireScreenWakeLock("onCreate");
-        nativeNotifyScreen(true);
         registerPimaxHardwareBridge();
         registerProximitySensor();
         startControllerPoller();
+        startNativeBootstrapIfNeeded("onCreate");
     }
 
     /**
@@ -424,13 +557,22 @@ public final class VrRenderActivity extends NativeActivity {
         resetNativeShutdown("onResume");
         // 90 Hz provides the smoothest head tracking on Pimax Crystal.
         trySetPeakRefreshRate(90.0f, "onResume");
+        setPimaxEyechipEnabled(false, "onResume active streaming");
         getWindow().addFlags(WINDOW_FLAGS_ON_CREATE | WINDOW_FLAGS_ON_FOCUS);
         registerScreenReceiver();
-        acquireScreenWakeLock("onResume");
-        nativeNotifyScreen(true);
+        pendingNativeScreenOn = true;
+        if (nativeLibrariesLoaded) {
+            nativeNotifyScreen(true);
+        }
+        pokeDisplayPower("onResume");
+        forceScreenWakeLock("onResume");
+        if (headsetNear) {
+            startDisplayWakeRetry("onResume while near");
+        }
         registerPimaxHardwareBridge();
         registerProximitySensor();
         startControllerPoller();
+        startNativeBootstrapIfNeeded("onResume");
     }
 
     /**
@@ -489,6 +631,7 @@ public final class VrRenderActivity extends NativeActivity {
         // Signal the native render loop to shut down.
         requestNativeShutdown("onDestroy");
         stopControllerPoller();
+        stopDisplayWakeRetry("onDestroy");
         unregisterProximitySensor();
         unregisterPimaxHardwareBridge();
         unregisterScreenReceiver();
@@ -602,6 +745,7 @@ public final class VrRenderActivity extends NativeActivity {
      */
     private void shutdownAndFinish(String reason) {
         paused = true;
+        setPimaxEyechipEnabled(true, "explicit shutdown: " + reason);
         requestNativeShutdown(reason);
         unregisterScreenReceiver();
         releaseScreenWakeLock();
@@ -648,10 +792,27 @@ public final class VrRenderActivity extends NativeActivity {
      * @param reason      a human-readable reason for this change (logged alongside success/failure)
      */
     private void trySetPeakRefreshRate(float refreshRate, String reason) {
+        String currentValue = Settings.System.getString(getContentResolver(), "peak_refresh_rate");
+        if (currentValue != null) {
+            try {
+                if (Math.abs(Float.parseFloat(currentValue) - refreshRate) < 0.01f) {
+                    Log.i(TAG, "peak_refresh_rate already " + currentValue + ": " + reason);
+                    return;
+                }
+            } catch (NumberFormatException ignored) {
+                // Fall through and try writing the requested value.
+            }
+        }
+        if (peakRefreshRateWriteDenied) {
+            Log.i(TAG, "skipping peak_refresh_rate=" + refreshRate
+                    + " after previous denial; current=" + currentValue + ": " + reason);
+            return;
+        }
         try {
             Settings.System.putFloat(getContentResolver(), "peak_refresh_rate", refreshRate);
             Log.i(TAG, "requested peak_refresh_rate=" + refreshRate + ": " + reason);
         } catch (RuntimeException error) {
+            peakRefreshRateWriteDenied = true;
             Log.w(TAG, "failed to set peak_refresh_rate=" + refreshRate + ": " + reason
                     + " (" + error.getClass().getSimpleName() + ": " + error.getMessage() + ")");
         }
@@ -718,6 +879,194 @@ public final class VrRenderActivity extends NativeActivity {
         } catch (RuntimeException error) {
             Log.w(TAG, "failed to acquire activity wake lock: " + reason, error);
         }
+    }
+
+    /**
+     * Toggles the same vendor display/proximity policy switch used by stock WiFi Airlink.
+     *
+     * <p>Airlink writes {@code eyechip_on} from {@code HmdSync.registerHw(...)} before it
+     * starts streaming. On Crystal OG builds this appears to control the headset's
+     * eye/proximity chip policy that can blank the panel while the app keeps streaming.
+     * During active ALVR sessions we keep it disabled and restore it only on explicit exit.
+     */
+    private void setPimaxEyechipEnabled(boolean enabled, String reason) {
+        int value = enabled ? 1 : 0;
+        String currentValue = Settings.System.getString(getContentResolver(), PIMAX_EYECHIP_ON_SETTING);
+        if (Integer.toString(value).equals(currentValue)) {
+            Log.i(TAG, PIMAX_EYECHIP_ON_SETTING + " already " + value + ": " + reason);
+            return;
+        }
+        if (pimaxEyechipWriteDenied) {
+            Log.i(TAG, "skipping " + PIMAX_EYECHIP_ON_SETTING + "=" + value
+                    + " after previous denial; current=" + currentValue + ": " + reason);
+            return;
+        }
+        try {
+            boolean ok = Settings.System.putInt(getContentResolver(), PIMAX_EYECHIP_ON_SETTING, value);
+            Log.i(TAG, "requested " + PIMAX_EYECHIP_ON_SETTING + "=" + value
+                    + " ok=" + ok + ": " + reason);
+        } catch (RuntimeException error) {
+            pimaxEyechipWriteDenied = true;
+            Log.w(TAG, "failed to set " + PIMAX_EYECHIP_ON_SETTING + "=" + value
+                    + ": " + reason + " (" + error.getClass().getSimpleName()
+                    + ": " + error.getMessage() + ")");
+        }
+    }
+
+    /**
+     * Forces a fresh wake event by releasing and recreating the wake lock.
+     *
+     * <p>Calling {@link #acquireScreenWakeLock} on an already-held wake lock is not always
+     * sufficient to wake the panel back up after the headset has blanked it. Releasing the
+     * current lock first ensures the subsequent acquire re-triggers {@code ACQUIRE_CAUSES_WAKEUP}.
+     */
+    private void forceScreenWakeLock(String reason) {
+        if (screenWakeLock != null) {
+            try {
+                if (screenWakeLock.isHeld()) {
+                    screenWakeLock.release();
+                    Log.i(TAG, "released activity wake lock before forced wake: " + reason);
+                }
+            } catch (RuntimeException error) {
+                Log.w(TAG, "failed to release activity wake lock before forced wake: " + reason, error);
+            } finally {
+                screenWakeLock = null;
+            }
+        }
+        acquireScreenWakeLock(reason);
+    }
+
+    /**
+     * Pokes the system PowerManager to wake the display back up.
+     *
+     * <p>Pimax appears to treat the proximity transition as a stronger display policy event
+     * than a standard Android screen-off, so a wake lock alone is not always sufficient.
+     * We try the available hidden PowerManager wake methods reflectively and fall back to
+     * the normal wake-lock path if none are available.
+     */
+    private void pokeDisplayPower(String reason) {
+        PowerManager powerManager = (PowerManager) getSystemService(POWER_SERVICE);
+        if (powerManager == null) {
+            Log.w(TAG, "PowerManager unavailable; cannot poke display power: " + reason);
+            return;
+        }
+        long now = SystemClock.uptimeMillis();
+        String packageName = getPackageName();
+        if (tryInvokePowerManagerMethod(powerManager, "wakeUp", now, reason, packageName)) {
+            return;
+        }
+        Log.w(TAG, "PowerManager wake methods unavailable; relying on wake lock: " + reason);
+    }
+
+    /**
+     * Tries to invoke a hidden PowerManager wake helper by name.
+     */
+    private boolean tryInvokePowerManagerMethod(
+            PowerManager powerManager, String methodName, long now, String reason, String packageName) {
+        if ("wakeUp".equals(methodName) && powerWakeUpDenied) {
+            return false;
+        }
+        for (Method method : powerManager.getClass().getMethods()) {
+            if (!methodName.equals(method.getName())) {
+                continue;
+            }
+            try {
+                Class<?>[] parameterTypes = method.getParameterTypes();
+                Object[] args =
+                        buildPowerManagerInvocationArgs(parameterTypes, now, reason, packageName);
+                if (args == null) {
+                    continue;
+                }
+                method.setAccessible(true);
+                method.invoke(powerManager, args);
+                Log.i(TAG, "poked display power via PowerManager." + methodName + ": " + reason);
+                return true;
+            } catch (ReflectiveOperationException | IllegalArgumentException error) {
+                if ("wakeUp".equals(methodName) && hasSecurityExceptionCause(error)) {
+                    powerWakeUpDenied = true;
+                    Log.i(TAG, "PowerManager.wakeUp denied; relying on wake lock instead: " + reason);
+                    return false;
+                }
+                Log.w(TAG, "failed to invoke PowerManager." + methodName + ": " + reason, error);
+            }
+        }
+        return false;
+    }
+
+    private static boolean hasSecurityExceptionCause(Throwable error) {
+        Throwable current = error;
+        while (current != null) {
+            if (current instanceof SecurityException) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
+    }
+
+    /**
+     * Starts a short retry loop that keeps poking the display while the headset remains near.
+     */
+    private void startDisplayWakeRetry(String reason) {
+        if (screenWakeHandler == null) {
+            screenWakeHandler = new Handler(Looper.getMainLooper());
+        }
+        screenWakeRetryCount = 0;
+        screenWakeHandler.removeCallbacks(screenWakeRetryRunnable);
+        screenWakeHandler.post(screenWakeRetryRunnable);
+        Log.i(TAG, "started display wake retry: " + reason);
+    }
+
+    /** Stops any pending display wake retries. */
+    private void stopDisplayWakeRetry(String reason) {
+        if (screenWakeHandler == null) {
+            return;
+        }
+        screenWakeHandler.removeCallbacks(screenWakeRetryRunnable);
+        Log.i(TAG, "stopped display wake retry: " + reason);
+    }
+
+    /** Retry wake pokes until the display becomes interactive or the retry budget is used up. */
+    private void retryDisplayWakeIfNeeded() {
+        if (!headsetNear) {
+            return;
+        }
+        PowerManager powerManager = (PowerManager) getSystemService(POWER_SERVICE);
+        if (powerManager != null && powerManager.isInteractive()) {
+            Log.i(TAG, "display became interactive; wake retry loop complete");
+            stopDisplayWakeRetry("display interactive");
+            return;
+        }
+        if (screenWakeRetryCount >= 20) {
+            Log.w(TAG, "display wake retry exhausted; leaving wake lock asserted");
+            return;
+        }
+        screenWakeRetryCount++;
+        pokeDisplayPower("retry " + screenWakeRetryCount);
+        forceScreenWakeLock("retry " + screenWakeRetryCount);
+        if (screenWakeHandler != null) {
+            screenWakeHandler.postDelayed(screenWakeRetryRunnable, 250L);
+        }
+    }
+
+    private Object[] buildPowerManagerInvocationArgs(
+            Class<?>[] parameterTypes, long now, String reason, String packageName) {
+        Object[] args = new Object[parameterTypes.length];
+        for (int index = 0; index < parameterTypes.length; index++) {
+            Class<?> parameterType = parameterTypes[index];
+            if (parameterType == long.class || parameterType == Long.class) {
+                args[index] = now;
+            } else if (parameterType == int.class || parameterType == Integer.class) {
+                args[index] = 0;
+            } else if (parameterType == boolean.class || parameterType == Boolean.class) {
+                args[index] = Boolean.TRUE;
+            } else if (parameterType == String.class) {
+                args[index] = index == parameterTypes.length - 1 ? packageName : reason;
+            } else {
+                return null;
+            }
+        }
+        return args;
     }
 
     /**
@@ -923,7 +1272,9 @@ public final class VrRenderActivity extends NativeActivity {
         if (type == PMX_EVENT_TYPE_MOTOR && (value == 1 || value == 2) && payload != null) {
             // IPD knob turned — parse the new IPD value and notify native.
             try {
-                nativeNotifyIpdChange(Float.parseFloat(payload));
+                if (nativeLibrariesLoaded) {
+                    nativeNotifyIpdChange(Float.parseFloat(payload));
+                }
             } catch (NumberFormatException error) {
                 Log.w(TAG, "failed to parse Pimax IPD payload: " + payload, error);
             }
@@ -1416,6 +1767,10 @@ public final class VrRenderActivity extends NativeActivity {
      */
     private void requestNativeShutdown(String reason) {
         nativeShutdownRequested = true;
+        if (!nativeLibrariesLoaded) {
+            Log.i(TAG, "deferring native shutdown until libraries load: " + reason);
+            return;
+        }
         try {
             nativeRequestShutdown();
             Log.i(TAG, "requested native shutdown: " + reason);
@@ -1437,6 +1792,10 @@ public final class VrRenderActivity extends NativeActivity {
      * @param reason a human-readable reason for the reset, included in log messages
      */
     private void resetNativeShutdown(String reason) {
+        if (!nativeLibrariesLoaded) {
+            Log.i(TAG, "deferring native reset until libraries load: " + reason);
+            return;
+        }
         try {
             nativeResetShutdown();
             Log.i(TAG, "reset native shutdown: " + reason);

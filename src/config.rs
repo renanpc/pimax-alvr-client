@@ -29,6 +29,7 @@
 /// - `ipd_scale`: IPD scale factor (default: 1.0)
 /// - `color_black_crush`: Black level adjustment (default: 0.072)
 /// - `color_gain`: Contrast gain (default: 1.22)
+/// - `controller_rotation_*_deg`: Live controller grip-pose calibration
 ///
 /// # Versioning
 ///
@@ -158,6 +159,22 @@ pub struct ClientConfig {
     ///
     /// See `tune.rs` for detailed explanation of color correction.
     pub color_gain: Option<f32>,
+
+    /// Controller local X-axis rotation offset in degrees.
+    ///
+    /// Used to calibrate the native Pimax controller model basis into ALVR's
+    /// OpenXR grip-pose basis. Applied live from the tune page.
+    pub controller_rotation_x_deg: Option<f32>,
+
+    /// Controller local Y-axis rotation offset in degrees.
+    ///
+    /// Used to calibrate yaw/model-basis mismatch from the tune page.
+    pub controller_rotation_y_deg: Option<f32>,
+
+    /// Controller local Z-axis rotation offset in degrees.
+    ///
+    /// Used to calibrate roll/model-basis mismatch from the tune page.
+    pub controller_rotation_z_deg: Option<f32>,
 }
 
 impl Default for ClientConfig {
@@ -188,6 +205,9 @@ impl Default for ClientConfig {
             ipd_scale: Some(crate::client::ALVR_IPD_SCALE_DEFAULT),
             color_black_crush: Some(crate::video_receiver::COLOR_BLACK_CRUSH_DEFAULT),
             color_gain: Some(crate::video_receiver::COLOR_GAIN_DEFAULT),
+            controller_rotation_x_deg: Some(crate::tune::CONTROLLER_ROTATION_X_DEG_DEFAULT),
+            controller_rotation_y_deg: Some(crate::tune::CONTROLLER_ROTATION_Y_DEG_DEFAULT),
+            controller_rotation_z_deg: Some(crate::tune::CONTROLLER_ROTATION_Z_DEG_DEFAULT),
         }
     }
 }

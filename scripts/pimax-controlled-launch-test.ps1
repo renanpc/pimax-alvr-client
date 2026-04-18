@@ -1,11 +1,13 @@
 param(
     [string]$Serial,
     [string]$ArtifactRoot = ".tmp",
-    [int[]]$SnapshotSeconds = @(5, 20, 45),
+    [int[]]$SnapshotSeconds = @(5, 20, 45, 120),
     [int]$Brightness = 135,
     [int]$NetworkWaitTimeoutSeconds = 90,
+    [int]$SteamVRRestartWaitSeconds = 25,
     [switch]$RebootBeforeRun,
-    [switch]$RecoverAfterRun
+    [switch]$RecoverAfterRun,
+    [switch]$SkipSteamVRRestart
 )
 
 Set-StrictMode -Version Latest
@@ -109,6 +111,114 @@ function Write-ProgressMarker {
     Add-Content -Encoding UTF8 -Path (Join-Path $artifactDir "progress.txt") -Value $line
 }
 
+function Get-SteamVRProcessSnapshot {
+    $steamVrNames = @(
+        "vrmonitor.exe",
+        "vrserver.exe",
+        "vrcompositor.exe",
+        "vrdashboard.exe",
+        "vrwebhelper.exe",
+        "steamtours.exe",
+        "vrstartup.exe"
+    )
+
+    @(Get-CimInstance Win32_Process | Where-Object { $steamVrNames -contains $_.Name })
+}
+
+function Save-SteamVRProcessSnapshot {
+    param(
+        [string]$Label
+    )
+
+    $processes = @(Get-SteamVRProcessSnapshot)
+    $path = Join-Path $artifactDir "steamvr-processes-$Label.txt"
+    if ($processes.Count -eq 0) {
+        Set-Content -Encoding UTF8 -Path $path -Value "No SteamVR processes found."
+        return $processes
+    }
+
+    $processes |
+        Select-Object ProcessId, Name, ExecutablePath, CommandLine |
+        Format-List |
+        Out-String |
+        Set-Content -Encoding UTF8 -Path $path
+    return $processes
+}
+
+function Restart-SteamVR {
+    if ($SkipSteamVRRestart) {
+        Write-Host "Skipping SteamVR restart because -SkipSteamVRRestart was provided."
+        Write-ProgressMarker "steamvr restart skipped"
+        return
+    }
+
+    Write-Host "Restarting SteamVR before headset launch..."
+    Write-ProgressMarker "steamvr restart start"
+    $before = @(Save-SteamVRProcessSnapshot -Label "before-restart")
+    $vrMonitorPath = $null
+    if ($before.Count -gt 0) {
+        $runningMonitor = $before |
+            Where-Object { $_.Name -ieq "vrmonitor.exe" -and -not [string]::IsNullOrWhiteSpace($_.ExecutablePath) } |
+            Select-Object -First 1
+        if ($null -ne $runningMonitor) {
+            $vrMonitorPath = $runningMonitor.ExecutablePath
+        }
+    }
+
+    foreach ($process in $before) {
+        Write-Host "  stopping $($process.Name) pid=$($process.ProcessId)"
+        Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+
+    Start-Sleep -Seconds 4
+    Save-SteamVRProcessSnapshot -Label "after-stop" | Out-Null
+
+    $candidatePaths = @(
+        $vrMonitorPath,
+        "D:\Program Files (x86)\Steam\steamapps\common\SteamVR\bin\win64\vrmonitor.exe"
+    )
+    if (-not [string]::IsNullOrWhiteSpace(${env:ProgramFiles(x86)})) {
+        $candidatePaths += Join-Path ${env:ProgramFiles(x86)} "Steam\steamapps\common\SteamVR\bin\win64\vrmonitor.exe"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
+        $candidatePaths += Join-Path $env:ProgramFiles "Steam\steamapps\common\SteamVR\bin\win64\vrmonitor.exe"
+    }
+    $candidatePaths = $candidatePaths |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Select-Object -Unique
+
+    $started = $false
+    foreach ($candidatePath in $candidatePaths) {
+        if (Test-Path $candidatePath) {
+            Write-Host "  starting SteamVR via $candidatePath"
+            Start-Process -FilePath $candidatePath | Out-Null
+            $started = $true
+            break
+        }
+    }
+
+    if (-not $started) {
+        Write-Host "  vrmonitor.exe not found by path; starting SteamVR through the Steam URL handler."
+        Start-Process "steam://rungameid/250820" | Out-Null
+    }
+
+    $deadline = (Get-Date).AddSeconds($SteamVRRestartWaitSeconds)
+    do {
+        Start-Sleep -Seconds 2
+        $running = @(Get-SteamVRProcessSnapshot | Where-Object { $_.Name -in @("vrmonitor.exe", "vrserver.exe", "vrcompositor.exe") })
+        if ($running.Count -gt 0) {
+            Save-SteamVRProcessSnapshot -Label "after-restart" | Out-Null
+            Write-Host "  SteamVR is running again ($($running.Name -join ', '))."
+            Write-ProgressMarker "steamvr restart end"
+            return
+        }
+    } while ((Get-Date) -lt $deadline)
+
+    Save-SteamVRProcessSnapshot -Label "after-restart-timeout" | Out-Null
+    Write-Warning "SteamVR did not report vrmonitor/vrserver/vrcompositor within $SteamVRRestartWaitSeconds seconds; continuing so the artifact captures the failure mode."
+    Write-ProgressMarker "steamvr restart timeout"
+}
+
 function Wait-For-NetworkReady {
     param(
         [int]$TimeoutSeconds = 90
@@ -201,6 +311,90 @@ function Stop-AppForCleanLaunch {
     Write-DisplaySummary -Label $SnapshotLabel
 }
 
+function Grant-AppWriteSettings {
+    Write-Host "Granting WRITE_SETTINGS app-op for $packageName..."
+    $grant = Invoke-AdbCommand `
+        -Description "grant WRITE_SETTINGS app-op" `
+        -AdbCommandArgs @("shell", "appops set $packageName WRITE_SETTINGS allow") `
+        -AllowFailure
+    $grant.Output | Set-Content -Encoding UTF8 -Path (Join-Path $artifactDir "appops-write-settings-grant.txt")
+    if ($grant.ExitCode -ne 0) {
+        Write-Warning "WRITE_SETTINGS app-op grant failed; peak_refresh_rate and eyechip_on writes may be denied."
+        return
+    }
+
+    Save-AdbSnapshot `
+        -FileName "appops-write-settings-after-grant.txt" `
+        -Description "appops WRITE_SETTINGS after grant" `
+        -AdbCommandArgs @("shell", "appops get $packageName WRITE_SETTINGS") `
+        -AllowFailure | Out-Null
+}
+
+function Set-PimaxBootProperties {
+    param(
+        [string]$Reason
+    )
+
+    Write-Host "Applying Pimax boot/runtime display properties: $Reason"
+    Save-AdbSnapshot `
+        -FileName "pimax-boot-properties-before-$Reason.txt" `
+        -Description "Pimax boot properties before $Reason" `
+        -AdbCommandArgs @("shell", 'echo sta_pm=$(getprop persist.sys.pmx.sta.pm.enable); echo disable_psensor=$(getprop persist.sys.pmx.dbg.disable.psensor); echo sta_time=$(getprop persist.sys.pmx.sta.time); echo dim_screen=$(settings get system dim_screen); echo screen_off_timeout=$(settings get system screen_off_timeout); echo pmx_pc_screen_off_timeout=$(settings get system pmx_pc_screen_off_timeout)') `
+        -AllowFailure | Out-Null
+
+    Invoke-AdbCommand `
+        -Description "disable Pimax station power-management property" `
+        -AdbCommandArgs @("shell", "setprop persist.sys.pmx.sta.pm.enable false") `
+        -AllowFailure | Out-Null
+    Invoke-AdbCommand `
+        -Description "restore normal Pimax proximity state-machine" `
+        -AdbCommandArgs @("shell", "setprop persist.sys.pmx.dbg.disable.psensor false") `
+        -AllowFailure | Out-Null
+    Invoke-AdbCommand `
+        -Description "disable Android dim-screen setting" `
+        -AdbCommandArgs @("shell", "settings put system dim_screen 0") `
+        -AllowFailure | Out-Null
+    Invoke-AdbCommand `
+        -Description "extend Android screen-off timeout" `
+        -AdbCommandArgs @("shell", "settings put system screen_off_timeout 2147483647") `
+        -AllowFailure | Out-Null
+    Invoke-AdbCommand `
+        -Description "extend Pimax PC-mode screen-off timeout" `
+        -AdbCommandArgs @("shell", "settings put system pmx_pc_screen_off_timeout 2147483647") `
+        -AllowFailure | Out-Null
+
+    Save-AdbSnapshot `
+        -FileName "pimax-boot-properties-after-$Reason.txt" `
+        -Description "Pimax boot properties after $Reason" `
+        -AdbCommandArgs @("shell", 'echo sta_pm=$(getprop persist.sys.pmx.sta.pm.enable); echo disable_psensor=$(getprop persist.sys.pmx.dbg.disable.psensor); echo sta_time=$(getprop persist.sys.pmx.sta.time); echo dim_screen=$(settings get system dim_screen); echo screen_off_timeout=$(settings get system screen_off_timeout); echo pmx_pc_screen_off_timeout=$(settings get system pmx_pc_screen_off_timeout)') `
+        -AllowFailure | Out-Null
+}
+
+function Set-PimaxStreamingSettings {
+    Write-Host "Applying Pimax streaming display settings..."
+    Save-AdbSnapshot `
+        -FileName "settings-before-streaming-tweaks.txt" `
+        -Description "settings before streaming tweaks" `
+        -AdbCommandArgs @("shell", 'echo eyechip_on=$(settings get system eyechip_on); echo peak_refresh_rate=$(settings get system peak_refresh_rate); echo dim_screen=$(settings get system dim_screen); echo screen_off_timeout=$(settings get system screen_off_timeout); echo pmx_pc_screen_off_timeout=$(settings get system pmx_pc_screen_off_timeout); echo sta_pm=$(getprop persist.sys.pmx.sta.pm.enable); echo disable_psensor=$(getprop persist.sys.pmx.dbg.disable.psensor)') `
+        -AllowFailure | Out-Null
+
+    Set-PimaxBootProperties -Reason "streaming-tweaks"
+    Invoke-AdbCommand `
+        -Description "disable Pimax eyechip suspend policy" `
+        -AdbCommandArgs @("shell", "settings put system eyechip_on 0") `
+        -AllowFailure | Out-Null
+    Invoke-AdbCommand `
+        -Description "set peak refresh rate" `
+        -AdbCommandArgs @("shell", "settings put system peak_refresh_rate 90") `
+        -AllowFailure | Out-Null
+
+    Save-AdbSnapshot `
+        -FileName "settings-after-streaming-tweaks.txt" `
+        -Description "settings after streaming tweaks" `
+        -AdbCommandArgs @("shell", 'echo eyechip_on=$(settings get system eyechip_on); echo peak_refresh_rate=$(settings get system peak_refresh_rate); echo dim_screen=$(settings get system dim_screen); echo screen_off_timeout=$(settings get system screen_off_timeout); echo pmx_pc_screen_off_timeout=$(settings get system pmx_pc_screen_off_timeout); echo sta_pm=$(getprop persist.sys.pmx.sta.pm.enable); echo disable_psensor=$(getprop persist.sys.pmx.dbg.disable.psensor)') `
+        -AllowFailure | Out-Null
+}
+
 function Wait-For-PackageExit {
     param(
         [int]$TimeoutSeconds = 15
@@ -219,6 +413,83 @@ function Wait-For-PackageExit {
     return $false
 }
 
+function Analyze-Screencap {
+    param(
+        [string]$Label,
+        [string]$Path
+    )
+
+    $analysisPath = Join-Path $artifactDir "screencap-analysis-$Label.txt"
+    if (-not (Test-Path $Path)) {
+        Set-Content -Encoding UTF8 -Path $analysisPath -Value "classification=NO_SCREENSHOT"
+        return
+    }
+
+    try {
+        Add-Type -AssemblyName System.Drawing
+        $bitmap = [System.Drawing.Bitmap]::new($Path)
+        try {
+            $width = $bitmap.Width
+            $height = $bitmap.Height
+            $stepX = [Math]::Max(1, [int][Math]::Floor($width / 96))
+            $stepY = [Math]::Max(1, [int][Math]::Floor($height / 96))
+            $samples = 0
+            $darkSamples = 0
+            $brightSamples = 0
+            [double]$totalLuma = 0
+
+            for ($y = 0; $y -lt $height; $y += $stepY) {
+                for ($x = 0; $x -lt $width; $x += $stepX) {
+                    $pixel = $bitmap.GetPixel($x, $y)
+                    $luma = (0.2126 * $pixel.R) + (0.7152 * $pixel.G) + (0.0722 * $pixel.B)
+                    $totalLuma += $luma
+                    $samples++
+                    if ($luma -lt 8) {
+                        $darkSamples++
+                    }
+                    if ($luma -gt 32) {
+                        $brightSamples++
+                    }
+                }
+            }
+
+            $averageLuma = [Math]::Round($totalLuma / [Math]::Max(1, $samples), 2)
+            $darkPct = [Math]::Round(($darkSamples * 100.0) / [Math]::Max(1, $samples), 2)
+            $brightPct = [Math]::Round(($brightSamples * 100.0) / [Math]::Max(1, $samples), 2)
+            $classification = if ($averageLuma -lt 8 -and $brightPct -lt 0.5) {
+                "BLACK_FRAMEBUFFER"
+            } elseif ($averageLuma -lt 20 -and $brightPct -lt 5) {
+                "VERY_DARK_FRAMEBUFFER"
+            } else {
+                "NON_BLACK_FRAMEBUFFER"
+            }
+            $interpretation = if ($classification -eq "NON_BLACK_FRAMEBUFFER") {
+                "Android framebuffer has visible pixels. If the headset lenses are black, suspect panel/compositor/presentation path rather than app rendering."
+            } else {
+                "Android framebuffer itself is black or nearly black."
+            }
+
+            @(
+                "classification=$classification",
+                "width=$width",
+                "height=$height",
+                "samples=$samples",
+                "avg_luma=$averageLuma",
+                "dark_pct=$darkPct",
+                "bright_pct=$brightPct",
+                "interpretation=$interpretation"
+            ) | Set-Content -Encoding UTF8 -Path $analysisPath
+        } finally {
+            $bitmap.Dispose()
+        }
+    } catch {
+        @(
+            "classification=ANALYSIS_FAILED",
+            "error=$($_.Exception.Message)"
+        ) | Set-Content -Encoding UTF8 -Path $analysisPath
+    }
+}
+
 function Save-DisplaySnapshot {
     param(
         [string]$Label
@@ -228,15 +499,21 @@ function Save-DisplaySnapshot {
     Save-AdbSnapshot -FileName "pid-$Label.txt" -Description "pid $Label" -AdbCommandArgs @("shell", "pidof $packageName") -AllowFailure | Out-Null
     Save-AdbSnapshot -FileName "power-$Label.txt" -Description "power $Label" -AdbCommandArgs @("shell", "dumpsys power") -AllowFailure | Out-Null
     Save-AdbSnapshot -FileName "display-$Label.txt" -Description "display $Label" -AdbCommandArgs @("shell", "dumpsys display") -AllowFailure | Out-Null
+    Save-AdbSnapshot -FileName "surfaceflinger-$Label.txt" -Description "surfaceflinger $Label" -AdbCommandArgs @("shell", "dumpsys SurfaceFlinger") -AllowFailure | Out-Null
     Save-AdbSnapshot -FileName "activity-$Label.txt" -Description "activity $Label" -AdbCommandArgs @("shell", "dumpsys activity activities") -AllowFailure | Out-Null
     Save-AdbSnapshot -FileName "window-$Label.txt" -Description "window $Label" -AdbCommandArgs @("shell", "dumpsys window windows") -AllowFailure | Out-Null
-    Save-AdbSnapshot -FileName "settings-$Label.txt" -Description "settings $Label" -AdbCommandArgs @("shell", 'echo brightness=$(settings get system screen_brightness); echo brightness_mode=$(settings get system screen_brightness_mode); echo guardian_effective=$(getprop pxr.vr.guardian.effective); echo pimax_guide=$(settings get system pimax_guide)') -AllowFailure | Out-Null
+    Save-AdbSnapshot -FileName "settings-$Label.txt" -Description "settings $Label" -AdbCommandArgs @("shell", 'echo brightness=$(settings get system screen_brightness); echo brightness_mode=$(settings get system screen_brightness_mode); echo eyechip_on=$(settings get system eyechip_on); echo dim_screen=$(settings get system dim_screen); echo screen_off_timeout=$(settings get system screen_off_timeout); echo pmx_pc_screen_off_timeout=$(settings get system pmx_pc_screen_off_timeout); echo sta_pm=$(getprop persist.sys.pmx.sta.pm.enable); echo disable_psensor=$(getprop persist.sys.pmx.dbg.disable.psensor); echo guardian_effective=$(getprop pxr.vr.guardian.effective); echo pimax_guide=$(settings get system pimax_guide)') -AllowFailure | Out-Null
 
     $remoteScreenshot = "/sdcard/pimax_controlled_launch_$Label.png"
+    $localScreenshot = Join-Path $artifactDir "screencap-$Label.png"
     $screencap = Invoke-AdbCommand -Description "screencap $Label" -AdbCommandArgs @("shell", "screencap -p $remoteScreenshot") -AllowFailure
     $screencap.Output | Set-Content -Encoding UTF8 -Path (Join-Path $artifactDir "screencap-$Label.txt")
     if ($screencap.ExitCode -eq 0) {
-        Invoke-AdbCommand -Description "pull screencap $Label" -AdbCommandArgs @("pull", $remoteScreenshot, (Join-Path $artifactDir "screencap-$Label.png")) -AllowFailure | Out-Null
+        $pull = Invoke-AdbCommand -Description "pull screencap $Label" -AdbCommandArgs @("pull", $remoteScreenshot, $localScreenshot) -AllowFailure
+        $pull.Output | Set-Content -Encoding UTF8 -Path (Join-Path $artifactDir "screencap-pull-$Label.txt")
+        if ($pull.ExitCode -eq 0) {
+            Analyze-Screencap -Label $Label -Path $localScreenshot
+        }
         Invoke-AdbCommand -Description "remove remote screencap $Label" -AdbCommandArgs @("shell", "rm $remoteScreenshot") -AllowFailure | Out-Null
     }
     Write-ProgressMarker "snapshot $Label end"
@@ -262,6 +539,13 @@ function Write-DisplaySummary {
             Select-String -Pattern "mGlobalDisplayState=|mState=ON|mBrightness=|mScreenState=|mScreenBrightness=|mActualState=|mActualBacklight=" |
             Select-Object -First 12 |
             ForEach-Object { Write-Host "  $($_.Line.Trim())" }
+    }
+
+    $analysisPath = Join-Path $artifactDir "screencap-analysis-$Label.txt"
+    if (Test-Path $analysisPath) {
+        Get-Content $analysisPath |
+            Select-String -Pattern "^classification=|^avg_luma=|^dark_pct=|^bright_pct=|^interpretation=" |
+            ForEach-Object { Write-Host "  framebuffer $($_.Line.Trim())" }
     }
 }
 
@@ -327,6 +611,7 @@ try {
 
     if ($RebootBeforeRun) {
         Write-ProgressMarker "pre-run reboot start"
+        Set-PimaxBootProperties -Reason "before-pre-run-reboot"
         Write-Host "Rebooting before run..."
         Save-AdbSnapshot -FileName "pre-run-reboot.txt" -Description "pre-run reboot" -AdbCommandArgs @("reboot") | Out-Null
         Wait-For-BootCompleted
@@ -337,9 +622,12 @@ try {
     Initialize-HeadsetForRun -Reason "pre-run"
     Write-ProgressMarker "initialize pre-run end"
     Stop-AppForCleanLaunch
+    Grant-AppWriteSettings
+    Set-PimaxStreamingSettings
     Write-ProgressMarker "network wait start"
     Wait-For-NetworkReady -TimeoutSeconds $NetworkWaitTimeoutSeconds | Out-Null
     Write-ProgressMarker "network wait end"
+    Restart-SteamVR
     Save-DisplaySnapshot -Label "before"
     Write-DisplaySummary -Label "before"
 
