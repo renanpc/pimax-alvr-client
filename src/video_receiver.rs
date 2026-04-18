@@ -122,7 +122,6 @@
 //! - `color_gain`: Contrast gain (default: 1.22)
 //! - `ipd_scale`: Stereo separation strength (default: 1.0)
 
-
 use std::ffi::{c_void, CString};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -238,7 +237,13 @@ extern "C" {
     fn glCheckFramebufferStatus(target: u32) -> u32;
     fn glDeleteFramebuffers(n: i32, framebuffers: *const u32);
     fn glFlush();
-    fn glFramebufferTexture2D(target: u32, attachment: u32, textarget: u32, texture: u32, level: i32);
+    fn glFramebufferTexture2D(
+        target: u32,
+        attachment: u32,
+        textarget: u32,
+        texture: u32,
+        level: i32,
+    );
     fn glGenFramebuffers(n: i32, framebuffers: *mut u32);
     fn glTexImage2D(
         target: u32,
@@ -994,7 +999,13 @@ fn get_intermediate_fbo(width: i32, height: i32) -> Result<IntermediateFbo> {
             bail!("glGenFramebuffers returned 0 for intermediate FBO");
         }
         glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+        glFramebufferTexture2D(
+            GL_FRAMEBUFFER,
+            GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_2D,
+            texture,
+            0,
+        );
         let status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         if status != GL_FRAMEBUFFER_COMPLETE {
@@ -1045,8 +1056,8 @@ fn get_blit_program() -> Result<BlitProgram> {
     }
 
     // Pass 2 of two-pass blit always samples from a standard RGBA texture via GL_TEXTURE_2D.
-    let created = create_blit_program(false)
-        .context("create GL_TEXTURE_2D blit program for pass 2")?;
+    let created =
+        create_blit_program(false).context("create GL_TEXTURE_2D blit program for pass 2")?;
     *program = Some(BlitProgram {
         program: created.program,
         texture_target: created.texture_target,
@@ -1371,8 +1382,8 @@ pub(crate) fn render_ahardwarebuffer_to_target(
         load_egl_proc::<GlEglImageTargetTexture2dOes>("glEGLImageTargetTexture2DOES")
             .context("load glEGLImageTargetTexture2DOES")?;
 
-    let passthrough = get_passthrough_oes_program()
-        .context("get passthrough OES shader for pass 1")?;
+    let passthrough =
+        get_passthrough_oes_program().context("get passthrough OES shader for pass 1")?;
     let blit_program = get_blit_program().context("get blit shader for pass 2")?;
 
     let display = unsafe { eglGetCurrentDisplay() };
@@ -1450,7 +1461,10 @@ pub(crate) fn render_ahardwarebuffer_to_target(
         glBindTexture(GL_TEXTURE_EXTERNAL_OES, source_texture);
         glUniform1i(passthrough.texture_uniform, 0);
         // Live-tunable color expansion (adjustable via HTTP at :7878)
-        glUniform1f(passthrough.black_crush_uniform, crate::tune::color_black_crush());
+        glUniform1f(
+            passthrough.black_crush_uniform,
+            crate::tune::color_black_crush(),
+        );
         glUniform1f(passthrough.color_gain_uniform, crate::tune::color_gain());
         glDrawArrays(GL_TRIANGLES, 0, 3);
 

@@ -6,10 +6,10 @@ pub mod client;
 pub mod config;
 pub mod controller;
 #[cfg(target_os = "android")]
-pub mod tune;
-#[cfg(target_os = "android")]
 pub mod pimax;
 pub mod protocol;
+#[cfg(target_os = "android")]
+pub mod tune;
 #[cfg(target_os = "android")]
 pub mod video_receiver;
 

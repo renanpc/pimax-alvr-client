@@ -84,6 +84,8 @@ pub enum Hand {
 pub struct SingleControllerState {
     pub connected: bool,
     pub handle: i32,
+    /// Latest controller pose/velocity when provided by the native runtime.
+    pub(crate) motion: Option<DeviceMotion>,
     /// Bitmask of currently pressed buttons.
     pub buttons_pressed: u32,
     /// Bitmask of currently touched buttons (capacitive).
@@ -218,14 +220,14 @@ struct ButtonBitMap {
 /// Verify against actual hardware output using the diagnostic logs, then
 /// adjust as needed.
 ///
-/// Bit assignments (Qualcomm SVR / Pimax convention):
+/// Bit assignments after native Pimax normalization:
 ///   0 = trigger click
-///   1 = trackpad/thumbstick click
-///   2 = menu/start
-///   3 = grip
-///   4 = A / X (lower face button)
-///   5 = B / Y (upper face button)
-///   6 = system
+///   1 = thumbstick click
+///   2 = menu
+///   3 = grip/squeeze click
+///   4 = X / A face button
+///   5 = Y / B face button
+///   6 = system (reserved; currently not emitted by native pxrapi)
 const BUTTON_PRESS_MAP: &[ButtonBitMap] = &[
     ButtonBitMap {
         bit: 0,
@@ -240,7 +242,7 @@ const BUTTON_PRESS_MAP: &[ButtonBitMap] = &[
     ButtonBitMap {
         bit: 2,
         left_suffix: "input/menu/click",
-        right_suffix: "input/system/click",
+        right_suffix: "input/menu/click",
     },
     ButtonBitMap {
         bit: 3,
@@ -271,6 +273,11 @@ const BUTTON_TOUCH_MAP: &[ButtonBitMap] = &[
         bit: 1,
         left_suffix: "input/thumbstick/touch",
         right_suffix: "input/thumbstick/touch",
+    },
+    ButtonBitMap {
+        bit: 3,
+        left_suffix: "input/squeeze/touch",
+        right_suffix: "input/squeeze/touch",
     },
     ButtonBitMap {
         bit: 4,
@@ -374,10 +381,9 @@ pub fn build_button_entries(snapshot: &ControllerSnapshot) -> Vec<ButtonEntry> {
 }
 
 /// Build `DeviceMotion` entries for connected controllers.
-///
-/// Phase 1: identity pose (no 6DOF tracking yet). The ALVR server will
-/// place the controllers at a default position relative to the head.
-pub fn build_controller_device_motions(snapshot: &ControllerSnapshot) -> Vec<(u64, DeviceMotion)> {
+pub(crate) fn build_controller_device_motions(
+    snapshot: &ControllerSnapshot,
+) -> Vec<(u64, DeviceMotion)> {
     let mut motions = Vec::with_capacity(2);
 
     for (hand_state, hand_path) in [
@@ -388,15 +394,14 @@ pub fn build_controller_device_motions(snapshot: &ControllerSnapshot) -> Vec<(u6
             Some(s) if is_fresh(s) => s,
             _ => continue,
         };
-        let _ = state; // will use pose data in Phase 2
 
         motions.push((
             hash_string(hand_path),
-            DeviceMotion {
+            state.motion.unwrap_or(DeviceMotion {
                 pose: Pose::default(),
                 linear_velocity: glam::Vec3::ZERO,
                 angular_velocity: glam::Vec3::ZERO,
-            },
+            }),
         ));
     }
 
@@ -453,6 +458,7 @@ mod tests {
             left: Some(SingleControllerState {
                 connected: true,
                 handle: 1,
+                motion: None,
                 buttons_pressed: 0x01,
                 buttons_touched: 0x00,
                 trigger: 0.8,
@@ -490,6 +496,7 @@ mod tests {
             left: Some(SingleControllerState {
                 connected: true,
                 handle: 1,
+                motion: None,
                 buttons_pressed: 0,
                 buttons_touched: 0,
                 trigger: 0.0,

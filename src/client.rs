@@ -263,7 +263,11 @@ fn normalize_pimax_ipd_m(raw_ipd: f32) -> Option<f32> {
         return None;
     }
 
-    let ipd_m = if raw_ipd > 1.0 { raw_ipd / 1000.0 } else { raw_ipd };
+    let ipd_m = if raw_ipd > 1.0 {
+        raw_ipd / 1000.0
+    } else {
+        raw_ipd
+    };
     if !ipd_m.is_finite() || ipd_m <= 0.0 {
         return None;
     }
@@ -390,10 +394,16 @@ pub(crate) fn notify_ipd_scale_changed() {
         .map(|s| s.config.clone())
         .unwrap_or_else(default_views_config);
     config.ipd_m = physical * crate::tune::ipd_scale();
-    *state = Some(VersionedViewsConfig { version, config: config.clone() });
+    *state = Some(VersionedViewsConfig {
+        version,
+        config: config.clone(),
+    });
     info!(
         "tune: IPD scale changed → physical_m={:.4} scale={:.2} alvr_ipd_m={:.4} version={}",
-        physical, crate::tune::ipd_scale(), config.ipd_m, version
+        physical,
+        crate::tune::ipd_scale(),
+        config.ipd_m,
+        version
     );
 }
 
@@ -715,8 +725,7 @@ impl AlvrClient {
         let local_ip = IpAddr::V4(wifi_ipv4().context("get local IPv4 for mDNS")?);
         let protocol_str = alvr_protocol_string(&self.config.version_string);
 
-        let daemon =
-            mdns_sd::ServiceDaemon::new().context("create mDNS ServiceDaemon")?;
+        let daemon = mdns_sd::ServiceDaemon::new().context("create mDNS ServiceDaemon")?;
 
         let service_info = mdns_sd::ServiceInfo::new(
             "_alvr._tcp.local.",
@@ -1398,9 +1407,7 @@ fn maintain_alvr_control_socket(writer: SharedControlWriter) {
                 }
                 buttons_sent = buttons_sent.wrapping_add(1);
                 if buttons_sent <= 5 || buttons_sent % ALVR_STREAM_LOG_EVERY == 0 {
-                    info!(
-                        "sent ALVR Buttons packet: count={buttons_sent} entries={entry_count}"
-                    );
+                    info!("sent ALVR Buttons packet: count={buttons_sent} entries={entry_count}");
                 }
             }
             next_buttons_send = now + ALVR_BUTTONS_SEND_INTERVAL;
@@ -1958,7 +1965,8 @@ mod tests {
             })
             .collect();
         let json_str = std::str::from_utf8(&json_bytes).expect("packed JSON is valid UTF-8");
-        let decoded: serde_json::Value = serde_json::from_str(json_str).expect("packed JSON parses");
+        let decoded: serde_json::Value =
+            serde_json::from_str(json_str).expect("packed JSON parses");
 
         // Must use v20.14.1 field names (not the older "foveated_encoding").
         assert!(decoded.get("supports_foveated_encoding").is_some());

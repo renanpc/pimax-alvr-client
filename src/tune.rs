@@ -30,11 +30,13 @@
 /// 3. Open `http://<headset-ip>:7878/` in any browser on the same Wi-Fi network
 /// 4. Adjust sliders and see changes immediately
 /// 5. Settings are auto-saved and restored on next launch
-
 use std::{
     io::{BufRead, BufReader, Write},
     net::{IpAddr, TcpListener},
-    sync::{LazyLock, Mutex, atomic::{AtomicU32, Ordering}},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        LazyLock, Mutex,
+    },
     thread,
 };
 
@@ -129,13 +131,15 @@ static SERVER_IP: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::
 /// Human-readable connection status for display in the web UI.
 ///
 /// Examples: "Not connected", "Connecting...", "Connected", "Connection failed: ..."
-static SERVER_STATUS: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::from("Not connected")));
+static SERVER_STATUS: LazyLock<Mutex<String>> =
+    LazyLock::new(|| Mutex::new(String::from("Not connected")));
 
 /// List of ALVR servers discovered via UDP broadcast.
 ///
 /// Each entry is (hostname, IP address). Populated when user clicks "Scan for Servers"
 /// in the web UI. Discovery uses ALVR's protocol on port 9943.
-static DISCOVERED_SERVERS: LazyLock<Mutex<Vec<(String, String)>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static DISCOVERED_SERVERS: LazyLock<Mutex<Vec<(String, String)>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
 
 /// Load an f32 value from an AtomicU32.
 ///
@@ -174,22 +178,29 @@ fn store(atom: &AtomicU32, v: f32) {
 /// # Called From
 ///
 /// `android::run_inner()` during application startup
-pub fn init(
-    convergence_shift_ndc: f32,
-    ipd_scale: f32,
-    color_black_crush: f32,
-    color_gain: f32,
-) {
+pub fn init(convergence_shift_ndc: f32, ipd_scale: f32, color_black_crush: f32, color_gain: f32) {
     // Load tuning settings from config, or use defaults if not available
     let config_path = crate::config::default_config_path();
     let config = crate::config::ClientConfig::load_or_create(&config_path).ok();
 
     // Extract each setting with fallback to default
     // This pattern allows adding new settings without breaking old configs
-    let cs = config.as_ref().and_then(|c| c.convergence_shift_ndc).unwrap_or(convergence_shift_ndc);
-    let is = config.as_ref().and_then(|c| c.ipd_scale).unwrap_or(ipd_scale);
-    let bc = config.as_ref().and_then(|c| c.color_black_crush).unwrap_or(color_black_crush);
-    let cg = config.as_ref().and_then(|c| c.color_gain).unwrap_or(color_gain);
+    let cs = config
+        .as_ref()
+        .and_then(|c| c.convergence_shift_ndc)
+        .unwrap_or(convergence_shift_ndc);
+    let is = config
+        .as_ref()
+        .and_then(|c| c.ipd_scale)
+        .unwrap_or(ipd_scale);
+    let bc = config
+        .as_ref()
+        .and_then(|c| c.color_black_crush)
+        .unwrap_or(color_black_crush);
+    let cg = config
+        .as_ref()
+        .and_then(|c| c.color_gain)
+        .unwrap_or(color_gain);
 
     // Store in atomics for render thread access
     store(&CONVERGENCE_SHIFT_NDC, cs);
@@ -200,9 +211,10 @@ pub fn init(
     info!("tune: loaded settings from config: convergence_shift_ndc={:.4}, ipd_scale={:.4}, color_black_crush={:.4}, color_gain={:.4}", cs, is, bc, cg);
 
     // Load server IP from config
-    let initial_server_ip = config.as_ref()
+    let initial_server_ip = config
+        .as_ref()
         .and_then(|c| c.last_server_ip.clone())
-        .unwrap_or_else(|| String::from("192.168.8.102"));
+        .unwrap_or_else(|| String::from("192.168.50.220"));
     *SERVER_IP.lock().unwrap() = initial_server_ip;
     *SERVER_STATUS.lock().unwrap() = String::from("Not connected - configure below");
 
@@ -226,7 +238,9 @@ pub fn init(
 ///
 /// `video_receiver::blit()` - applied per-eye during the blit shader
 #[inline]
-pub fn convergence_shift_ndc() -> f32 { load(&CONVERGENCE_SHIFT_NDC) }
+pub fn convergence_shift_ndc() -> f32 {
+    load(&CONVERGENCE_SHIFT_NDC)
+}
 
 /// Get the current IPD scale factor.
 ///
@@ -234,7 +248,9 @@ pub fn convergence_shift_ndc() -> f32 { load(&CONVERGENCE_SHIFT_NDC) }
 ///
 /// `client::update_alvr_views_config_from_pimax()` - applied when building ViewsConfig
 #[inline]
-pub fn ipd_scale() -> f32 { load(&IPD_SCALE) }
+pub fn ipd_scale() -> f32 {
+    load(&IPD_SCALE)
+}
 
 /// Get the current color black crush value.
 ///
@@ -242,7 +258,9 @@ pub fn ipd_scale() -> f32 { load(&IPD_SCALE) }
 ///
 /// `video_receiver::blit()` - applied in fragment shader for color correction
 #[inline]
-pub fn color_black_crush() -> f32 { load(&COLOR_BLACK_CRUSH) }
+pub fn color_black_crush() -> f32 {
+    load(&COLOR_BLACK_CRUSH)
+}
 
 /// Get the current color gain value.
 ///
@@ -250,7 +268,9 @@ pub fn color_black_crush() -> f32 { load(&COLOR_BLACK_CRUSH) }
 ///
 /// `video_receiver::blit()` - applied in fragment shader for color correction
 #[inline]
-pub fn color_gain() -> f32 { load(&COLOR_GAIN) }
+pub fn color_gain() -> f32 {
+    load(&COLOR_GAIN)
+}
 
 // =============================================================================
 // Server Management
@@ -470,7 +490,9 @@ fn run_http_server() {
         let Ok(mut stream) = stream else { continue };
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut request_line = String::new();
-        if reader.read_line(&mut request_line).is_err() { continue };
+        if reader.read_line(&mut request_line).is_err() {
+            continue;
+        };
 
         // Drain headers (read until empty line)
         loop {
@@ -502,8 +524,12 @@ fn run_http_server() {
             // Return current tuning values as JSON
             let body = format!(
                 r#"{{"convergence_shift_ndc":{:.4},"ipd_scale":{:.4},"color_black_crush":{:.4},"color_gain":{:.4},"server_ip":"{}","server_status":"{}"}}"#,
-                convergence_shift_ndc(), ipd_scale(), color_black_crush(), color_gain(),
-                get_server_ip(), get_server_status()
+                convergence_shift_ndc(),
+                ipd_scale(),
+                color_black_crush(),
+                color_gain(),
+                get_server_ip(),
+                get_server_status()
             );
             let _ = write!(
                 stream,
@@ -513,7 +539,10 @@ fn run_http_server() {
         } else if path == "/servers" {
             // Return discovered servers as JSON array
             let servers = get_discovered_servers();
-            let servers_json: Vec<_> = servers.iter().map(|(h, i)| format!(r#"{{"hostname":"{}","ip":"{}"}}"#, h, i)).collect();
+            let servers_json: Vec<_> = servers
+                .iter()
+                .map(|(h, i)| format!(r#"{{"hostname":"{}","ip":"{}"}}"#, h, i))
+                .collect();
             let body = format!(r#"{{"servers":[{}]}}"#, servers_json.join(","));
             let _ = write!(
                 stream,
@@ -526,7 +555,8 @@ fn run_http_server() {
             let _ = write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
-                html.len(), html
+                html.len(),
+                html
             );
         }
     }
@@ -701,7 +731,7 @@ fn discover_servers_http() {
         if let Ok((len, addr)) = socket.recv_from(&mut buf) {
             if len > 18 {
                 // Extract hostname from response (bytes 18-49)
-                let hostname = String::from_utf8_lossy(&buf[18..(18+32).min(len)])
+                let hostname = String::from_utf8_lossy(&buf[18..(18 + 32).min(len)])
                     .trim_end_matches('\0')
                     .to_string();
                 let ip = addr.ip().to_string();
@@ -753,7 +783,8 @@ fn build_html() -> String {
         )
     }).collect();
 
-    format!(r#"<!DOCTYPE html>
+    format!(
+        r#"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -843,12 +874,25 @@ tuningIds.forEach(id => {{
   }});
 }});
 
+function refreshServerStatus() {{
+  fetch('/values')
+    .then(r => r.json())
+    .then(data => {{
+      document.getElementById('server_status').textContent = data.server_status;
+    }})
+    .catch(() => {{}});
+}}
+
 // Server IP connection
 function setServerIp() {{
   const ip = document.getElementById('server_ip').value.trim();
   if (ip) {{
+    document.getElementById('server_status').textContent = 'Connecting to ' + ip + '...';
     fetch('/set?server_ip=' + encodeURIComponent(ip))
-      .then(() => {{ document.getElementById('status').textContent = 'Server IP set to ' + ip + ' ✓'; }})
+      .then(() => {{
+        document.getElementById('status').textContent = 'Server IP set to ' + ip + ' ✓';
+        refreshServerStatus();
+      }})
       .catch(() => {{ document.getElementById('status').textContent = 'Failed to set server IP'; }});
   }}
 }}
@@ -881,6 +925,8 @@ function selectServer(ip) {{
 
 // Load servers on page load
 loadServers();
+refreshServerStatus();
+setInterval(refreshServerStatus, 1500);
 </script>
 </body>
 </html>

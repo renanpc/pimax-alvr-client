@@ -116,8 +116,8 @@ use android_logger::Config as AndroidLoggerConfig;
 use anyhow::{Context, Result};
 use log::{error, info, warn, LevelFilter};
 
-use crate::{config, AlvrClient, ClientConfig};
 use crate::tune::set_server_status;
+use crate::{config, AlvrClient, ClientConfig};
 
 /// Logger initialization guard.
 ///

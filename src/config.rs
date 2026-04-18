@@ -43,7 +43,6 @@
 /// Config is loaded at startup and saved when settings change. The file is
 /// read/write on background threads to avoid blocking the render loop.
 /// Concurrent access is handled by the OS file system.
-
 use std::{
     env, fs,
     io::Write,
@@ -183,7 +182,9 @@ impl Default for ClientConfig {
             stream_port: STREAM_PORT,
             last_server_ip: None,
             // Default tuning values from their respective modules
-            convergence_shift_ndc: Some(crate::video_receiver::PIMAX_BLIT_CONVERGENCE_SHIFT_NDC_DEFAULT),
+            convergence_shift_ndc: Some(
+                crate::video_receiver::PIMAX_BLIT_CONVERGENCE_SHIFT_NDC_DEFAULT,
+            ),
             ipd_scale: Some(crate::client::ALVR_IPD_SCALE_DEFAULT),
             color_black_crush: Some(crate::video_receiver::COLOR_BLACK_CRUSH_DEFAULT),
             color_gain: Some(crate::video_receiver::COLOR_GAIN_DEFAULT),

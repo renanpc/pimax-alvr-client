@@ -534,13 +534,16 @@ public final class VrRenderActivity extends NativeActivity {
      */
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
+        logAnyControllerKeyEvent(event);
+        if (event != null && controllerStateForDevice(event.getDevice()) != null) {
+            if (handleControllerKeyEvent(event)) {
+                return true;
+            }
+        }
         if (event != null && event.getAction() == KeyEvent.ACTION_UP && isExitKey(event.getKeyCode())) {
             String keyName = KeyEvent.keyCodeToString(event.getKeyCode());
             Log.i(TAG, "handling exit key: " + keyName);
             shutdownAndFinish("key " + keyName);
-            return true;
-        }
-        if (event != null && handleControllerKeyEvent(event)) {
             return true;
         }
         return super.dispatchKeyEvent(event);
@@ -548,6 +551,7 @@ public final class VrRenderActivity extends NativeActivity {
 
     @Override
     public boolean dispatchGenericMotionEvent(MotionEvent event) {
+        logAnyControllerMotionEvent(event);
         if (event != null && handleControllerMotionEvent(event)) {
             return true;
         }
@@ -1001,6 +1005,7 @@ public final class VrRenderActivity extends NativeActivity {
     // =========================================================================================
 
     private static final long CONTROLLER_POLL_INTERVAL_MS = 33;
+    private static final boolean USE_NATIVE_PIMAX_SDK_CONTROLLER_POLLER = true;
     private static final String CONTROLLER_DEVICE_NAME_LEFT = "nrfinput_left";
     private static final String CONTROLLER_DEVICE_NAME_RIGHT = "nrfinput_right";
     private static final String CONTROLLER_BATTERY_PATH_LEFT =
@@ -1076,16 +1081,64 @@ public final class VrRenderActivity extends NativeActivity {
         }
     }
 
+    private static String keyActionToString(int action) {
+        if (action == KeyEvent.ACTION_DOWN) {
+            return "down";
+        }
+        if (action == KeyEvent.ACTION_UP) {
+            return "up";
+        }
+        return Integer.toString(action);
+    }
+
+    private static String motionActionToString(int action) {
+        if (action == MotionEvent.ACTION_DOWN) {
+            return "down";
+        }
+        if (action == MotionEvent.ACTION_UP) {
+            return "up";
+        }
+        if (action == MotionEvent.ACTION_MOVE) {
+            return "move";
+        }
+        if (action == MotionEvent.ACTION_CANCEL) {
+            return "cancel";
+        }
+        return Integer.toString(action);
+    }
+
+    private static String eventDeviceName(InputDevice device) {
+        return device != null ? device.getName() : "<unknown>";
+    }
+
+    private static int eventDeviceId(InputDevice device) {
+        return device != null ? device.getId() : -1;
+    }
+
+    private static String eventSourceString(int source) {
+        return "0x" + Integer.toHexString(source);
+    }
+
     private boolean handleControllerKeyEvent(KeyEvent event) {
         ControllerState state = controllerStateForDevice(event.getDevice());
         if (state == null) {
             return false;
         }
+        InputDevice device = event.getDevice();
+        String deviceName = eventDeviceName(device);
+        int deviceId = eventDeviceId(device);
+        String source = eventSourceString(event.getSource());
+        int before = state.buttonsPressed;
         int bit = mapKeyCodeToBit(event.getKeyCode());
         if (bit == 0) {
             // Unknown key on a known controller device — log once for discovery.
-            Log.i(TAG, "unmapped controller key: device=" + event.getDevice().getName()
-                    + " keyCode=" + KeyEvent.keyCodeToString(event.getKeyCode()));
+            Log.i(TAG, "unmapped controller key: device=" + deviceName
+                    + " deviceId=" + deviceId
+                    + " keyCode=" + KeyEvent.keyCodeToString(event.getKeyCode())
+                    + " scanCode=" + event.getScanCode()
+                    + " action=" + keyActionToString(event.getAction())
+                    + " repeat=" + event.getRepeatCount()
+                    + " source=" + source);
             return false;
         }
         if (event.getAction() == KeyEvent.ACTION_DOWN) {
@@ -1093,6 +1146,16 @@ public final class VrRenderActivity extends NativeActivity {
         } else if (event.getAction() == KeyEvent.ACTION_UP) {
             state.buttonsPressed &= ~bit;
         }
+        Log.i(TAG, "controller key event: device=" + deviceName
+                + " deviceId=" + deviceId
+                + " keyCode=" + KeyEvent.keyCodeToString(event.getKeyCode())
+                + " scanCode=" + event.getScanCode()
+                + " action=" + keyActionToString(event.getAction())
+                + " repeat=" + event.getRepeatCount()
+                + " source=" + source
+                + " mappedBit=0x" + Integer.toHexString(bit)
+                + " buttonsBefore=0x" + Integer.toHexString(before)
+                + " buttonsAfter=0x" + Integer.toHexString(state.buttonsPressed));
         return true;
     }
 
@@ -1101,6 +1164,13 @@ public final class VrRenderActivity extends NativeActivity {
         if (state == null) {
             return false;
         }
+        InputDevice device = event.getDevice();
+        String deviceName = eventDeviceName(device);
+        int deviceId = eventDeviceId(device);
+        String source = eventSourceString(event.getSource());
+        float beforeX = state.thumbstickX;
+        float beforeY = state.thumbstickY;
+        float beforeTrigger = state.trigger;
         // Standard joystick mapping. May need per-device tuning once hardware is observed.
         state.thumbstickX = event.getAxisValue(MotionEvent.AXIS_X);
         state.thumbstickY = event.getAxisValue(MotionEvent.AXIS_Y);
@@ -1109,7 +1179,45 @@ public final class VrRenderActivity extends NativeActivity {
         if (trig <= 0f) trig = event.getAxisValue(MotionEvent.AXIS_BRAKE);
         if (trig <= 0f) trig = event.getAxisValue(MotionEvent.AXIS_GAS);
         state.trigger = trig;
+        Log.i(TAG, "controller motion event: device=" + deviceName
+                + " deviceId=" + deviceId
+                + " action=" + motionActionToString(event.getAction())
+                + " source=" + source
+                + " stick=(" + beforeX + "," + beforeY + ")=>("
+                + state.thumbstickX + "," + state.thumbstickY + ")"
+                + " trigger=" + beforeTrigger + "=>" + state.trigger);
         return true;
+    }
+
+    private void logAnyControllerKeyEvent(KeyEvent event) {
+        if (event == null) {
+            return;
+        }
+        InputDevice device = event.getDevice();
+        Log.i(TAG, "key event seen: device=" + eventDeviceName(device)
+                + " deviceId=" + eventDeviceId(device)
+                + " keyCode=" + KeyEvent.keyCodeToString(event.getKeyCode())
+                + " scanCode=" + event.getScanCode()
+                + " action=" + keyActionToString(event.getAction())
+                + " repeat=" + event.getRepeatCount()
+                + " source=" + eventSourceString(event.getSource()));
+    }
+
+    private void logAnyControllerMotionEvent(MotionEvent event) {
+        if (event == null) {
+            return;
+        }
+        InputDevice device = event.getDevice();
+        Log.i(TAG, "motion event seen: device=" + eventDeviceName(device)
+                + " deviceId=" + eventDeviceId(device)
+                + " action=" + motionActionToString(event.getAction())
+                + " source=" + eventSourceString(event.getSource())
+                + " axisX=" + event.getAxisValue(MotionEvent.AXIS_X)
+                + " axisY=" + event.getAxisValue(MotionEvent.AXIS_Y)
+                + " ltrigger=" + event.getAxisValue(MotionEvent.AXIS_LTRIGGER)
+                + " rtrigger=" + event.getAxisValue(MotionEvent.AXIS_RTRIGGER)
+                + " brake=" + event.getAxisValue(MotionEvent.AXIS_BRAKE)
+                + " gas=" + event.getAxisValue(MotionEvent.AXIS_GAS));
     }
 
     private static int readControllerBattery(boolean left) {
@@ -1129,6 +1237,10 @@ public final class VrRenderActivity extends NativeActivity {
     }
 
     private void startControllerPoller() {
+        if (USE_NATIVE_PIMAX_SDK_CONTROLLER_POLLER) {
+            Log.i(TAG, "skipping Android InputDevice ControllerPoller; native Pimax SDK poller owns controller state");
+            return;
+        }
         if (controllerPoller != null) {
             return;
         }

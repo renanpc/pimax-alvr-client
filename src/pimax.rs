@@ -150,7 +150,7 @@ use std::os::raw::c_void;
 use std::{
     ffi::CStr,
     ffi::CString,
-    ptr,
+    mem, ptr,
     sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant},
@@ -258,6 +258,7 @@ pub extern "system" fn Java_com_pimax_alvr_client_VrRenderActivity_nativeNotifyC
     let state = crate::controller::SingleControllerState {
         connected: true,
         handle,
+        motion: None,
         buttons_pressed: buttons_pressed as u32,
         buttons_touched: buttons_touched as u32,
         trigger,
@@ -468,6 +469,64 @@ const PIMAX_PROMOTE_TO_POSITIONAL_TRACKING: bool = false;
 const TRACKING_MODE_ROTATION: i32 = 1;
 const TRACKING_MODE_POSITION: i32 = 2;
 const TRACKING_MODE_ROTATION_POSITION: i32 = TRACKING_MODE_ROTATION | TRACKING_MODE_POSITION;
+const PIMAX_CONTROLLER_QUERY_INTERVAL: Duration = Duration::from_secs(1);
+const PIMAX_CONTROLLER_RING_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
+const PIMAX_CONTROLLER_RING_MAX_CHANGE_LOG_WORDS: usize = 32;
+const PIMAX_NATIVE_CONTROLLER_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const PIMAX_NATIVE_CONTROLLER_CHANGE_LOG_INTERVAL: Duration = Duration::from_millis(250);
+const PIMAX_NATIVE_CONTROLLER_BATTERY_INTERVAL: Duration = Duration::from_secs(1);
+const PIMAX_NATIVE_CONTROLLER_STATE_SIZE: usize = 0xd0;
+const PIMAX_NATIVE_CONTROLLER_MAX_CHANGE_LOG_WORDS: usize = 24;
+
+const PIMAX_CONTROLLER_QUERY_BATTERY: i32 = 0;
+const PIMAX_CONTROLLER_QUERY_ACTIVE_BUTTONS: i32 = 4;
+const PIMAX_CONTROLLER_QUERY_ACTIVE_2D_ANALOGS: i32 = 5;
+const PIMAX_CONTROLLER_QUERY_ACTIVE_1D_ANALOGS: i32 = 6;
+const PIMAX_CONTROLLER_QUERY_ACTIVE_TOUCH_BUTTONS: i32 = 7;
+
+const PIMAX_BUTTON_ONE: u32 = 1;
+const PIMAX_BUTTON_TWO: u32 = 2;
+const PIMAX_BUTTON_THREE: u32 = 4;
+const PIMAX_BUTTON_FOUR: u32 = 8;
+const PIMAX_BUTTON_BACK: u32 = 512;
+const PIMAX_BUTTON_START: u32 = 256;
+const PIMAX_BUTTON_PRIMARY_INDEX_TRIGGER: u32 = 8192;
+const PIMAX_BUTTON_PRIMARY_HAND_TRIGGER: u32 = 16384;
+const PIMAX_BUTTON_PRIMARY_THUMBSTICK: u32 = 32768;
+const PIMAX_BUTTON_PRIMARY_THUMBSTICK_UP: u32 = 65536;
+const PIMAX_BUTTON_PRIMARY_THUMBSTICK_DOWN: u32 = 131072;
+const PIMAX_BUTTON_PRIMARY_THUMBSTICK_LEFT: u32 = 262144;
+const PIMAX_BUTTON_PRIMARY_THUMBSTICK_RIGHT: u32 = 524288;
+const PIMAX_BUTTON_SECONDARY_INDEX_TRIGGER: u32 = 2097152;
+const PIMAX_BUTTON_SECONDARY_HAND_TRIGGER: u32 = 4194304;
+const PIMAX_BUTTON_SECONDARY_THUMBSTICK: u32 = 8388608;
+const PIMAX_BUTTON_SECONDARY_THUMBSTICK_UP: u32 = 16777216;
+const PIMAX_BUTTON_SECONDARY_THUMBSTICK_DOWN: u32 = 33554432;
+const PIMAX_BUTTON_SECONDARY_THUMBSTICK_LEFT: u32 = 67108864;
+const PIMAX_BUTTON_SECONDARY_THUMBSTICK_RIGHT: u32 = 134217728;
+
+const PIMAX_TOUCH_ONE: u32 = 1;
+const PIMAX_TOUCH_TWO: u32 = 2;
+const PIMAX_TOUCH_THREE: u32 = 4;
+const PIMAX_TOUCH_FOUR: u32 = 8;
+const PIMAX_TOUCH_PRIMARY_THUMBSTICK: u32 = 16;
+const PIMAX_TOUCH_SECONDARY_THUMBSTICK: u32 = 32;
+const PIMAX_NATIVE_TOUCH_TRIGGER: u32 = 0x0000_2000;
+const PIMAX_NATIVE_TOUCH_GRIP: u32 = 0x0000_4000;
+
+const PIMAX_AXIS_1D_PRIMARY_INDEX_TRIGGER: u32 = 1 << 0;
+const PIMAX_AXIS_1D_SECONDARY_INDEX_TRIGGER: u32 = 1 << 1;
+const PIMAX_AXIS_1D_PRIMARY_HAND_TRIGGER: u32 = 1 << 2;
+const PIMAX_AXIS_1D_SECONDARY_HAND_TRIGGER: u32 = 1 << 3;
+const PIMAX_AXIS_2D_PRIMARY_THUMBSTICK: u32 = 1 << 0;
+const PIMAX_AXIS_2D_SECONDARY_THUMBSTICK: u32 = 1 << 1;
+
+const ALVR_BUTTON_TRIGGER: u32 = 1 << 0;
+const ALVR_BUTTON_THUMBSTICK_CLICK: u32 = 1 << 1;
+const ALVR_BUTTON_MENU: u32 = 1 << 2;
+const ALVR_BUTTON_GRIP: u32 = 1 << 3;
+const ALVR_BUTTON_AX: u32 = 1 << 4;
+const ALVR_BUTTON_BY: u32 = 1 << 5;
 
 #[derive(Clone, Copy, Debug)]
 enum SubmittedImageHandleKind {
@@ -1314,6 +1373,1389 @@ fn dump_class_schema(env: &mut jni::JNIEnv<'_>, class_name: &str) -> Result<()> 
     Ok(())
 }
 
+fn java_value_to_string(env: &mut jni::JNIEnv<'_>, value: &JObject<'_>) -> Result<String> {
+    let text = call_static_object(
+        env,
+        "java/lang/String",
+        "valueOf",
+        "(Ljava/lang/Object;)Ljava/lang/String;",
+        &[JValue::Object(value)],
+    )
+    .context("call String.valueOf")?;
+    object_to_string(env, text).context("convert String.valueOf result")
+}
+
+fn dump_object_declared_fields(
+    env: &mut jni::JNIEnv<'_>,
+    object: &JObject<'_>,
+    label: &str,
+) -> Result<()> {
+    if object.is_null() {
+        info!("{label}: <null>");
+        return Ok(());
+    }
+
+    let class = env
+        .call_method(object, "getClass", "()Ljava/lang/Class;", &[])
+        .context("get object class")?
+        .l()
+        .context("decode object class")?;
+    let class_name: String = env
+        .call_method(&class, "getName", "()Ljava/lang/String;", &[])
+        .context("get object class name")?
+        .l()
+        .context("decode object class name")
+        .and_then(|object| object_to_string(env, object).context("object class name string"))?;
+    let object_text = java_value_to_string(env, object).unwrap_or_else(|err| format!("{err:#}"));
+    info!("{label}: class={class_name} value={object_text}");
+
+    let fields = env
+        .call_method(
+            &class,
+            "getDeclaredFields",
+            "()[Ljava/lang/reflect/Field;",
+            &[],
+        )
+        .context("get object declared fields")?
+        .l()
+        .context("decode object declared fields")?;
+    let fields = JObjectArray::from(fields);
+    let count = env
+        .get_array_length(&fields)
+        .context("count object declared fields")?;
+    info!("{label}: {count} declared fields");
+
+    for index in 0..count {
+        let field = env
+            .get_object_array_element(&fields, index)
+            .with_context(|| format!("get object declared field {index}"))?;
+        let _ = env.call_method(&field, "setAccessible", "(Z)V", &[JValue::Bool(1)]);
+        let field_name: String = env
+            .call_method(&field, "getName", "()Ljava/lang/String;", &[])
+            .context("get object field name")?
+            .l()
+            .context("decode object field name")
+            .and_then(|object| object_to_string(env, object).context("object field name string"))?;
+        let type_obj = env
+            .call_method(&field, "getType", "()Ljava/lang/Class;", &[])
+            .context("get object field type")?
+            .l()
+            .context("decode object field type")?;
+        let type_name: String = env
+            .call_method(&type_obj, "getName", "()Ljava/lang/String;", &[])
+            .context("get object field type name")?
+            .l()
+            .context("decode object field type name")
+            .and_then(|object| {
+                object_to_string(env, object).context("object field type name string")
+            })?;
+        let value = match env.call_method(
+            &field,
+            "get",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[JValue::Object(object)],
+        ) {
+            Ok(value) => value.l().context("decode reflected field value")?,
+            Err(err) => {
+                let summary = take_java_exception_summary(env)
+                    .unwrap_or_else(|| "no pending Java exception summary".to_string());
+                warn!("{label}.{field_name}: unable to read field: {err:#}; {summary}");
+                continue;
+            }
+        };
+        let value_text = java_value_to_string(env, &value).unwrap_or_else(|err| format!("{err:#}"));
+        info!("{label}.{field_name}: type={type_name} value={value_text}");
+    }
+
+    Ok(())
+}
+
+fn get_declared_int_field_by_name(
+    env: &mut jni::JNIEnv<'_>,
+    object: &JObject<'_>,
+    field_name: &str,
+) -> Result<i32> {
+    let class = env
+        .call_method(object, "getClass", "()Ljava/lang/Class;", &[])
+        .context("get object class")?
+        .l()
+        .context("decode object class")?;
+    let field_name_obj = JObject::from(
+        env.new_string(field_name)
+            .context("create reflected field name")?,
+    );
+    let field = match env.call_method(
+        &class,
+        "getDeclaredField",
+        "(Ljava/lang/String;)Ljava/lang/reflect/Field;",
+        &[JValue::Object(&field_name_obj)],
+    ) {
+        Ok(field) => field.l().context("decode reflected field")?,
+        Err(err) => {
+            let summary = take_java_exception_summary(env)
+                .unwrap_or_else(|| "no pending Java exception summary".to_string());
+            bail!("getDeclaredField({field_name}) failed: {err:#}; {summary}");
+        }
+    };
+    let _ = env.call_method(&field, "setAccessible", "(Z)V", &[JValue::Bool(1)]);
+    let value = match env.call_method(
+        &field,
+        "getInt",
+        "(Ljava/lang/Object;)I",
+        &[JValue::Object(object)],
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            let summary = take_java_exception_summary(env)
+                .unwrap_or_else(|| "no pending Java exception summary".to_string());
+            bail!("Field.getInt({field_name}) failed: {err:#}; {summary}");
+        }
+    };
+    value.i().context("decode reflected int field")
+}
+
+fn infer_controller_start_handle(
+    env: &mut jni::JNIEnv<'_>,
+    start_info: &JObject<'_>,
+) -> Option<i32> {
+    for name in [
+        "handle",
+        "mHandle",
+        "m_handle",
+        "controllerHandle",
+        "mControllerHandle",
+        "controller_handle",
+        "fd",
+        "mFd",
+    ] {
+        if let Ok(handle) = get_declared_int_field_by_name(env, start_info, name) {
+            info!("ControllerStartInfo inferred handle from {name}={handle}");
+            return Some(handle);
+        }
+    }
+    warn!("ControllerStartInfo handle field was not inferred from known names");
+    None
+}
+
+fn pvr_service_controller_start<'local>(
+    env: &mut jni::JNIEnv<'local>,
+    client: &GlobalRef,
+    service: &str,
+) -> Result<JObject<'local>> {
+    let service = JObject::from(
+        env.new_string(service)
+            .context("create ControllerStart service string")?,
+    );
+    let value = match env.call_method(
+        client.as_obj(),
+        "ControllerStart",
+        "(Ljava/lang/String;)Lcom/pimax/pxrapi/controller/ControllerStartInfo;",
+        &[JValue::Object(&service)],
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            let summary = take_java_exception_summary(env)
+                .unwrap_or_else(|| "no pending Java exception summary".to_string());
+            bail!("call PvrServiceClient.ControllerStart failed: {err:#}; {summary}");
+        }
+    };
+    value.l().context("decode ControllerStartInfo")
+}
+
+fn pvr_service_controller_stop(
+    env: &mut jni::JNIEnv<'_>,
+    client: &GlobalRef,
+    handle: i32,
+) -> Result<()> {
+    if let Err(err) = env.call_method(
+        client.as_obj(),
+        "ControllerStop",
+        "(I)V",
+        &[JValue::Int(handle)],
+    ) {
+        let summary = take_java_exception_summary(env)
+            .unwrap_or_else(|| "no pending Java exception summary".to_string());
+        bail!("call PvrServiceClient.ControllerStop({handle}) failed: {err:#}; {summary}");
+    }
+    Ok(())
+}
+
+fn pvr_service_controller_query_int(
+    env: &mut jni::JNIEnv<'_>,
+    client: &GlobalRef,
+    handle: i32,
+    query_type: i32,
+) -> Result<i32> {
+    let value = match env.call_method(
+        client.as_obj(),
+        "ControllerQueryInt",
+        "(II)I",
+        &[JValue::Int(handle), JValue::Int(query_type)],
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            let summary = take_java_exception_summary(env)
+                .unwrap_or_else(|| "no pending Java exception summary".to_string());
+            bail!(
+                "call PvrServiceClient.ControllerQueryInt({handle}, {query_type}) failed: {err:#}; {summary}"
+            );
+        }
+    };
+    value.i().context("decode ControllerQueryInt result")
+}
+
+struct PimaxControllerRuntime {
+    client: GlobalRef,
+    handle: i32,
+    native_fd: i32,
+    fd_size: usize,
+    ring_mapping: Option<PimaxControllerRingMapping>,
+    last_ring_sample: Vec<u8>,
+    last_ring_change_log: Instant,
+    last_poll: Instant,
+    last_query_poll: Instant,
+    last_buttons: u32,
+    last_touches: u32,
+    last_active_1d: u32,
+    last_active_2d: u32,
+    last_battery: i32,
+    poll_count: u64,
+}
+
+struct PimaxControllerRingMapping {
+    ptr: *mut u8,
+    len: usize,
+}
+
+fn clamp_battery_percent(value: i32) -> u8 {
+    value.clamp(0, 100) as u8
+}
+
+fn has_flag(value: u32, flag: u32) -> bool {
+    (value & flag) != 0
+}
+
+fn derive_stick_axis(negative: bool, positive: bool) -> f32 {
+    match (negative, positive) {
+        (true, false) => -1.0,
+        (false, true) => 1.0,
+        _ => 0.0,
+    }
+}
+
+fn map_pimax_controller_ring_buffer(
+    native_fd: i32,
+    fd_size: usize,
+) -> Option<PimaxControllerRingMapping> {
+    if native_fd < 0 || fd_size == 0 {
+        warn!(
+            "Pimax controller ring buffer unavailable: native_fd={} fd_size={}",
+            native_fd, fd_size
+        );
+        return None;
+    }
+
+    let ptr = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            fd_size,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            native_fd,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        warn!(
+            "Pimax controller ring buffer mmap failed: native_fd={} fd_size={} errno={}",
+            native_fd,
+            fd_size,
+            std::io::Error::last_os_error()
+        );
+        return None;
+    }
+
+    info!(
+        "Pimax controller ring buffer mapped: native_fd={} fd_size={} ptr={ptr:p}",
+        native_fd, fd_size
+    );
+    Some(PimaxControllerRingMapping {
+        ptr: ptr.cast(),
+        len: fd_size,
+    })
+}
+
+fn unmap_pimax_controller_ring_buffer(mapping: PimaxControllerRingMapping) {
+    let result = unsafe { libc::munmap(mapping.ptr.cast::<c_void>(), mapping.len) };
+    if result != 0 {
+        warn!(
+            "Pimax controller ring buffer munmap failed: ptr={:p} len={} errno={}",
+            mapping.ptr,
+            mapping.len,
+            std::io::Error::last_os_error()
+        );
+    } else {
+        info!(
+            "Pimax controller ring buffer unmapped: ptr={:p} len={}",
+            mapping.ptr, mapping.len
+        );
+    }
+}
+
+fn close_pimax_controller_fd(native_fd: i32) {
+    if native_fd < 0 {
+        return;
+    }
+    let result = unsafe { libc::close(native_fd) };
+    if result != 0 {
+        warn!(
+            "Pimax controller native fd close failed: fd={} errno={}",
+            native_fd,
+            std::io::Error::last_os_error()
+        );
+    } else {
+        info!("Pimax controller native fd closed: fd={native_fd}");
+    }
+}
+
+fn checksum_bytes(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+fn format_hex_bytes(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(bytes.len().saturating_mul(3));
+    for (index, byte) in bytes.iter().enumerate() {
+        if index > 0 {
+            text.push(' ');
+        }
+        text.push_str(&format!("{byte:02x}"));
+    }
+    text
+}
+
+fn sample_pimax_controller_ring_buffer(runtime: &mut PimaxControllerRuntime) {
+    let Some(mapping) = runtime.ring_mapping.as_ref() else {
+        return;
+    };
+    let sample_len = mapping.len;
+    if sample_len == 0 {
+        return;
+    }
+
+    let sample = unsafe { std::slice::from_raw_parts(mapping.ptr, sample_len) };
+    if runtime.last_ring_sample.len() != sample_len {
+        runtime.last_ring_sample.clear();
+        runtime.last_ring_sample.extend_from_slice(sample);
+        info!(
+            "Pimax controller ring initial sample: len={} checksum=0x{:016x} head={} tail={}",
+            sample_len,
+            checksum_bytes(sample),
+            format_hex_bytes(&sample[..sample_len.min(64)]),
+            format_hex_bytes(&sample[sample_len.saturating_sub(64)..])
+        );
+        return;
+    }
+
+    let mut changed_words = Vec::new();
+    let mut changed_word_count = 0_usize;
+    for offset in (0..sample_len).step_by(4) {
+        let end = (offset + 4).min(sample_len);
+        if sample[offset..end] != runtime.last_ring_sample[offset..end] {
+            changed_word_count += 1;
+            let mut before = [0_u8; 4];
+            let mut after = [0_u8; 4];
+            before[..end - offset].copy_from_slice(&runtime.last_ring_sample[offset..end]);
+            after[..end - offset].copy_from_slice(&sample[offset..end]);
+            if changed_words.len() < PIMAX_CONTROLLER_RING_MAX_CHANGE_LOG_WORDS {
+                changed_words.push((
+                    offset,
+                    u32::from_le_bytes(before),
+                    u32::from_le_bytes(after),
+                ));
+            }
+        }
+    }
+
+    if changed_word_count == 0 {
+        return;
+    }
+
+    let should_log = runtime.last_ring_change_log.elapsed() >= Duration::from_millis(250)
+        || runtime.poll_count <= 10;
+    if should_log {
+        let changes = changed_words
+            .iter()
+            .map(|(offset, before, after)| format!("0x{offset:04x}:0x{before:08x}->0x{after:08x}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        info!(
+            "Pimax controller ring changed: poll_count={} changed_words={} checksum=0x{:016x} changes=[{}]",
+            runtime.poll_count,
+            changed_word_count,
+            checksum_bytes(sample),
+            changes
+        );
+        runtime.last_ring_change_log = Instant::now();
+    }
+
+    runtime.last_ring_sample.copy_from_slice(sample);
+}
+
+fn push_pimax_controller_states(
+    runtime: &mut PimaxControllerRuntime,
+    buttons: u32,
+    touches: u32,
+    active_1d: u32,
+    active_2d: u32,
+    battery: i32,
+) {
+    let mut left_buttons = 0_u32;
+    let mut right_buttons = 0_u32;
+
+    if has_flag(buttons, PIMAX_BUTTON_PRIMARY_INDEX_TRIGGER) {
+        left_buttons |= ALVR_BUTTON_TRIGGER;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_PRIMARY_HAND_TRIGGER) {
+        left_buttons |= ALVR_BUTTON_GRIP;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_PRIMARY_THUMBSTICK) {
+        left_buttons |= ALVR_BUTTON_THUMBSTICK_CLICK;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_BACK) {
+        left_buttons |= ALVR_BUTTON_MENU;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_THREE) {
+        left_buttons |= ALVR_BUTTON_AX;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_FOUR) {
+        left_buttons |= ALVR_BUTTON_BY;
+    }
+
+    if has_flag(buttons, PIMAX_BUTTON_SECONDARY_INDEX_TRIGGER) {
+        right_buttons |= ALVR_BUTTON_TRIGGER;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_SECONDARY_HAND_TRIGGER) {
+        right_buttons |= ALVR_BUTTON_GRIP;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_SECONDARY_THUMBSTICK) {
+        right_buttons |= ALVR_BUTTON_THUMBSTICK_CLICK;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_START) {
+        right_buttons |= ALVR_BUTTON_MENU;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_ONE) {
+        right_buttons |= ALVR_BUTTON_AX;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_TWO) {
+        right_buttons |= ALVR_BUTTON_BY;
+    }
+
+    let mut left_touches = 0_u32;
+    let mut right_touches = 0_u32;
+    if has_flag(touches, PIMAX_TOUCH_PRIMARY_THUMBSTICK) {
+        left_touches |= ALVR_BUTTON_THUMBSTICK_CLICK;
+    }
+    if has_flag(touches, PIMAX_TOUCH_THREE) {
+        left_touches |= ALVR_BUTTON_AX;
+    }
+    if has_flag(touches, PIMAX_TOUCH_FOUR) {
+        left_touches |= ALVR_BUTTON_BY;
+    }
+    if has_flag(touches, PIMAX_TOUCH_SECONDARY_THUMBSTICK) {
+        right_touches |= ALVR_BUTTON_THUMBSTICK_CLICK;
+    }
+    if has_flag(touches, PIMAX_TOUCH_ONE) {
+        right_touches |= ALVR_BUTTON_AX;
+    }
+    if has_flag(touches, PIMAX_TOUCH_TWO) {
+        right_touches |= ALVR_BUTTON_BY;
+    }
+
+    let left_trigger_active = has_flag(active_1d, PIMAX_AXIS_1D_PRIMARY_INDEX_TRIGGER)
+        || has_flag(buttons, PIMAX_BUTTON_PRIMARY_INDEX_TRIGGER);
+    let right_trigger_active = has_flag(active_1d, PIMAX_AXIS_1D_SECONDARY_INDEX_TRIGGER)
+        || has_flag(buttons, PIMAX_BUTTON_SECONDARY_INDEX_TRIGGER);
+    let left_grip_active = has_flag(active_1d, PIMAX_AXIS_1D_PRIMARY_HAND_TRIGGER)
+        || has_flag(buttons, PIMAX_BUTTON_PRIMARY_HAND_TRIGGER);
+    let right_grip_active = has_flag(active_1d, PIMAX_AXIS_1D_SECONDARY_HAND_TRIGGER)
+        || has_flag(buttons, PIMAX_BUTTON_SECONDARY_HAND_TRIGGER);
+
+    let left_stick_active = has_flag(active_2d, PIMAX_AXIS_2D_PRIMARY_THUMBSTICK)
+        || has_flag(buttons, PIMAX_BUTTON_PRIMARY_THUMBSTICK);
+    let right_stick_active = has_flag(active_2d, PIMAX_AXIS_2D_SECONDARY_THUMBSTICK)
+        || has_flag(buttons, PIMAX_BUTTON_SECONDARY_THUMBSTICK);
+
+    let left_thumbstick_x = if left_stick_active {
+        derive_stick_axis(
+            has_flag(buttons, PIMAX_BUTTON_PRIMARY_THUMBSTICK_LEFT),
+            has_flag(buttons, PIMAX_BUTTON_PRIMARY_THUMBSTICK_RIGHT),
+        )
+    } else {
+        0.0
+    };
+    let left_thumbstick_y = if left_stick_active {
+        derive_stick_axis(
+            has_flag(buttons, PIMAX_BUTTON_PRIMARY_THUMBSTICK_DOWN),
+            has_flag(buttons, PIMAX_BUTTON_PRIMARY_THUMBSTICK_UP),
+        )
+    } else {
+        0.0
+    };
+    let right_thumbstick_x = if right_stick_active {
+        derive_stick_axis(
+            has_flag(buttons, PIMAX_BUTTON_SECONDARY_THUMBSTICK_LEFT),
+            has_flag(buttons, PIMAX_BUTTON_SECONDARY_THUMBSTICK_RIGHT),
+        )
+    } else {
+        0.0
+    };
+    let right_thumbstick_y = if right_stick_active {
+        derive_stick_axis(
+            has_flag(buttons, PIMAX_BUTTON_SECONDARY_THUMBSTICK_DOWN),
+            has_flag(buttons, PIMAX_BUTTON_SECONDARY_THUMBSTICK_UP),
+        )
+    } else {
+        0.0
+    };
+
+    let now = Instant::now();
+    let battery = clamp_battery_percent(battery);
+    crate::controller::update_controller_state(
+        crate::controller::Hand::Left,
+        crate::controller::SingleControllerState {
+            connected: true,
+            handle: runtime.handle,
+            motion: None,
+            buttons_pressed: left_buttons,
+            buttons_touched: left_touches,
+            trigger: if left_trigger_active { 1.0 } else { 0.0 },
+            grip: if left_grip_active { 1.0 } else { 0.0 },
+            thumbstick_x: left_thumbstick_x,
+            thumbstick_y: left_thumbstick_y,
+            battery_percent: battery,
+            last_updated: now,
+        },
+    );
+    crate::controller::update_controller_state(
+        crate::controller::Hand::Right,
+        crate::controller::SingleControllerState {
+            connected: true,
+            handle: runtime.handle,
+            motion: None,
+            buttons_pressed: right_buttons,
+            buttons_touched: right_touches,
+            trigger: if right_trigger_active { 1.0 } else { 0.0 },
+            grip: if right_grip_active { 1.0 } else { 0.0 },
+            thumbstick_x: right_thumbstick_x,
+            thumbstick_y: right_thumbstick_y,
+            battery_percent: battery,
+            last_updated: now,
+        },
+    );
+
+    runtime.poll_count = runtime.poll_count.wrapping_add(1);
+    let changed = buttons != runtime.last_buttons
+        || touches != runtime.last_touches
+        || active_1d != runtime.last_active_1d
+        || active_2d != runtime.last_active_2d
+        || battery as i32 != runtime.last_battery;
+    if changed || runtime.poll_count <= 5 || runtime.poll_count % 120 == 0 {
+        info!(
+            "Pimax controller SDK poll: count={} handle={} raw_buttons=0x{buttons:08x} raw_touches=0x{touches:08x} active_1d=0x{active_1d:08x} active_2d=0x{active_2d:08x} battery={} left_buttons=0x{left_buttons:08x} right_buttons=0x{right_buttons:08x} left_stick=({left_thumbstick_x:.1},{left_thumbstick_y:.1}) right_stick=({right_thumbstick_x:.1},{right_thumbstick_y:.1})",
+            runtime.poll_count, runtime.handle, battery
+        );
+    }
+    runtime.last_buttons = buttons;
+    runtime.last_touches = touches;
+    runtime.last_active_1d = active_1d;
+    runtime.last_active_2d = active_2d;
+    runtime.last_battery = battery as i32;
+}
+
+fn start_pimax_controller_runtime(
+    env: &mut jni::JNIEnv<'_>,
+    context: &JObject<'_>,
+) -> Result<Option<PimaxControllerRuntime>> {
+    let Some(default_service) = probe_pvr_controller_defaults(env) else {
+        warn!("Pimax controller SDK runtime disabled: default service unavailable");
+        return Ok(None);
+    };
+
+    let client =
+        create_pvr_service_client(env, context).context("create controller runtime client")?;
+    if let Err(err) = connect_pvr_service_client(env, &client) {
+        warn!("Pimax controller SDK runtime Connect failed: {err:#}");
+        return Ok(None);
+    }
+    if let Err(err) = wait_for_pvr_service_interface(env, &client, Duration::from_secs(3)) {
+        warn!("Pimax controller SDK runtime service wait failed: {err:#}");
+        if let Err(disconnect_err) = disconnect_pvr_service_client(env, &client) {
+            warn!("Pimax controller SDK runtime disconnect after failed wait failed: {disconnect_err:#}");
+        }
+        return Ok(None);
+    }
+
+    let start_info = match pvr_service_controller_start(env, &client, &default_service) {
+        Ok(info) => info,
+        Err(err) => {
+            warn!("Pimax controller SDK runtime ControllerStart failed: {err:#}");
+            if let Err(disconnect_err) = disconnect_pvr_service_client(env, &client) {
+                warn!(
+                    "Pimax controller SDK runtime disconnect after failed start failed: {disconnect_err:#}"
+                );
+            }
+            return Ok(None);
+        }
+    };
+    if let Err(err) = dump_object_declared_fields(env, &start_info, "ControllerRuntimeStartInfo") {
+        warn!("failed to dump ControllerRuntimeStartInfo: {err:#}");
+    }
+    let Some(handle) = infer_controller_start_handle(env, &start_info) else {
+        if let Err(disconnect_err) = disconnect_pvr_service_client(env, &client) {
+            warn!(
+                "Pimax controller SDK runtime disconnect after missing handle failed: {disconnect_err:#}"
+            );
+        }
+        bail!("ControllerStart succeeded but no controller handle was found");
+    };
+    let native_fd = get_declared_int_field_by_name(env, &start_info, "m_nativeFd").unwrap_or(-1);
+    let fd_size =
+        get_declared_int_field_by_name(env, &start_info, "m_fd_size").unwrap_or_default() as usize;
+    let ring_mapping = map_pimax_controller_ring_buffer(native_fd, fd_size);
+    info!(
+        "Pimax controller SDK runtime started: service={default_service} handle={handle} native_fd={native_fd} fd_size={fd_size}"
+    );
+
+    Ok(Some(PimaxControllerRuntime {
+        client,
+        handle,
+        native_fd,
+        fd_size,
+        ring_mapping,
+        last_ring_sample: Vec::new(),
+        last_ring_change_log: Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now),
+        last_poll: Instant::now()
+            .checked_sub(PIMAX_CONTROLLER_RING_SAMPLE_INTERVAL)
+            .unwrap_or_else(Instant::now),
+        last_query_poll: Instant::now()
+            .checked_sub(PIMAX_CONTROLLER_QUERY_INTERVAL)
+            .unwrap_or_else(Instant::now),
+        last_buttons: u32::MAX,
+        last_touches: u32::MAX,
+        last_active_1d: u32::MAX,
+        last_active_2d: u32::MAX,
+        last_battery: i32::MIN,
+        poll_count: 0,
+    }))
+}
+
+fn poll_pimax_controller_runtime(env: &mut jni::JNIEnv<'_>, runtime: &mut PimaxControllerRuntime) {
+    if runtime.last_poll.elapsed() >= PIMAX_CONTROLLER_RING_SAMPLE_INTERVAL {
+        runtime.last_poll = Instant::now();
+        sample_pimax_controller_ring_buffer(runtime);
+    }
+
+    if runtime.last_query_poll.elapsed() < PIMAX_CONTROLLER_QUERY_INTERVAL {
+        return;
+    }
+    runtime.last_query_poll = Instant::now();
+
+    let query = |env: &mut jni::JNIEnv<'_>, query_type| {
+        pvr_service_controller_query_int(env, &runtime.client, runtime.handle, query_type)
+    };
+    let battery = match query(env, PIMAX_CONTROLLER_QUERY_BATTERY) {
+        Ok(value) => value,
+        Err(err) => {
+            warn!("Pimax controller SDK battery query failed: {err:#}");
+            return;
+        }
+    };
+    let buttons = match query(env, PIMAX_CONTROLLER_QUERY_ACTIVE_BUTTONS) {
+        Ok(value) => value as u32,
+        Err(err) => {
+            warn!("Pimax controller SDK active-buttons query failed: {err:#}");
+            return;
+        }
+    };
+    let active_2d = match query(env, PIMAX_CONTROLLER_QUERY_ACTIVE_2D_ANALOGS) {
+        Ok(value) => value as u32,
+        Err(err) => {
+            warn!("Pimax controller SDK active-2d query failed: {err:#}");
+            return;
+        }
+    };
+    let active_1d = match query(env, PIMAX_CONTROLLER_QUERY_ACTIVE_1D_ANALOGS) {
+        Ok(value) => value as u32,
+        Err(err) => {
+            warn!("Pimax controller SDK active-1d query failed: {err:#}");
+            return;
+        }
+    };
+    let touches = match query(env, PIMAX_CONTROLLER_QUERY_ACTIVE_TOUCH_BUTTONS) {
+        Ok(value) => value as u32,
+        Err(err) => {
+            warn!("Pimax controller SDK active-touch query failed: {err:#}");
+            return;
+        }
+    };
+
+    push_pimax_controller_states(runtime, buttons, touches, active_1d, active_2d, battery);
+}
+
+fn stop_pimax_controller_runtime(env: &mut jni::JNIEnv<'_>, mut runtime: PimaxControllerRuntime) {
+    if let Err(err) = pvr_service_controller_stop(env, &runtime.client, runtime.handle) {
+        warn!(
+            "Pimax controller SDK runtime ControllerStop({}) failed: {err:#}",
+            runtime.handle
+        );
+    } else {
+        info!(
+            "Pimax controller SDK runtime stopped handle={}",
+            runtime.handle
+        );
+    }
+    if let Err(err) = disconnect_pvr_service_client(env, &runtime.client) {
+        warn!("Pimax controller SDK runtime Disconnect failed: {err:#}");
+    }
+    if let Some(mapping) = runtime.ring_mapping.take() {
+        unmap_pimax_controller_ring_buffer(mapping);
+    }
+    close_pimax_controller_fd(runtime.native_fd);
+    crate::controller::update_controller_connection(crate::controller::Hand::Left, false);
+    crate::controller::update_controller_connection(crate::controller::Hand::Right, false);
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PimaxNativeControllerState {
+    bytes: [u8; PIMAX_NATIVE_CONTROLLER_STATE_SIZE],
+}
+
+impl Default for PimaxNativeControllerState {
+    fn default() -> Self {
+        Self {
+            bytes: [0; PIMAX_NATIVE_CONTROLLER_STATE_SIZE],
+        }
+    }
+}
+
+type SxrControllerStartTrackingFn = unsafe extern "C" fn(*const libc::c_char) -> i32;
+type SxrControllerStopTrackingFn = unsafe extern "C" fn(i32);
+type SxrControllerGetStateFn = unsafe extern "C" fn(i32, i32) -> PimaxNativeControllerState;
+
+struct PimaxNativeControllerApi {
+    dl_handle: *mut c_void,
+    start_tracking: SxrControllerStartTrackingFn,
+    stop_tracking: SxrControllerStopTrackingFn,
+    get_state: SxrControllerGetStateFn,
+}
+
+struct PimaxNativeControllerRuntime {
+    api: PimaxNativeControllerApi,
+    controllers: Vec<PimaxNativeControllerHandle>,
+    last_poll: Instant,
+    last_change_log: Instant,
+    poll_count: u64,
+}
+
+struct PimaxNativeControllerHandle {
+    hand: crate::controller::Hand,
+    descriptor: CString,
+    handle: i32,
+    last_state: PimaxNativeControllerState,
+    last_parsed: PimaxNativeControllerParsed,
+    last_battery: u8,
+    last_battery_poll: Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PimaxNativeControllerParsed {
+    orientation: glam::Quat,
+    position: glam::Vec3,
+    linear_velocity: glam::Vec3,
+    angular_velocity: glam::Vec3,
+    timestamp_ns: u64,
+    buttons: u32,
+    touches: u32,
+    thumbstick_x: f32,
+    thumbstick_y: f32,
+    trigger: f32,
+    grip: f32,
+}
+
+impl Default for PimaxNativeControllerParsed {
+    fn default() -> Self {
+        Self {
+            orientation: glam::Quat::IDENTITY,
+            position: glam::Vec3::ZERO,
+            linear_velocity: glam::Vec3::ZERO,
+            angular_velocity: glam::Vec3::ZERO,
+            timestamp_ns: 0,
+            buttons: 0,
+            touches: 0,
+            thumbstick_x: 0.0,
+            thumbstick_y: 0.0,
+            trigger: 0.0,
+            grip: 0.0,
+        }
+    }
+}
+
+fn dlerror_string() -> String {
+    let err = unsafe { libc::dlerror() };
+    if err.is_null() {
+        "unknown dlerror".to_string()
+    } else {
+        unsafe { CStr::from_ptr(err) }
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+unsafe fn load_pimax_native_symbol<T: Copy>(dl_handle: *mut c_void, name: &str) -> Result<T> {
+    let symbol_name = CString::new(name).with_context(|| format!("create symbol name {name}"))?;
+    libc::dlerror();
+    let raw = libc::dlsym(dl_handle, symbol_name.as_ptr());
+    if raw.is_null() {
+        bail!("dlsym({name}) failed: {}", dlerror_string());
+    }
+    Ok(mem::transmute_copy::<*mut c_void, T>(&raw))
+}
+
+fn open_pimax_native_controller_api() -> Result<Option<PimaxNativeControllerApi>> {
+    let library = CString::new("libpxrapi.so").context("create libpxrapi.so name")?;
+    unsafe {
+        libc::dlerror();
+    }
+    let dl_handle = unsafe { libc::dlopen(library.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+    if dl_handle.is_null() {
+        warn!(
+            "native Pimax controller runtime disabled: dlopen(libpxrapi.so) failed: {}",
+            dlerror_string()
+        );
+        return Ok(None);
+    }
+
+    let load_result = unsafe {
+        let start_tracking = load_pimax_native_symbol::<SxrControllerStartTrackingFn>(
+            dl_handle,
+            "sxrControllerStartTracking",
+        )?;
+        let stop_tracking = load_pimax_native_symbol::<SxrControllerStopTrackingFn>(
+            dl_handle,
+            "sxrControllerStopTracking",
+        )?;
+        let get_state = load_pimax_native_symbol::<SxrControllerGetStateFn>(
+            dl_handle,
+            "sxrControllerGetState",
+        )?;
+        Ok::<_, anyhow::Error>(PimaxNativeControllerApi {
+            dl_handle,
+            start_tracking,
+            stop_tracking,
+            get_state,
+        })
+    };
+
+    match load_result {
+        Ok(api) => Ok(Some(api)),
+        Err(err) => {
+            unsafe {
+                libc::dlclose(dl_handle);
+            }
+            Err(err).context("load native Pimax controller symbols")
+        }
+    }
+}
+
+fn close_pimax_native_controller_api(api: PimaxNativeControllerApi) {
+    let result = unsafe { libc::dlclose(api.dl_handle) };
+    if result != 0 {
+        warn!("dlclose(libpxrapi.so) failed: {}", dlerror_string());
+    }
+}
+
+fn read_u32_at(bytes: &[u8], offset: usize) -> u32 {
+    let Some(window) = bytes.get(offset..offset + 4) else {
+        return 0;
+    };
+    u32::from_le_bytes([window[0], window[1], window[2], window[3]])
+}
+
+fn read_u64_at(bytes: &[u8], offset: usize) -> u64 {
+    let Some(window) = bytes.get(offset..offset + 8) else {
+        return 0;
+    };
+    u64::from_le_bytes([
+        window[0], window[1], window[2], window[3], window[4], window[5], window[6], window[7],
+    ])
+}
+
+fn read_f32_at(bytes: &[u8], offset: usize) -> f32 {
+    f32::from_bits(read_u32_at(bytes, offset))
+}
+
+fn read_vec3_at(bytes: &[u8], offset: usize) -> glam::Vec3 {
+    let value = glam::vec3(
+        read_f32_at(bytes, offset),
+        read_f32_at(bytes, offset + 4),
+        read_f32_at(bytes, offset + 8),
+    );
+    if value.is_finite() {
+        value
+    } else {
+        glam::Vec3::ZERO
+    }
+}
+
+fn sanitize_pimax_quat(raw: glam::Quat) -> glam::Quat {
+    if !raw.is_finite() {
+        return glam::Quat::IDENTITY;
+    }
+    let length_squared = raw.length_squared();
+    if !(0.001..=4.0).contains(&length_squared) {
+        return glam::Quat::IDENTITY;
+    }
+    raw.normalize()
+}
+
+fn normalize_pimax_native_axis(value: f32) -> f32 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    if value.abs() > 2.0 {
+        ((value - 128.0) / 127.0).clamp(-1.0, 1.0)
+    } else {
+        value.clamp(-1.0, 1.0)
+    }
+}
+
+fn normalize_pimax_native_trigger(value: f32) -> f32 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    if value > 1.5 {
+        (value / 255.0).clamp(0.0, 1.0)
+    } else {
+        value.clamp(0.0, 1.0)
+    }
+}
+
+fn parse_pimax_native_controller_state(
+    state: &PimaxNativeControllerState,
+) -> PimaxNativeControllerParsed {
+    let bytes = &state.bytes;
+    let orientation = sanitize_pimax_quat(glam::Quat::from_xyzw(
+        read_f32_at(bytes, 0x00),
+        read_f32_at(bytes, 0x04),
+        read_f32_at(bytes, 0x08),
+        read_f32_at(bytes, 0x0c),
+    ));
+    let position = read_vec3_at(bytes, 0x10);
+    let angular_velocity = read_vec3_at(bytes, 0x1c);
+    let linear_velocity = read_vec3_at(bytes, 0x28);
+    let timestamp_ns = read_u64_at(bytes, 0x38);
+    let buttons = read_u32_at(bytes, 0x40);
+    let thumbstick_x = normalize_pimax_native_axis(read_f32_at(bytes, 0x44));
+    let thumbstick_y = normalize_pimax_native_axis(read_f32_at(bytes, 0x48));
+    let trigger = normalize_pimax_native_trigger(read_f32_at(bytes, 0x64));
+    let grip = normalize_pimax_native_trigger(read_f32_at(bytes, 0x6c));
+    let touches = read_u32_at(bytes, 0x84);
+
+    PimaxNativeControllerParsed {
+        orientation,
+        position,
+        linear_velocity,
+        angular_velocity,
+        timestamp_ns,
+        buttons,
+        touches,
+        thumbstick_x,
+        thumbstick_y,
+        trigger,
+        grip,
+    }
+}
+
+fn format_pimax_native_state_changes(
+    before: &PimaxNativeControllerState,
+    after: &PimaxNativeControllerState,
+) -> String {
+    let mut changed_words = Vec::new();
+    for offset in (0..PIMAX_NATIVE_CONTROLLER_STATE_SIZE).step_by(4) {
+        let old = read_u32_at(&before.bytes, offset);
+        let new = read_u32_at(&after.bytes, offset);
+        if old != new {
+            if changed_words.len() < PIMAX_NATIVE_CONTROLLER_MAX_CHANGE_LOG_WORDS {
+                changed_words.push(format!("0x{offset:02x}:0x{old:08x}->0x{new:08x}"));
+            } else {
+                break;
+            }
+        }
+    }
+    changed_words.join(", ")
+}
+
+fn read_pimax_controller_battery(hand: crate::controller::Hand) -> Option<u8> {
+    let path = match hand {
+        crate::controller::Hand::Left => "/sys/class/pimax_controller/controller_left/battery",
+        crate::controller::Hand::Right => "/sys/class/pimax_controller/controller_right/battery",
+    };
+    let text = std::fs::read_to_string(path).ok()?;
+    let value = text.trim().parse::<i32>().ok()?;
+    Some(clamp_battery_percent(value))
+}
+
+fn map_pimax_native_buttons(
+    _hand: crate::controller::Hand,
+    parsed: &PimaxNativeControllerParsed,
+) -> (u32, u32) {
+    let mut pressed = 0_u32;
+    let mut touched = 0_u32;
+    let buttons = parsed.buttons;
+    let touches = parsed.touches;
+
+    if has_flag(buttons, PIMAX_BUTTON_PRIMARY_INDEX_TRIGGER)
+        || has_flag(buttons, PIMAX_BUTTON_SECONDARY_INDEX_TRIGGER)
+        || parsed.trigger > 0.2
+    {
+        pressed |= ALVR_BUTTON_TRIGGER;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_PRIMARY_HAND_TRIGGER)
+        || has_flag(buttons, PIMAX_BUTTON_SECONDARY_HAND_TRIGGER)
+        || parsed.grip > 0.2
+    {
+        pressed |= ALVR_BUTTON_GRIP;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_PRIMARY_THUMBSTICK)
+        || has_flag(buttons, PIMAX_BUTTON_SECONDARY_THUMBSTICK)
+    {
+        pressed |= ALVR_BUTTON_THUMBSTICK_CLICK;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_BACK) || has_flag(buttons, PIMAX_BUTTON_START) {
+        pressed |= ALVR_BUTTON_MENU;
+    }
+
+    // Crystal OG native sxrControllerGetState reports the face buttons as the
+    // low two bits for both hands: left X/right A = bit 0, left Y/right B = bit 1.
+    // Keep the older THREE/FOUR constants as a harmless fallback for the Binder
+    // query layout seen in Pimax/Qualcomm docs.
+    if has_flag(buttons, PIMAX_BUTTON_ONE) || has_flag(buttons, PIMAX_BUTTON_THREE) {
+        pressed |= ALVR_BUTTON_AX;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_TWO) || has_flag(buttons, PIMAX_BUTTON_FOUR) {
+        pressed |= ALVR_BUTTON_BY;
+    }
+
+    if has_flag(touches, PIMAX_NATIVE_TOUCH_TRIGGER) || parsed.trigger > 0.01 {
+        touched |= ALVR_BUTTON_TRIGGER;
+    }
+    if has_flag(touches, PIMAX_NATIVE_TOUCH_GRIP) || parsed.grip > 0.01 {
+        touched |= ALVR_BUTTON_GRIP;
+    }
+    if has_flag(touches, PIMAX_TOUCH_PRIMARY_THUMBSTICK)
+        || has_flag(touches, PIMAX_TOUCH_SECONDARY_THUMBSTICK)
+    {
+        touched |= ALVR_BUTTON_THUMBSTICK_CLICK;
+    }
+    if has_flag(touches, PIMAX_TOUCH_ONE) || has_flag(touches, PIMAX_TOUCH_THREE) {
+        touched |= ALVR_BUTTON_AX;
+    }
+    if has_flag(touches, PIMAX_TOUCH_TWO) || has_flag(touches, PIMAX_TOUCH_FOUR) {
+        touched |= ALVR_BUTTON_BY;
+    }
+
+    (pressed, touched)
+}
+
+fn push_pimax_native_controller_state(
+    controller: &PimaxNativeControllerHandle,
+    parsed: PimaxNativeControllerParsed,
+) {
+    let (buttons_pressed, buttons_touched) = map_pimax_native_buttons(controller.hand, &parsed);
+    crate::controller::update_controller_state(
+        controller.hand,
+        crate::controller::SingleControllerState {
+            connected: true,
+            handle: controller.handle,
+            motion: Some(crate::client::DeviceMotion {
+                pose: crate::client::Pose {
+                    orientation: parsed.orientation,
+                    position: parsed.position,
+                },
+                linear_velocity: parsed.linear_velocity,
+                angular_velocity: parsed.angular_velocity,
+            }),
+            buttons_pressed,
+            buttons_touched,
+            trigger: parsed.trigger,
+            grip: parsed.grip,
+            thumbstick_x: parsed.thumbstick_x,
+            thumbstick_y: parsed.thumbstick_y,
+            battery_percent: controller.last_battery,
+            last_updated: Instant::now(),
+        },
+    );
+}
+
+fn start_pimax_native_controller_runtime() -> Result<Option<PimaxNativeControllerRuntime>> {
+    let Some(api) = open_pimax_native_controller_api()? else {
+        return Ok(None);
+    };
+
+    let mut controllers = Vec::new();
+    for (hand, descriptor) in [
+        (crate::controller::Hand::Left, "left"),
+        (crate::controller::Hand::Right, "right"),
+    ] {
+        let descriptor = CString::new(descriptor).context("create native controller descriptor")?;
+        let handle = unsafe { (api.start_tracking)(descriptor.as_ptr()) };
+        if handle < 0 {
+            warn!(
+                "native Pimax controller start failed: hand={hand:?} descriptor={} handle={handle}",
+                descriptor.to_string_lossy()
+            );
+            continue;
+        }
+        let battery = read_pimax_controller_battery(hand).unwrap_or(100);
+        info!(
+            "native Pimax controller started: hand={hand:?} descriptor={} handle={handle} battery={battery}",
+            descriptor.to_string_lossy()
+        );
+        crate::controller::update_controller_connection(hand, true);
+        controllers.push(PimaxNativeControllerHandle {
+            hand,
+            descriptor,
+            handle,
+            last_state: PimaxNativeControllerState::default(),
+            last_parsed: PimaxNativeControllerParsed::default(),
+            last_battery: battery,
+            last_battery_poll: Instant::now()
+                .checked_sub(PIMAX_NATIVE_CONTROLLER_BATTERY_INTERVAL)
+                .unwrap_or_else(Instant::now),
+        });
+    }
+
+    if controllers.is_empty() {
+        warn!("native Pimax controller runtime disabled: no controller handles started");
+        close_pimax_native_controller_api(api);
+        return Ok(None);
+    }
+
+    info!(
+        "native Pimax controller runtime active: handles={}",
+        controllers
+            .iter()
+            .map(|controller| format!("{:?}:{}", controller.hand, controller.handle))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    Ok(Some(PimaxNativeControllerRuntime {
+        api,
+        controllers,
+        last_poll: Instant::now()
+            .checked_sub(PIMAX_NATIVE_CONTROLLER_POLL_INTERVAL)
+            .unwrap_or_else(Instant::now),
+        last_change_log: Instant::now()
+            .checked_sub(PIMAX_NATIVE_CONTROLLER_CHANGE_LOG_INTERVAL)
+            .unwrap_or_else(Instant::now),
+        poll_count: 0,
+    }))
+}
+
+fn poll_pimax_native_controller_runtime(runtime: &mut PimaxNativeControllerRuntime) {
+    if runtime.last_poll.elapsed() < PIMAX_NATIVE_CONTROLLER_POLL_INTERVAL {
+        return;
+    }
+    runtime.last_poll = Instant::now();
+    runtime.poll_count = runtime.poll_count.wrapping_add(1);
+
+    let can_log_change =
+        runtime.last_change_log.elapsed() >= PIMAX_NATIVE_CONTROLLER_CHANGE_LOG_INTERVAL;
+    let mut logged_change = false;
+
+    for controller in &mut runtime.controllers {
+        if controller.last_battery_poll.elapsed() >= PIMAX_NATIVE_CONTROLLER_BATTERY_INTERVAL {
+            if let Some(battery) = read_pimax_controller_battery(controller.hand) {
+                controller.last_battery = battery;
+            }
+            controller.last_battery_poll = Instant::now();
+        }
+
+        let state = unsafe { (runtime.api.get_state)(controller.handle, 0) };
+        let parsed = parse_pimax_native_controller_state(&state);
+        let state_changed = state != controller.last_state;
+        let controls_changed = parsed.buttons != controller.last_parsed.buttons
+            || parsed.touches != controller.last_parsed.touches
+            || (parsed.trigger - controller.last_parsed.trigger).abs() > 0.01
+            || (parsed.grip - controller.last_parsed.grip).abs() > 0.01
+            || (parsed.thumbstick_x - controller.last_parsed.thumbstick_x).abs() > 0.01
+            || (parsed.thumbstick_y - controller.last_parsed.thumbstick_y).abs() > 0.01;
+
+        let should_log_control_change =
+            controls_changed && (can_log_change || runtime.poll_count <= 5);
+        let should_log_initial_state = state_changed && runtime.poll_count <= 5;
+
+        if should_log_control_change || should_log_initial_state {
+            let changes = format_pimax_native_state_changes(&controller.last_state, &state);
+            info!(
+                "native Pimax controller control state: count={} hand={:?} descriptor={} handle={} buttons=0x{:08x} touches=0x{:08x} trigger={:.3} grip={:.3} stick=({:.3},{:.3}) pos=({:.3},{:.3},{:.3}) rot=({:.3},{:.3},{:.3},{:.3}) timestamp_ns={} battery={} changes=[{}]",
+                runtime.poll_count,
+                controller.hand,
+                controller.descriptor.to_string_lossy(),
+                controller.handle,
+                parsed.buttons,
+                parsed.touches,
+                parsed.trigger,
+                parsed.grip,
+                parsed.thumbstick_x,
+                parsed.thumbstick_y,
+                parsed.position.x,
+                parsed.position.y,
+                parsed.position.z,
+                parsed.orientation.x,
+                parsed.orientation.y,
+                parsed.orientation.z,
+                parsed.orientation.w,
+                parsed.timestamp_ns,
+                controller.last_battery,
+                changes
+            );
+            logged_change = true;
+        } else if runtime.poll_count <= 5 || runtime.poll_count % 180 == 0 {
+            info!(
+                "native Pimax controller poll: count={} hand={:?} handle={} buttons=0x{:08x} touches=0x{:08x} trigger={:.3} grip={:.3} stick=({:.3},{:.3}) pos=({:.3},{:.3},{:.3}) rot=({:.3},{:.3},{:.3},{:.3}) battery={}",
+                runtime.poll_count,
+                controller.hand,
+                controller.handle,
+                parsed.buttons,
+                parsed.touches,
+                parsed.trigger,
+                parsed.grip,
+                parsed.thumbstick_x,
+                parsed.thumbstick_y,
+                parsed.position.x,
+                parsed.position.y,
+                parsed.position.z,
+                parsed.orientation.x,
+                parsed.orientation.y,
+                parsed.orientation.z,
+                parsed.orientation.w,
+                controller.last_battery
+            );
+        }
+
+        push_pimax_native_controller_state(controller, parsed);
+        controller.last_state = state;
+        controller.last_parsed = parsed;
+    }
+
+    if logged_change {
+        runtime.last_change_log = Instant::now();
+    }
+}
+
+fn stop_pimax_native_controller_runtime(runtime: PimaxNativeControllerRuntime) {
+    for controller in &runtime.controllers {
+        unsafe {
+            (runtime.api.stop_tracking)(controller.handle);
+        }
+        info!(
+            "native Pimax controller stopped: hand={:?} descriptor={} handle={}",
+            controller.hand,
+            controller.descriptor.to_string_lossy(),
+            controller.handle
+        );
+        crate::controller::update_controller_connection(controller.hand, false);
+    }
+    close_pimax_native_controller_api(runtime.api);
+}
+
+fn probe_pvr_controller_defaults(env: &mut jni::JNIEnv<'_>) -> Option<String> {
+    match call_static_string(
+        env,
+        "com/pimax/vrservice/PxrServiceApi",
+        "ControllerGetDefaultService",
+        "()Ljava/lang/String;",
+        &[],
+    ) {
+        Ok(service) => {
+            info!("PxrServiceApi.ControllerGetDefaultService() -> {service}");
+            Some(service)
+        }
+        Err(err) => {
+            warn!("PxrServiceApi.ControllerGetDefaultService() failed: {err:#}");
+            None
+        }
+    }
+    .inspect(|_| {
+        match call_static_int(
+            env,
+            "com/pimax/vrservice/PxrServiceApi",
+            "ControllerGetDefaultBufferCnt",
+            "()I",
+            &[],
+        ) {
+            Ok(count) => info!("PxrServiceApi.ControllerGetDefaultBufferCnt() -> {count}"),
+            Err(err) => warn!("PxrServiceApi.ControllerGetDefaultBufferCnt() failed: {err:#}"),
+        }
+    })
+}
+
+fn probe_pvr_controller_client(
+    env: &mut jni::JNIEnv<'_>,
+    context: &JObject<'_>,
+    default_service: Option<&str>,
+) -> Result<()> {
+    let Some(default_service) = default_service else {
+        warn!("skipping ControllerStart probe because default controller service is unavailable");
+        return Ok(());
+    };
+
+    info!("starting short-lived PvrServiceClient controller probe");
+    let client =
+        create_pvr_service_client(env, context).context("create controller probe client")?;
+    let mut connected = false;
+    let mut started_handle = None;
+
+    let probe_result = (|| -> Result<()> {
+        connect_pvr_service_client(env, &client).context("connect controller probe client")?;
+        connected = true;
+        wait_for_pvr_service_interface(env, &client, Duration::from_secs(3))
+            .context("wait for controller probe service interface")?;
+        info!("PvrServiceClient controller probe connected");
+
+        let start_info = pvr_service_controller_start(env, &client, default_service)
+            .with_context(|| format!("ControllerStart({default_service})"))?;
+        dump_object_declared_fields(env, &start_info, "ControllerStartInfo")
+            .context("dump ControllerStartInfo")?;
+        started_handle = infer_controller_start_handle(env, &start_info);
+        Ok(())
+    })();
+
+    if let Some(handle) = started_handle {
+        if let Err(err) = pvr_service_controller_stop(env, &client, handle) {
+            warn!("ControllerStop({handle}) failed during probe cleanup: {err:#}");
+        } else {
+            info!("ControllerStop({handle}) succeeded during probe cleanup");
+        }
+    }
+    if connected {
+        if let Err(err) = disconnect_pvr_service_client(env, &client) {
+            warn!("PvrServiceClient.Disconnect failed after controller probe: {err:#}");
+        } else {
+            info!("PvrServiceClient controller probe disconnected");
+        }
+    }
+
+    probe_result
+}
+
 fn dump_enum_constants(env: &mut jni::JNIEnv<'_>, class_name: &str) -> Result<()> {
     let class_name_text = class_name.to_string();
     let class_name = env
@@ -1455,6 +2897,48 @@ fn dump_all_methods(env: &mut jni::JNIEnv<'_>, class_name: &str) -> Result<()> {
             .and_then(|object| object_to_string(env, object).context("method signature string"))?;
         info!("{class_name_text}::{signature}");
     }
+    Ok(())
+}
+
+fn dump_declared_inner_classes(env: &mut jni::JNIEnv<'_>, class_name: &str) -> Result<()> {
+    let class_name_text = class_name.to_string();
+    let class_name = env
+        .new_string(class_name)
+        .context("create class name string")?;
+    let class_name_obj = JObject::from(class_name);
+    let class = call_static_object(
+        env,
+        "java/lang/Class",
+        "forName",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        &[JValue::Object(&class_name_obj)],
+    )
+    .with_context(|| format!("load class {class_name_text}"))?;
+
+    let classes = env
+        .call_method(&class, "getDeclaredClasses", "()[Ljava/lang/Class;", &[])
+        .context("get declared inner classes")?
+        .l()
+        .context("decode declared inner classes")?;
+    let classes = JObjectArray::from(classes);
+    let count = env
+        .get_array_length(&classes)
+        .context("count declared inner classes")?;
+    info!("{class_name_text} has {count} declared inner classes");
+
+    for index in 0..count {
+        let class = env
+            .get_object_array_element(&classes, index)
+            .with_context(|| format!("get declared inner class {index}"))?;
+        let name: String = env
+            .call_method(&class, "getName", "()Ljava/lang/String;", &[])
+            .context("get inner class name")?
+            .l()
+            .context("decode inner class name")
+            .and_then(|object| object_to_string(env, object).context("inner class name string"))?;
+        info!("{class_name_text} inner class: {name}");
+    }
+
     Ok(())
 }
 
@@ -3544,8 +5028,8 @@ fn try_begin_and_submit_frame<'local>(
     let display_refresh = get_float_field(env, &device_info, "displayRefreshRateHz")?;
     let fov_x = get_float_field(env, &device_info, "targetFovXRad")?;
     let fov_y = get_float_field(env, &device_info, "targetFovYRad")?;
-    let eye_convergence_m = get_float_field(env, &device_info, "targetEyeConvergence")
-        .unwrap_or(0.0);
+    let eye_convergence_m =
+        get_float_field(env, &device_info, "targetEyeConvergence").unwrap_or(0.0);
     info!("Pimax targetEyeConvergence: {eye_convergence_m:.4} m");
     match call_static_float(
         env,
@@ -3564,7 +5048,8 @@ fn try_begin_and_submit_frame<'local>(
         )
     })
     .or_else(|_| call_method_float(env, &outer, "pxrGetInterpupillaryDistance", "()F", &[]))
-    .or_else(|_| call_method_float(env, &outer, "sxrGetInterpupillaryDistance", "()F", &[])) {
+    .or_else(|_| call_method_float(env, &outer, "sxrGetInterpupillaryDistance", "()F", &[]))
+    {
         Ok(runtime_ipd) => {
             info!("Pimax runtime IPD reported by PxrApi: raw={runtime_ipd:.3}");
             crate::client::update_alvr_ipd_from_pimax(runtime_ipd);
@@ -3578,7 +5063,9 @@ fn try_begin_and_submit_frame<'local>(
                     crate::client::update_alvr_ipd_from_pimax(raw_ipd);
                 }
                 None => {
-                    warn!("persist.sys.pmx.ipd system property unavailable; keeping default ALVR IPD");
+                    warn!(
+                        "persist.sys.pmx.ipd system property unavailable; keeping default ALVR IPD"
+                    );
                 }
             }
         }
@@ -3629,7 +5116,13 @@ fn try_begin_and_submit_frame<'local>(
     }
     info!(
         "Pimax device info: display={}x{} eye={}x{} refresh={}Hz fov=({}, {}) convergence={:.4}m",
-        display_width, display_height, eye_width, eye_height, display_refresh, fov_x, fov_y,
+        display_width,
+        display_height,
+        eye_width,
+        eye_height,
+        display_refresh,
+        fov_x,
+        fov_y,
         eye_convergence_m
     );
     crate::client::update_alvr_views_config_from_pimax(fov_x, fov_y, eye_width, eye_height);
@@ -3898,6 +5391,25 @@ fn try_begin_and_submit_frame<'local>(
     if !render_window_surface_mirror_enabled {
         info!("NativeActivity surface mirror disabled for VR texture submission run");
     }
+    let mut native_controller_runtime = match start_pimax_native_controller_runtime() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            warn!("native Pimax controller runtime unavailable: {err:#}");
+            None
+        }
+    };
+    let mut controller_runtime = if native_controller_runtime.is_some() {
+        info!("skipping Java/Binder controller runtime because native pxrapi controller runtime is active");
+        None
+    } else {
+        match start_pimax_controller_runtime(env, context) {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                warn!("Pimax controller SDK runtime unavailable: {err:#}");
+                None
+            }
+        }
+    };
     loop {
         if is_shutdown_requested() {
             info!("Pimax render loop exiting after shutdown request at frame {frame_index}");
@@ -3916,6 +5428,11 @@ fn try_begin_and_submit_frame<'local>(
         let slot_index = (frame_index.rem_euclid(eye_buffers.len() as i32)) as usize;
         let current_buffers = &eye_buffers[slot_index];
         let mut submitted_video_timestamp = None::<u64>;
+        if let Some(runtime) = native_controller_runtime.as_mut() {
+            poll_pimax_native_controller_runtime(runtime);
+        } else if let Some(runtime) = controller_runtime.as_mut() {
+            poll_pimax_controller_runtime(env, runtime);
+        }
         if let Some(offset) = vsync_offset_nanos {
             let phase_start = Instant::now();
             if let Err(err) = pump_pimax_vsync(env, offset) {
@@ -4280,6 +5797,12 @@ fn try_begin_and_submit_frame<'local>(
         thread::sleep(frame_interval);
     }
 
+    if let Some(runtime) = native_controller_runtime.take() {
+        stop_pimax_native_controller_runtime(runtime);
+    }
+    if let Some(runtime) = controller_runtime.take() {
+        stop_pimax_controller_runtime(env, runtime);
+    }
     cleanup_pimax_render_session(env, context, pvr_service_client, display_wake_lock.as_ref());
     Ok(())
 }
@@ -4379,6 +5902,68 @@ pub fn probe() -> PimaxProbeReport {
     ) {
         warn!("failed to dump matching PxrServiceApi methods: {err:#}");
     }
+    let controller_keywords = &[
+        "Controller",
+        "controller",
+        "Input",
+        "input",
+        "Button",
+        "button",
+        "Key",
+        "key",
+        "Trigger",
+        "trigger",
+        "Grip",
+        "grip",
+        "Joystick",
+        "joystick",
+        "Thumb",
+        "thumb",
+        "Stick",
+        "stick",
+        "Pose",
+        "pose",
+        "Tracking",
+        "tracking",
+        "Query",
+        "query",
+        "State",
+        "state",
+        "Haptic",
+        "haptic",
+        "Vibrator",
+        "vibrator",
+    ];
+    info!("probing Pimax controller/input SDK surface");
+    for class_name in [
+        "com.pimax.pxrapi.PxrApi",
+        "com.pimax.vrservice.PxrServiceApi",
+        "com.pimax.pxrapi.PvrServiceClient",
+        "com.pimax.vrservice.IPvrServiceInterface",
+    ] {
+        if let Err(err) = dump_matching_methods(&mut env, class_name, controller_keywords) {
+            warn!("failed to dump controller/input methods for {class_name}: {err:#}");
+        }
+        if let Err(err) = dump_matching_fields(&mut env, class_name, controller_keywords) {
+            warn!("failed to dump controller/input fields for {class_name}: {err:#}");
+        }
+        if let Err(err) = dump_declared_inner_classes(&mut env, class_name) {
+            warn!("failed to dump inner classes for {class_name}: {err:#}");
+        }
+    }
+    for class_name in [
+        "com.pimax.pxrapi.controller.ControllerStartInfo",
+        "com.pimax.pxrapi.controller.ControllerFd",
+        "com.pimax.pvrapi.controllers.IControllerInterfaceCallback",
+    ] {
+        if let Err(err) = dump_class_schema(&mut env, class_name) {
+            warn!("failed to dump controller class schema for {class_name}: {err:#}");
+        }
+        if let Err(err) = dump_all_methods(&mut env, class_name) {
+            warn!("failed to dump controller class methods for {class_name}: {err:#}");
+        }
+    }
+    let default_controller_service = probe_pvr_controller_defaults(&mut env);
     if let Err(err) = dump_enum_constants(&mut env, "com.pimax.pxrapi.PxrApi$sxrTextureType") {
         warn!("failed to dump sxrTextureType constants: {err:#}");
     }
@@ -4470,6 +6055,11 @@ pub fn probe() -> PimaxProbeReport {
             "PxrApi current tracking mode: {}",
             format_tracking_modes(mode)
         );
+    }
+    if let Err(err) =
+        probe_pvr_controller_client(&mut env, pxr_context, default_controller_service.as_deref())
+    {
+        warn!("PvrServiceClient controller probe failed: {err:#}");
     }
 
     let bootstrap_tracking_mode = select_bootstrap_tracking_mode(report.supported_tracking_modes);
