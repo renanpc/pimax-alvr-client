@@ -162,7 +162,7 @@ use std::{
 /// take long enough to trip the Android launch timeout on some boots. Keep the
 /// default path lightweight so the headset gets a frame up quickly.
 const PIMAX_VERBOSE_STARTUP_INTROSPECTION: bool = false;
-const ENABLE_NATIVE_PIMAX_CONTROLLER_RUNTIME: bool = false;
+const ENABLE_NATIVE_PIMAX_CONTROLLER_RUNTIME: bool = true;
 
 type EGLDisplay = *mut c_void;
 type EGLConfig = *mut c_void;

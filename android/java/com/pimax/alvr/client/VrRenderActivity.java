@@ -136,11 +136,11 @@ public final class VrRenderActivity extends NativeActivity {
     private static final int PMX_EVENT_TYPE_MOTOR_AND_LENS = 3;
 
     /**
-     * Loading {@code libpxrapi.so} explicitly can stall startup on some headset builds even
-     * though the framework already has a usable copy available. Keep this off unless we need
-     * to force the APK-bundled library for debugging.
+     * The native controller runtime resolves {@code sxrController*} symbols from libpxrapi.
+     * Load it before the Rust client so controller startup uses the same initialized path as
+     * stock Pimax apps instead of a late dlopen from native code.
      */
-    private static final boolean LOAD_PXRAPI_EAGERLY = false;
+    private static final boolean LOAD_PXRAPI_EAGERLY = true;
 
     // =========================================================================================
     // Fields
