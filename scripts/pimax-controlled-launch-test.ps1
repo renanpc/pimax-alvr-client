@@ -7,7 +7,8 @@ param(
     [int]$SteamVRRestartWaitSeconds = 25,
     [switch]$RebootBeforeRun,
     [switch]$RecoverAfterRun,
-    [switch]$SkipSteamVRRestart
+    [switch]$SkipSteamVRRestart,
+    [switch]$LeaveRunningWhenDisplayOff
 )
 
 Set-StrictMode -Version Latest
@@ -15,6 +16,9 @@ $ErrorActionPreference = "Stop"
 
 $packageName = "com.pimax.alvr.client"
 $launchComponent = "com.pimax.alvr.client/com.pimax.alvr.client.VrRenderActivity"
+$competingPackageNames = @(
+    "com.pimax.vrstreaming"
+)
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $guardianHelper = Join-Path $PSScriptRoot "pimax-ensure-guardian-stationary.ps1"
 $artifactRootPath = if ([System.IO.Path]::IsPathRooted($ArtifactRoot)) {
@@ -311,6 +315,23 @@ function Stop-AppForCleanLaunch {
     Write-DisplaySummary -Label $SnapshotLabel
 }
 
+function Stop-CompetingVrApps {
+    Write-Host "Stopping competing Pimax VR apps before launch..."
+    foreach ($competingPackageName in $competingPackageNames) {
+        Save-AdbSnapshot `
+            -FileName "pid-competing-$competingPackageName.txt" `
+            -Description "pid for competing package $competingPackageName" `
+            -AdbCommandArgs @("shell", "pidof $competingPackageName") `
+            -AllowFailure | Out-Null
+
+        Save-AdbSnapshot `
+            -FileName "force-stop-competing-$competingPackageName.txt" `
+            -Description "force-stop competing package $competingPackageName" `
+            -AdbCommandArgs @("shell", "am force-stop $competingPackageName") `
+            -AllowFailure | Out-Null
+    }
+}
+
 function Grant-AppWriteSettings {
     Write-Host "Granting WRITE_SETTINGS app-op for $packageName..."
     $grant = Invoke-AdbCommand `
@@ -339,12 +360,20 @@ function Set-PimaxBootProperties {
     Save-AdbSnapshot `
         -FileName "pimax-boot-properties-before-$Reason.txt" `
         -Description "Pimax boot properties before $Reason" `
-        -AdbCommandArgs @("shell", 'echo sta_pm=$(getprop persist.sys.pmx.sta.pm.enable); echo disable_psensor=$(getprop persist.sys.pmx.dbg.disable.psensor); echo sta_time=$(getprop persist.sys.pmx.sta.time); echo dim_screen=$(settings get system dim_screen); echo screen_off_timeout=$(settings get system screen_off_timeout); echo pmx_pc_screen_off_timeout=$(settings get system pmx_pc_screen_off_timeout)') `
+        -AdbCommandArgs @("shell", 'echo sta_pm=$(getprop persist.sys.pmx.sta.pm.enable); echo psensor_gotosleep=$(getprop persist.sys.pmx.psensor.gotosleep); echo disable_psensor=$(getprop persist.sys.pmx.dbg.disable.psensor); echo pc_switch=$(getprop sys.pmx.pc.switch); echo sta_time=$(getprop persist.sys.pmx.sta.time); echo dim_screen=$(settings get system dim_screen); echo screen_off_timeout=$(settings get system screen_off_timeout); echo pmx_pc_screen_off_timeout=$(settings get system pmx_pc_screen_off_timeout)') `
         -AllowFailure | Out-Null
 
     Invoke-AdbCommand `
+        -Description "disable transient Pimax PC-switch panel gate" `
+        -AdbCommandArgs @("shell", "setprop sys.pmx.pc.switch 0") `
+        -AllowFailure | Out-Null
+    Invoke-AdbCommand `
         -Description "disable Pimax station power-management property" `
         -AdbCommandArgs @("shell", "setprop persist.sys.pmx.sta.pm.enable false") `
+        -AllowFailure | Out-Null
+    Invoke-AdbCommand `
+        -Description "disable Pimax proximity/gyro sleep policy" `
+        -AdbCommandArgs @("shell", "setprop persist.sys.pmx.psensor.gotosleep false") `
         -AllowFailure | Out-Null
     Invoke-AdbCommand `
         -Description "restore normal Pimax proximity state-machine" `
@@ -366,7 +395,7 @@ function Set-PimaxBootProperties {
     Save-AdbSnapshot `
         -FileName "pimax-boot-properties-after-$Reason.txt" `
         -Description "Pimax boot properties after $Reason" `
-        -AdbCommandArgs @("shell", 'echo sta_pm=$(getprop persist.sys.pmx.sta.pm.enable); echo disable_psensor=$(getprop persist.sys.pmx.dbg.disable.psensor); echo sta_time=$(getprop persist.sys.pmx.sta.time); echo dim_screen=$(settings get system dim_screen); echo screen_off_timeout=$(settings get system screen_off_timeout); echo pmx_pc_screen_off_timeout=$(settings get system pmx_pc_screen_off_timeout)') `
+        -AdbCommandArgs @("shell", 'echo sta_pm=$(getprop persist.sys.pmx.sta.pm.enable); echo psensor_gotosleep=$(getprop persist.sys.pmx.psensor.gotosleep); echo disable_psensor=$(getprop persist.sys.pmx.dbg.disable.psensor); echo pc_switch=$(getprop sys.pmx.pc.switch); echo sta_time=$(getprop persist.sys.pmx.sta.time); echo dim_screen=$(settings get system dim_screen); echo screen_off_timeout=$(settings get system screen_off_timeout); echo pmx_pc_screen_off_timeout=$(settings get system pmx_pc_screen_off_timeout)') `
         -AllowFailure | Out-Null
 }
 
@@ -375,7 +404,7 @@ function Set-PimaxStreamingSettings {
     Save-AdbSnapshot `
         -FileName "settings-before-streaming-tweaks.txt" `
         -Description "settings before streaming tweaks" `
-        -AdbCommandArgs @("shell", 'echo eyechip_on=$(settings get system eyechip_on); echo peak_refresh_rate=$(settings get system peak_refresh_rate); echo dim_screen=$(settings get system dim_screen); echo screen_off_timeout=$(settings get system screen_off_timeout); echo pmx_pc_screen_off_timeout=$(settings get system pmx_pc_screen_off_timeout); echo sta_pm=$(getprop persist.sys.pmx.sta.pm.enable); echo disable_psensor=$(getprop persist.sys.pmx.dbg.disable.psensor)') `
+        -AdbCommandArgs @("shell", 'echo eyechip_on=$(settings get system eyechip_on); echo peak_refresh_rate=$(settings get system peak_refresh_rate); echo dim_screen=$(settings get system dim_screen); echo screen_off_timeout=$(settings get system screen_off_timeout); echo pmx_pc_screen_off_timeout=$(settings get system pmx_pc_screen_off_timeout); echo sta_pm=$(getprop persist.sys.pmx.sta.pm.enable); echo psensor_gotosleep=$(getprop persist.sys.pmx.psensor.gotosleep); echo disable_psensor=$(getprop persist.sys.pmx.dbg.disable.psensor); echo pc_switch=$(getprop sys.pmx.pc.switch)') `
         -AllowFailure | Out-Null
 
     Set-PimaxBootProperties -Reason "streaming-tweaks"
@@ -391,7 +420,7 @@ function Set-PimaxStreamingSettings {
     Save-AdbSnapshot `
         -FileName "settings-after-streaming-tweaks.txt" `
         -Description "settings after streaming tweaks" `
-        -AdbCommandArgs @("shell", 'echo eyechip_on=$(settings get system eyechip_on); echo peak_refresh_rate=$(settings get system peak_refresh_rate); echo dim_screen=$(settings get system dim_screen); echo screen_off_timeout=$(settings get system screen_off_timeout); echo pmx_pc_screen_off_timeout=$(settings get system pmx_pc_screen_off_timeout); echo sta_pm=$(getprop persist.sys.pmx.sta.pm.enable); echo disable_psensor=$(getprop persist.sys.pmx.dbg.disable.psensor)') `
+        -AdbCommandArgs @("shell", 'echo eyechip_on=$(settings get system eyechip_on); echo peak_refresh_rate=$(settings get system peak_refresh_rate); echo dim_screen=$(settings get system dim_screen); echo screen_off_timeout=$(settings get system screen_off_timeout); echo pmx_pc_screen_off_timeout=$(settings get system pmx_pc_screen_off_timeout); echo sta_pm=$(getprop persist.sys.pmx.sta.pm.enable); echo psensor_gotosleep=$(getprop persist.sys.pmx.psensor.gotosleep); echo disable_psensor=$(getprop persist.sys.pmx.dbg.disable.psensor); echo pc_switch=$(getprop sys.pmx.pc.switch)') `
         -AllowFailure | Out-Null
 }
 
@@ -502,7 +531,8 @@ function Save-DisplaySnapshot {
     Save-AdbSnapshot -FileName "surfaceflinger-$Label.txt" -Description "surfaceflinger $Label" -AdbCommandArgs @("shell", "dumpsys SurfaceFlinger") -AllowFailure | Out-Null
     Save-AdbSnapshot -FileName "activity-$Label.txt" -Description "activity $Label" -AdbCommandArgs @("shell", "dumpsys activity activities") -AllowFailure | Out-Null
     Save-AdbSnapshot -FileName "window-$Label.txt" -Description "window $Label" -AdbCommandArgs @("shell", "dumpsys window windows") -AllowFailure | Out-Null
-    Save-AdbSnapshot -FileName "settings-$Label.txt" -Description "settings $Label" -AdbCommandArgs @("shell", 'echo brightness=$(settings get system screen_brightness); echo brightness_mode=$(settings get system screen_brightness_mode); echo eyechip_on=$(settings get system eyechip_on); echo dim_screen=$(settings get system dim_screen); echo screen_off_timeout=$(settings get system screen_off_timeout); echo pmx_pc_screen_off_timeout=$(settings get system pmx_pc_screen_off_timeout); echo sta_pm=$(getprop persist.sys.pmx.sta.pm.enable); echo disable_psensor=$(getprop persist.sys.pmx.dbg.disable.psensor); echo guardian_effective=$(getprop pxr.vr.guardian.effective); echo pimax_guide=$(settings get system pimax_guide)') -AllowFailure | Out-Null
+    Save-AdbSnapshot -FileName "settings-$Label.txt" -Description "settings $Label" -AdbCommandArgs @("shell", 'echo brightness=$(settings get system screen_brightness); echo brightness_mode=$(settings get system screen_brightness_mode); echo eyechip_on=$(settings get system eyechip_on); echo dim_screen=$(settings get system dim_screen); echo screen_off_timeout=$(settings get system screen_off_timeout); echo pmx_pc_screen_off_timeout=$(settings get system pmx_pc_screen_off_timeout); echo sta_pm=$(getprop persist.sys.pmx.sta.pm.enable); echo psensor_gotosleep=$(getprop persist.sys.pmx.psensor.gotosleep); echo disable_psensor=$(getprop persist.sys.pmx.dbg.disable.psensor); echo pc_switch=$(getprop sys.pmx.pc.switch); echo guardian_effective=$(getprop pxr.vr.guardian.effective); echo pimax_guide=$(settings get system pimax_guide)') -AllowFailure | Out-Null
+    Save-AdbSnapshot -FileName "panel-$Label.txt" -Description "panel $Label" -AdbCommandArgs @("shell", 'echo panel_requested=$(cat /sys/class/backlight/panel0-backlight/brightness 2>/dev/null); echo panel_actual=$(cat /sys/class/backlight/panel0-backlight/actual_brightness 2>/dev/null); echo panel_bl_power=$(cat /sys/class/backlight/panel0-backlight/bl_power 2>/dev/null); echo wled_actual=$(cat /sys/class/backlight/backlight/actual_brightness 2>/dev/null); echo drm_dsi_status=$(cat /sys/class/drm/card0-DSI-1/status 2>/dev/null); echo drm_dsi_enabled=$(cat /sys/class/drm/card0-DSI-1/enabled 2>/dev/null); echo drm_dsi_dpms=$(cat /sys/class/drm/card0-DSI-1/dpms 2>/dev/null); echo pc_dp_present=$(cat /sys/class/pc_switch/switch/dp_present 2>/dev/null); echo pc_mode_sw=$(cat /sys/class/pc_switch/switch/is_pc_mode_sw 2>/dev/null); echo panel_run_frame=$(cat /sys/class/pc_switch/switch/panel_run_frame 2>/dev/null); echo panel_type=$(cat /sys/class/pc_switch/switch/panel_type 2>/dev/null)') -AllowFailure | Out-Null
 
     $remoteScreenshot = "/sdcard/pimax_controlled_launch_$Label.png"
     $localScreenshot = Join-Path $artifactDir "screencap-$Label.png"
@@ -541,6 +571,13 @@ function Write-DisplaySummary {
             ForEach-Object { Write-Host "  $($_.Line.Trim())" }
     }
 
+    $panelPath = Join-Path $artifactDir "panel-$Label.txt"
+    if (Test-Path $panelPath) {
+        Get-Content $panelPath |
+            Select-String -Pattern "^panel_requested=|^panel_actual=|^panel_bl_power=|^wled_actual=|^drm_dsi_status=|^drm_dsi_enabled=|^drm_dsi_dpms=|^pc_dp_present=|^pc_mode_sw=" |
+            ForEach-Object { Write-Host "  physical $($_.Line.Trim())" }
+    }
+
     $analysisPath = Join-Path $artifactDir "screencap-analysis-$Label.txt"
     if (Test-Path $analysisPath) {
         Get-Content $analysisPath |
@@ -556,14 +593,17 @@ function Test-DisplayOff {
 
     $powerPath = Join-Path $artifactDir "power-$Label.txt"
     $displayPath = Join-Path $artifactDir "display-$Label.txt"
+    $panelPath = Join-Path $artifactDir "panel-$Label.txt"
     $powerText = if (Test-Path $powerPath) { Get-Content $powerPath | Out-String } else { "" }
     $displayText = if (Test-Path $displayPath) { Get-Content $displayPath | Out-String } else { "" }
+    $panelText = if (Test-Path $panelPath) { Get-Content $panelPath | Out-String } else { "" }
 
     return (
         $powerText -match "Display Power: state=OFF" -or
         $powerText -match "mWakefulness=Asleep" -or
         $displayText -match "mGlobalDisplayState=OFF" -or
-        $displayText -match "mActualBacklight=0"
+        $displayText -match "mActualBacklight=0" -or
+        $panelText -match "(?m)^panel_actual=0$"
     )
 }
 
@@ -622,6 +662,7 @@ try {
     Initialize-HeadsetForRun -Reason "pre-run"
     Write-ProgressMarker "initialize pre-run end"
     Stop-AppForCleanLaunch
+    Stop-CompetingVrApps
     Grant-AppWriteSettings
     Set-PimaxStreamingSettings
     Write-ProgressMarker "network wait start"
@@ -656,7 +697,11 @@ try {
         }
     }
 
-    if ($displayOff) {
+    if ($displayOff -and $LeaveRunningWhenDisplayOff) {
+        Write-Warning "Display appears OFF during controlled launch; leaving ALVR running because -LeaveRunningWhenDisplayOff was provided."
+        Save-DisplaySnapshot -Label "after-display-off-left-running"
+        Write-DisplaySummary -Label "after-display-off-left-running"
+    } elseif ($displayOff) {
         Write-Warning "Display appears OFF during controlled launch; force-stopping ALVR."
         Save-AdbSnapshot -FileName "force-stop.txt" -Description "force-stop ALVR" -AdbCommandArgs @("shell", "am force-stop $packageName") -AllowFailure | Out-Null
         Start-Sleep -Seconds 2

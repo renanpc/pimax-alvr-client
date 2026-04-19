@@ -114,6 +114,12 @@ public final class VrRenderActivity extends NativeActivity {
     /** Pimax vendor setting used by stock WiFi Airlink's HmdSync while streaming. */
     private static final String PIMAX_EYECHIP_ON_SETTING = "eyechip_on";
 
+    /** Pimax runtime property that enables the PC/DP panel switch path. Keep disabled for Wi-Fi VR. */
+    private static final String PIMAX_PC_SWITCH_PROPERTY = "sys.pmx.pc.switch";
+
+    /** How often to reassert standalone panel mode while the VR activity is alive. */
+    private static final long PIMAX_PC_SWITCH_GUARD_INTERVAL_MS = 2_000L;
+
     // ---- Pimax hardware bridge constants ---------------------------------------------
 
     /**
@@ -157,6 +163,9 @@ public final class VrRenderActivity extends NativeActivity {
     /** Main-thread handler used to retry waking the display when the headset is put back on. */
     private Handler screenWakeHandler;
 
+    /** Main-thread handler that keeps Pimax's PC/DP switch path disabled during Wi-Fi streaming. */
+    private Handler pcSwitchGuardHandler;
+
     /** True while the proximity sensor reports that the headset is near the face. */
     private boolean headsetNear;
 
@@ -175,11 +184,25 @@ public final class VrRenderActivity extends NativeActivity {
     /** Hidden PowerManager.wakeUp requires DEVICE_POWER on this headset build. */
     private boolean powerWakeUpDenied;
 
+    /** Prevents overlapping setprop subprocesses if Android stalls while waking/sleeping. */
+    private volatile boolean pcSwitchSetInFlight;
+
     /** Re-pokes display power until the panel reports itself interactive again. */
     private final Runnable screenWakeRetryRunnable = new Runnable() {
         @Override
         public void run() {
             retryDisplayWakeIfNeeded();
+        }
+    };
+
+    /** Periodically reasserts the standalone/Wi-Fi panel path. */
+    private final Runnable pcSwitchGuardRunnable = new Runnable() {
+        @Override
+        public void run() {
+            setPimaxPcSwitchProperty("periodic guard");
+            if (pcSwitchGuardHandler != null) {
+                pcSwitchGuardHandler.postDelayed(this, PIMAX_PC_SWITCH_GUARD_INTERVAL_MS);
+            }
         }
     };
 
@@ -311,25 +334,24 @@ public final class VrRenderActivity extends NativeActivity {
                 // Screen has turned on — notify native so it can resume rendering.
                 pendingNativeScreenOn = true;
                 setPimaxEyechipEnabled(false, "screen-on broadcast");
+                startPimaxPcSwitchGuard("screen-on broadcast");
                 if (nativeLibrariesLoaded) {
                     nativeNotifyScreen(true);
                 }
-                pokeDisplayPower("screen-on broadcast");
-                forceScreenWakeLock("screen-on broadcast");
+                acquireScreenWakeLock("screen-on broadcast");
             } else if (Intent.ACTION_SCREEN_OFF.equals(action)) {
-                // Screen has turned off — notify native but intentionally keep the app
-                // running. Re-acquire the wake lock immediately so a transient screen-off
-                // event does not leave the headset blank while streaming continues.
+                // Let the Pimax system service own physical panel wake/sleep. Forcing an
+                // app wake here can bring Android back before the vendor panel switch has
+                // restored the display path, leaving a bright framebuffer behind a black
+                // headset panel.
                 pendingNativeScreenOn = false;
                 setPimaxEyechipEnabled(false, "screen-off broadcast");
                 if (nativeLibrariesLoaded) {
                     nativeNotifyScreen(false);
                 }
-                forceScreenWakeLock("screen-off broadcast");
-                if (headsetNear) {
-                    startDisplayWakeRetry("screen-off broadcast while near");
-                }
-                Log.i(TAG, "screen turned off; keeping app running for development");
+                stopDisplayWakeRetry("screen-off broadcast");
+                releaseScreenWakeLock();
+                Log.i(TAG, "screen turned off; released app wake lock until Pimax reports screen-on");
             } else if (ACTION_SHUTDOWN.equals(action)) {
                 Log.i(TAG, "received ALVR shutdown broadcast");
                 shutdownAndFinish("shutdown broadcast");
@@ -389,24 +411,25 @@ public final class VrRenderActivity extends NativeActivity {
         registerPimaxHardwareBridge();
         registerProximitySensor();
         startControllerPoller();
-        if (headsetNear) {
-            startDisplayWakeRetry("native bootstrap complete");
-        }
     }
 
     /**
      * Reasserts the display wake path on the UI thread when the headset is put back on.
      */
     private void handleHeadsetNear(String reason) {
-        pendingNativeScreenOn = true;
         setPimaxEyechipEnabled(false, reason);
+        PowerManager powerManager = (PowerManager) getSystemService(POWER_SERVICE);
+        if (powerManager != null && !powerManager.isInteractive()) {
+            Log.i(TAG, "headset near while Android display is not interactive; waiting for Pimax screen-on: "
+                    + reason);
+            return;
+        }
+        pendingNativeScreenOn = true;
         if (nativeLibrariesLoaded) {
             nativeNotifyScreen(true);
         }
         getWindow().addFlags(WINDOW_FLAGS_ON_CREATE | WINDOW_FLAGS_ON_FOCUS);
-        pokeDisplayPower(reason);
-        forceScreenWakeLock(reason);
-        startDisplayWakeRetry(reason);
+        acquireScreenWakeLock(reason);
     }
 
     /** Stops the wake retry loop when the headset is removed again. */
@@ -521,6 +544,7 @@ public final class VrRenderActivity extends NativeActivity {
         createScreenWakeLock();
         screenWakeHandler = new Handler(Looper.getMainLooper());
         setPimaxEyechipEnabled(false, "onCreate active streaming");
+        startPimaxPcSwitchGuard("onCreate active streaming");
         registerScreenReceiver();
         acquireScreenWakeLock("onCreate");
         registerPimaxHardwareBridge();
@@ -558,16 +582,19 @@ public final class VrRenderActivity extends NativeActivity {
         // 90 Hz provides the smoothest head tracking on Pimax Crystal.
         trySetPeakRefreshRate(90.0f, "onResume");
         setPimaxEyechipEnabled(false, "onResume active streaming");
+        startPimaxPcSwitchGuard("onResume active streaming");
         getWindow().addFlags(WINDOW_FLAGS_ON_CREATE | WINDOW_FLAGS_ON_FOCUS);
         registerScreenReceiver();
-        pendingNativeScreenOn = true;
+        PowerManager powerManager = (PowerManager) getSystemService(POWER_SERVICE);
+        boolean interactive = powerManager == null || powerManager.isInteractive();
+        pendingNativeScreenOn = interactive;
         if (nativeLibrariesLoaded) {
-            nativeNotifyScreen(true);
+            nativeNotifyScreen(interactive);
         }
-        pokeDisplayPower("onResume");
-        forceScreenWakeLock("onResume");
-        if (headsetNear) {
-            startDisplayWakeRetry("onResume while near");
+        if (interactive) {
+            acquireScreenWakeLock("onResume");
+        } else {
+            Log.i(TAG, "onResume while display is not interactive; waiting for Pimax screen-on");
         }
         registerPimaxHardwareBridge();
         registerProximitySensor();
@@ -632,6 +659,7 @@ public final class VrRenderActivity extends NativeActivity {
         requestNativeShutdown("onDestroy");
         stopControllerPoller();
         stopDisplayWakeRetry("onDestroy");
+        stopPimaxPcSwitchGuard("onDestroy");
         unregisterProximitySensor();
         unregisterPimaxHardwareBridge();
         unregisterScreenReceiver();
@@ -829,8 +857,6 @@ public final class VrRenderActivity extends NativeActivity {
      * <p>The wake lock is created with the following flags:
      * <ul>
      *   <li>{@code FULL_WAKE_LOCK} — keeps the screen on at full brightness and the CPU active.</li>
-     *   <li>{@code ACQUIRE_CAUSES_WAKEUP} — ensures the display turns on immediately when
-     *       the wake lock is acquired, even if it was off.</li>
      *   <li>{@code ON_AFTER_RELEASE} — keeps the display on briefly after the wake lock is
      *       released, providing a smoother user experience.</li>
      * </ul>
@@ -849,7 +875,6 @@ public final class VrRenderActivity extends NativeActivity {
             return;
         }
         int flags = PowerManager.FULL_WAKE_LOCK
-                | PowerManager.ACQUIRE_CAUSES_WAKEUP
                 | PowerManager.ON_AFTER_RELEASE;
         screenWakeLock = powerManager.newWakeLock(flags, "PimaxALVR:ActivityWakeLock");
         // Disable reference counting so multiple acquires / releases are independent.
@@ -914,11 +939,74 @@ public final class VrRenderActivity extends NativeActivity {
     }
 
     /**
+     * Starts a small guard that keeps Pimax's PC/DP switch path disabled while ALVR streams.
+     *
+     * <p>The stock WiFi Airlink APK runs as {@code android.uid.system}; it can use privileged
+     * panel-switch APIs that are denied to normal apps. On this headset build, however, the
+     * {@code sys.pmx.pc.switch} property is writable from our debug app context. Holding it at
+     * {@code 0} keeps the standalone/Wi-Fi panel path selected and avoids the PC-switch daemon
+     * blanking the panel after it decides no external DP source is present.
+     */
+    private void startPimaxPcSwitchGuard(String reason) {
+        if (pcSwitchGuardHandler == null) {
+            pcSwitchGuardHandler = new Handler(Looper.getMainLooper());
+        }
+        pcSwitchGuardHandler.removeCallbacks(pcSwitchGuardRunnable);
+        setPimaxPcSwitchProperty(reason);
+        pcSwitchGuardHandler.postDelayed(pcSwitchGuardRunnable, PIMAX_PC_SWITCH_GUARD_INTERVAL_MS);
+    }
+
+    /** Stops periodically writing {@link #PIMAX_PC_SWITCH_PROPERTY}. */
+    private void stopPimaxPcSwitchGuard(String reason) {
+        if (pcSwitchGuardHandler == null) {
+            return;
+        }
+        pcSwitchGuardHandler.removeCallbacks(pcSwitchGuardRunnable);
+        Log.i(TAG, "stopped Pimax PC-switch guard: " + reason);
+    }
+
+    /** Writes {@code sys.pmx.pc.switch=0} using the platform setprop tool. */
+    private void setPimaxPcSwitchProperty(String reason) {
+        if (pcSwitchSetInFlight) {
+            return;
+        }
+        pcSwitchSetInFlight = true;
+        Thread setpropThread = new Thread(() -> {
+            try {
+                Process process = new ProcessBuilder(
+                        "setprop", PIMAX_PC_SWITCH_PROPERTY, "0")
+                        .redirectErrorStream(true)
+                        .start();
+                int exitCode = process.waitFor();
+                if (exitCode == 0) {
+                    if (!"periodic guard".equals(reason)) {
+                        Log.i(TAG, "set " + PIMAX_PC_SWITCH_PROPERTY + "=0: " + reason);
+                    }
+                } else {
+                    Log.w(TAG, "failed to set " + PIMAX_PC_SWITCH_PROPERTY
+                            + "=0 exit=" + exitCode + ": " + reason);
+                }
+            } catch (IOException error) {
+                Log.w(TAG, "failed to execute setprop for " + PIMAX_PC_SWITCH_PROPERTY
+                        + ": " + reason, error);
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                Log.w(TAG, "interrupted while setting " + PIMAX_PC_SWITCH_PROPERTY
+                        + ": " + reason, error);
+            } finally {
+                pcSwitchSetInFlight = false;
+            }
+        }, "PimaxPcSwitchGuard");
+        setpropThread.setDaemon(true);
+        setpropThread.start();
+    }
+
+    /**
      * Forces a fresh wake event by releasing and recreating the wake lock.
      *
      * <p>Calling {@link #acquireScreenWakeLock} on an already-held wake lock is not always
      * sufficient to wake the panel back up after the headset has blanked it. Releasing the
-     * current lock first ensures the subsequent acquire re-triggers {@code ACQUIRE_CAUSES_WAKEUP}.
+     * current lock first ensures the subsequent acquire refreshes the screen wake lock.
      */
     private void forceScreenWakeLock(String reason) {
         if (screenWakeLock != null) {
