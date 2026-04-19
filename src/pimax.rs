@@ -182,6 +182,12 @@ static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// Raised when the headset comes back on-face or the screen reports itself on again.
 static PRESENTATION_REFRESH_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Latest headset proximity state reported by the Android activity.
+///
+/// The render loop uses this to avoid waking the panel immediately after Pimax's
+/// own proximity state-machine has intentionally put it to sleep off-head.
+static HEADSET_NEAR: AtomicBool = AtomicBool::new(false);
+
 /// Check if shutdown has been requested
 fn is_shutdown_requested() -> bool {
     SHUTDOWN_REQUESTED.load(Ordering::SeqCst)
@@ -203,6 +209,10 @@ fn request_presentation_refresh(reason: &str) {
 
 fn take_presentation_refresh_requested() -> bool {
     PRESENTATION_REFRESH_REQUESTED.swap(false, Ordering::SeqCst)
+}
+
+fn is_headset_near() -> bool {
+    HEADSET_NEAR.load(Ordering::SeqCst)
 }
 
 #[no_mangle]
@@ -238,6 +248,7 @@ pub extern "system" fn Java_com_pimax_alvr_client_VrRenderActivity_nativeNotifyP
     is_near: jni::sys::jboolean,
 ) {
     let is_near = is_near != 0;
+    HEADSET_NEAR.store(is_near, Ordering::SeqCst);
     info!("Pimax proximity state changed: near={is_near}");
     if is_near {
         request_presentation_refresh("proximity near");
@@ -252,7 +263,7 @@ pub extern "system" fn Java_com_pimax_alvr_client_VrRenderActivity_nativeNotifyS
 ) {
     let is_screen_on = is_screen_on != 0;
     info!("Pimax screen state changed: on={is_screen_on}");
-    if is_screen_on {
+    if is_screen_on && is_headset_near() {
         request_presentation_refresh("screen on");
     }
 }
@@ -5029,10 +5040,14 @@ fn try_begin_and_submit_frame<'local>(
     info!("requested NativeActivity headset window flags");
     let display_wake_lock = match create_display_wake_lock(env, context) {
         Ok(wake_lock) => {
-            if let Err(err) = acquire_display_wake_lock(env, &wake_lock) {
-                warn!("failed to acquire display wake lock: {err:#}");
+            if is_headset_near() {
+                if let Err(err) = acquire_display_wake_lock(env, &wake_lock) {
+                    warn!("failed to acquire display wake lock: {err:#}");
+                } else {
+                    info!("acquired display wake lock for headset session");
+                }
             } else {
-                info!("acquired display wake lock for headset session");
+                info!("created display wake lock but left it released until headset is worn");
             }
             Some(wake_lock)
         }
@@ -5661,9 +5676,20 @@ fn try_begin_and_submit_frame<'local>(
             break;
         }
         if take_presentation_refresh_requested() {
-            let controller_client = controller_runtime.as_ref().map(|runtime| &runtime.client);
-            let presentation_client = controller_client.or(pvr_service_client);
-            refresh_pimax_presentation(env, context, presentation_client, "near-face wake");
+            if is_headset_near() {
+                if let Some(wake_lock) = display_wake_lock.as_ref() {
+                    if let Err(err) = acquire_display_wake_lock(env, wake_lock) {
+                        warn!("failed to acquire display wake lock for near-face refresh: {err:#}");
+                    } else {
+                        info!("acquired display wake lock for near-face refresh");
+                    }
+                }
+                let controller_client = controller_runtime.as_ref().map(|runtime| &runtime.client);
+                let presentation_client = controller_client.or(pvr_service_client);
+                refresh_pimax_presentation(env, context, presentation_client, "near-face wake");
+            } else {
+                info!("skipping presentation refresh while headset proximity is far");
+            }
         }
 
         let frame_start = Instant::now();
@@ -5984,25 +6010,37 @@ fn try_begin_and_submit_frame<'local>(
         }
 
         if frame_index >= 0 && frame_index % 30 == 0 {
-            match is_power_interactive(env, context) {
-                Ok(true) => {
-                    if frame_index % 720 == 0 {
-                        info!("display power is still interactive at frame {frame_index}");
+            if !is_headset_near() {
+                if let Some(wake_lock) = display_wake_lock.as_ref() {
+                    if let Err(err) = release_display_wake_lock(env, wake_lock) {
+                        warn!("failed to release display wake lock while off-head: {err:#}");
+                    } else if frame_index % 720 == 0 {
+                        info!(
+                            "display wake lock remains released while headset proximity is far at frame {frame_index}"
+                        );
                     }
                 }
-                Ok(false) => {
-                    warn!(
-                        "display power became non-interactive at frame {frame_index}; re-acquiring wake lock"
-                    );
-                    if let Some(wake_lock) = display_wake_lock.as_ref() {
-                        if let Err(err) = acquire_display_wake_lock(env, wake_lock) {
-                            warn!("failed to reacquire display wake lock: {err:#}");
+            } else {
+                match is_power_interactive(env, context) {
+                    Ok(true) => {
+                        if frame_index % 720 == 0 {
+                            info!("display power is still interactive at frame {frame_index}");
                         }
                     }
+                    Ok(false) => {
+                        warn!(
+                            "display power became non-interactive at frame {frame_index}; headset is near, re-acquiring wake lock"
+                        );
+                        if let Some(wake_lock) = display_wake_lock.as_ref() {
+                            if let Err(err) = acquire_display_wake_lock(env, wake_lock) {
+                                warn!("failed to reacquire display wake lock: {err:#}");
+                            }
+                        }
+                    }
+                    Err(err) => warn!(
+                        "failed to query display interactive state at frame {frame_index}: {err:#}"
+                    ),
                 }
-                Err(err) => warn!(
-                    "failed to query display interactive state at frame {frame_index}: {err:#}"
-                ),
             }
         }
         if frame_index > 0 && frame_index % PIMAX_HIDE_SYSTEM_UI_EVERY_N_FRAMES == 0 {

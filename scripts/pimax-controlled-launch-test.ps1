@@ -19,6 +19,7 @@ $launchComponent = "com.pimax.alvr.client/com.pimax.alvr.client.VrRenderActivity
 $competingPackageNames = @(
     "com.pimax.vrstreaming"
 )
+$screenOffTimeoutMs = 20000
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $guardianHelper = Join-Path $PSScriptRoot "pimax-ensure-guardian-stationary.ps1"
 $artifactRootPath = if ([System.IO.Path]::IsPathRooted($ArtifactRoot)) {
@@ -260,7 +261,7 @@ function Initialize-HeadsetForRun {
     )
 
     Write-Host "Preparing headset for run: $Reason"
-    Invoke-AdbCommand -Description "enable stayon" -AdbCommandArgs @("shell", "svc power stayon true") | Out-Null
+    Invoke-AdbCommand -Description "disable USB stay-awake override" -AdbCommandArgs @("shell", "svc power stayon false") | Out-Null
     Invoke-AdbCommand -Description "wake headset" -AdbCommandArgs @("shell", "input keyevent KEYCODE_WAKEUP") | Out-Null
     Start-Sleep -Milliseconds 700
     Invoke-AdbCommand -Description "dismiss keyguard" -AdbCommandArgs @("shell", "wm dismiss-keyguard") -AllowFailure | Out-Null
@@ -270,7 +271,7 @@ function Initialize-HeadsetForRun {
         throw "Guardian helper not found at $guardianHelper"
     }
 
-    $guardianArgs = @("-ExecutionPolicy", "Bypass", "-File", $guardianHelper, "-KeepAwake")
+    $guardianArgs = @("-ExecutionPolicy", "Bypass", "-File", $guardianHelper)
     if (-not [string]::IsNullOrWhiteSpace($Serial)) {
         $guardianArgs += @("-Serial", $Serial)
     }
@@ -372,8 +373,8 @@ function Set-PimaxBootProperties {
         -AdbCommandArgs @("shell", "setprop persist.sys.pmx.sta.pm.enable false") `
         -AllowFailure | Out-Null
     Invoke-AdbCommand `
-        -Description "disable Pimax proximity/gyro sleep policy" `
-        -AdbCommandArgs @("shell", "setprop persist.sys.pmx.psensor.gotosleep false") `
+        -Description "restore Pimax proximity/gyro sleep policy" `
+        -AdbCommandArgs @("shell", "setprop persist.sys.pmx.psensor.gotosleep true") `
         -AllowFailure | Out-Null
     Invoke-AdbCommand `
         -Description "restore normal Pimax proximity state-machine" `
@@ -384,12 +385,12 @@ function Set-PimaxBootProperties {
         -AdbCommandArgs @("shell", "settings put system dim_screen 0") `
         -AllowFailure | Out-Null
     Invoke-AdbCommand `
-        -Description "extend Android screen-off timeout" `
-        -AdbCommandArgs @("shell", "settings put system screen_off_timeout 2147483647") `
+        -Description "restore Android screen-off timeout" `
+        -AdbCommandArgs @("shell", "settings put system screen_off_timeout $screenOffTimeoutMs") `
         -AllowFailure | Out-Null
     Invoke-AdbCommand `
-        -Description "extend Pimax PC-mode screen-off timeout" `
-        -AdbCommandArgs @("shell", "settings put system pmx_pc_screen_off_timeout 2147483647") `
+        -Description "restore Pimax PC-mode screen-off timeout" `
+        -AdbCommandArgs @("shell", "settings put system pmx_pc_screen_off_timeout $screenOffTimeoutMs") `
         -AllowFailure | Out-Null
 
     Save-AdbSnapshot `

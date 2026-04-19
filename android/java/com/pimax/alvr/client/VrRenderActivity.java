@@ -23,6 +23,7 @@ import android.util.Log;
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
+import android.view.WindowManager;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
@@ -88,6 +89,11 @@ public final class VrRenderActivity extends NativeActivity {
      * {@code 128} decodes to {@code FLAG_KEEP_SCREEN_ON | FLAG_ALLOW_LOCK_WHILE_SCREEN_ON}.
      */
     private static final int WINDOW_FLAGS_ON_FOCUS = 128;
+
+    /** Window flags that specifically prevent normal off-head display sleep. */
+    private static final int WINDOW_KEEP_AWAKE_FLAGS =
+            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                    | WindowManager.LayoutParams.FLAG_ALLOW_LOCK_WHILE_SCREEN_ON;
 
     /**
      * System UI visibility flags applied when the activity gains window focus — immersive
@@ -168,6 +174,9 @@ public final class VrRenderActivity extends NativeActivity {
 
     /** True while the proximity sensor reports that the headset is near the face. */
     private boolean headsetNear;
+
+    /** True after the proximity sensor has reported at least one near/far sample. */
+    private boolean proximityStateKnown;
 
     /** Latest screen-on/off state that should be forwarded to native when it becomes ready. */
     private boolean pendingNativeScreenOn = true;
@@ -287,6 +296,7 @@ public final class VrRenderActivity extends NativeActivity {
             // The proximity sensor typically returns 0 (near) or 5+ cm (far) on Pimax devices.
             float distance = event != null && event.values.length > 0 ? event.values[0] : Float.NaN;
             boolean isNear = distance < 1.0f;
+            proximityStateKnown = true;
             headsetNear = isNear;
             if (nativeLibrariesLoaded) {
                 nativeNotifyProximity(isNear);
@@ -338,7 +348,11 @@ public final class VrRenderActivity extends NativeActivity {
                 if (nativeLibrariesLoaded) {
                     nativeNotifyScreen(true);
                 }
-                acquireScreenWakeLock("screen-on broadcast");
+                if (shouldKeepDisplayAwakeForProximity()) {
+                    keepDisplayAwake("screen-on broadcast");
+                } else {
+                    allowDisplaySleep("screen-on broadcast while off-head");
+                }
             } else if (Intent.ACTION_SCREEN_OFF.equals(action)) {
                 // Let the Pimax system service own physical panel wake/sleep. Forcing an
                 // app wake here can bring Android back before the vendor panel switch has
@@ -428,8 +442,7 @@ public final class VrRenderActivity extends NativeActivity {
         if (nativeLibrariesLoaded) {
             nativeNotifyScreen(true);
         }
-        getWindow().addFlags(WINDOW_FLAGS_ON_CREATE | WINDOW_FLAGS_ON_FOCUS);
-        acquireScreenWakeLock(reason);
+        keepDisplayAwake(reason);
     }
 
     /** Stops the wake retry loop when the headset is removed again. */
@@ -439,6 +452,7 @@ public final class VrRenderActivity extends NativeActivity {
         // Keep the last real screen state intact so launching off-head does not flush
         // screenOn=false into the native Pimax renderer and leave presentation black.
         stopDisplayWakeRetry(reason);
+        allowDisplaySleep(reason);
     }
 
     // =========================================================================================
@@ -591,8 +605,10 @@ public final class VrRenderActivity extends NativeActivity {
         if (nativeLibrariesLoaded) {
             nativeNotifyScreen(interactive);
         }
-        if (interactive) {
-            acquireScreenWakeLock("onResume");
+        if (interactive && shouldKeepDisplayAwakeForProximity()) {
+            keepDisplayAwake("onResume");
+        } else if (interactive) {
+            allowDisplaySleep("onResume while off-head");
         } else {
             Log.i(TAG, "onResume while display is not interactive; waiting for Pimax screen-on");
         }
@@ -686,8 +702,11 @@ public final class VrRenderActivity extends NativeActivity {
             Log.i(TAG, "VrRenderActivity.onWindowFocusChanged(true)");
             // Apply immersive sticky mode — hides navigation and status bars.
             getWindow().getDecorView().setSystemUiVisibility(SYSTEM_UI_VISIBILITY_FLAGS);
-            getWindow().addFlags(WINDOW_FLAGS_ON_FOCUS);
-            acquireScreenWakeLock("window focus");
+            if (shouldKeepDisplayAwakeForProximity()) {
+                keepDisplayAwake("window focus");
+            } else {
+                allowDisplaySleep("window focus while off-head");
+            }
         }
     }
 
@@ -904,6 +923,24 @@ public final class VrRenderActivity extends NativeActivity {
         } catch (RuntimeException error) {
             Log.w(TAG, "failed to acquire activity wake lock: " + reason, error);
         }
+    }
+
+    /** Returns true until proximity is known, and then only while the headset is worn. */
+    private boolean shouldKeepDisplayAwakeForProximity() {
+        return !proximityStateKnown || headsetNear;
+    }
+
+    /** Enables the normal VR keep-awake policy while the headset is being worn. */
+    private void keepDisplayAwake(String reason) {
+        getWindow().addFlags(WINDOW_KEEP_AWAKE_FLAGS);
+        acquireScreenWakeLock(reason);
+    }
+
+    /** Allows Pimax's own off-head timeout to turn the panel off while preserving PC-switch guard. */
+    private void allowDisplaySleep(String reason) {
+        getWindow().clearFlags(WINDOW_KEEP_AWAKE_FLAGS);
+        releaseScreenWakeLock();
+        Log.i(TAG, "allowing display sleep while off-head: " + reason);
     }
 
     /**
