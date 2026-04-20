@@ -1,11 +1,9 @@
 //! Minimal Android MediaCodec bridge for reconstructed ALVR video NALs.
 //!
-//! This is a pragmatic CPU-readback path: it proves the ALVR stream is decodable
-//! and reuses the already-working RGBA texture upload path. A later pass should
-//! replace this with an ImageReader/AHardwareBuffer zero-copy path.
+//! MediaCodec renders into an ImageReader-backed Surface. Decoded
+//! AHardwareBuffer frames are passed to the video receiver without CPU readback.
 
 use std::{
-    cmp,
     collections::VecDeque,
     ffi::{CStr, CString},
     ptr,
@@ -31,12 +29,8 @@ const DECODER_OUTPUT_TIMEOUT_US: i64 = 1_000;
 const DECODER_IDLE_TIMEOUT: Duration = Duration::from_millis(4);
 const DECODER_CONFIG_WIDTH: i32 = 512;
 const DECODER_CONFIG_HEIGHT: i32 = 1024;
-const DECODER_MAX_RGBA_DIMENSION: usize = 1024;
 const DECODER_LOG_EVERY_FRAME: u64 = 120;
-const COLOR_FORMAT_YUV420_PLANAR: i32 = 19;
-const COLOR_FORMAT_YUV420_SEMIPLANAR: i32 = 21;
 const COLOR_FORMAT_YUV420_FLEXIBLE: i32 = 0x7F42_0888;
-const COLOR_FORMAT_QCOM_YUV420_SEMIPLANAR32M: i32 = 0x7FA3_0C04;
 
 pub struct AlvrAndroidVideoDecoder {
     receiver: Arc<AlvrVideoReceiver>,
@@ -865,7 +859,6 @@ struct DecoderOutputFormat {
     height: usize,
     stride: usize,
     slice_height: usize,
-    color_format: i32,
 }
 
 impl DecoderOutputFormat {
@@ -881,9 +874,6 @@ impl DecoderOutputFormat {
                 .max(1) as usize,
             stride: 0,
             slice_height: 0,
-            color_format: format
-                .get_i32("color-format")
-                .unwrap_or(COLOR_FORMAT_YUV420_FLEXIBLE),
         };
         parsed.stride = format
             .get_i32("stride")
@@ -906,160 +896,8 @@ impl Default for DecoderOutputFormat {
             height: DECODER_CONFIG_HEIGHT as usize,
             stride: DECODER_CONFIG_WIDTH as usize,
             slice_height: DECODER_CONFIG_HEIGHT as usize,
-            color_format: COLOR_FORMAT_YUV420_FLEXIBLE,
         }
     }
-}
-
-struct RgbaFrame {
-    width: usize,
-    height: usize,
-    rgba: Vec<u8>,
-}
-
-fn decode_yuv420_to_rgba(data: &[u8], format: DecoderOutputFormat) -> Result<RgbaFrame> {
-    if format.width == 0 || format.height == 0 {
-        bail!(
-            "invalid MediaCodec output dimensions {}x{}",
-            format.width,
-            format.height
-        );
-    }
-
-    let scale = cmp::max(
-        1,
-        cmp::max(format.width, format.height).div_ceil(DECODER_MAX_RGBA_DIMENSION),
-    );
-    let out_width = cmp::max(1, format.width / scale);
-    let out_height = cmp::max(1, format.height / scale);
-    let mut rgba = vec![0_u8; out_width * out_height * 4];
-
-    match format.color_format {
-        COLOR_FORMAT_YUV420_PLANAR => {
-            convert_planar_yuv420(data, format, scale, out_width, out_height, &mut rgba)?
-        }
-        COLOR_FORMAT_YUV420_SEMIPLANAR
-        | COLOR_FORMAT_YUV420_FLEXIBLE
-        | COLOR_FORMAT_QCOM_YUV420_SEMIPLANAR32M => {
-            convert_semiplanar_yuv420(data, format, scale, out_width, out_height, &mut rgba)?
-        }
-        other => {
-            bail!("unsupported MediaCodec CPU color format {other}");
-        }
-    }
-
-    Ok(RgbaFrame {
-        width: out_width,
-        height: out_height,
-        rgba,
-    })
-}
-
-fn convert_planar_yuv420(
-    data: &[u8],
-    format: DecoderOutputFormat,
-    scale: usize,
-    out_width: usize,
-    out_height: usize,
-    rgba: &mut [u8],
-) -> Result<()> {
-    let y_stride = format.stride.max(format.width);
-    let y_rows = format.slice_height.max(format.height);
-    let chroma_stride = cmp::max(1, y_stride / 2);
-    let chroma_rows = cmp::max(1, y_rows / 2);
-    let y_plane_size = y_stride
-        .checked_mul(y_rows)
-        .context("Y plane size overflow")?;
-    let chroma_plane_size = chroma_stride
-        .checked_mul(chroma_rows)
-        .context("chroma plane size overflow")?;
-    let u_offset = y_plane_size;
-    let v_offset = u_offset
-        .checked_add(chroma_plane_size)
-        .context("V plane offset overflow")?;
-
-    if data.len() < v_offset + chroma_plane_size {
-        bail!(
-            "planar YUV output too small: got {} bytes, need at least {}",
-            data.len(),
-            v_offset + chroma_plane_size
-        );
-    }
-
-    for out_y in 0..out_height {
-        let src_y = (out_y * scale).min(format.height - 1);
-        for out_x in 0..out_width {
-            let src_x = (out_x * scale).min(format.width - 1);
-            let y = data[src_y * y_stride + src_x];
-            let chroma_index = (src_y / 2) * chroma_stride + (src_x / 2);
-            let u = data[u_offset + chroma_index];
-            let v = data[v_offset + chroma_index];
-            write_rgba_pixel(rgba, out_y * out_width + out_x, y, u, v);
-        }
-    }
-
-    Ok(())
-}
-
-fn convert_semiplanar_yuv420(
-    data: &[u8],
-    format: DecoderOutputFormat,
-    scale: usize,
-    out_width: usize,
-    out_height: usize,
-    rgba: &mut [u8],
-) -> Result<()> {
-    let y_stride = format.stride.max(format.width);
-    let y_rows = format.slice_height.max(format.height);
-    let uv_stride = y_stride;
-    let uv_rows = cmp::max(1, y_rows / 2);
-    let y_plane_size = y_stride
-        .checked_mul(y_rows)
-        .context("Y plane size overflow")?;
-    let uv_plane_size = uv_stride
-        .checked_mul(uv_rows)
-        .context("UV plane size overflow")?;
-    let uv_offset = y_plane_size;
-
-    if data.len() < uv_offset + uv_plane_size {
-        bail!(
-            "semiplanar YUV output too small: got {} bytes, need at least {}",
-            data.len(),
-            uv_offset + uv_plane_size
-        );
-    }
-
-    for out_y in 0..out_height {
-        let src_y = (out_y * scale).min(format.height - 1);
-        for out_x in 0..out_width {
-            let src_x = (out_x * scale).min(format.width - 1);
-            let y = data[src_y * y_stride + src_x];
-            let uv_index = (src_y / 2) * uv_stride + (src_x / 2) * 2;
-            let u = data[uv_offset + uv_index];
-            let v = data[uv_offset + uv_index + 1];
-            write_rgba_pixel(rgba, out_y * out_width + out_x, y, u, v);
-        }
-    }
-
-    Ok(())
-}
-
-fn write_rgba_pixel(rgba: &mut [u8], pixel_index: usize, y: u8, u: u8, v: u8) {
-    let c = i32::from(y).saturating_sub(16).max(0);
-    let d = i32::from(u) - 128;
-    let e = i32::from(v) - 128;
-    let r = clamp_u8((298 * c + 409 * e + 128) >> 8);
-    let g = clamp_u8((298 * c - 100 * d - 208 * e + 128) >> 8);
-    let b = clamp_u8((298 * c + 516 * d + 128) >> 8);
-    let offset = pixel_index * 4;
-    rgba[offset] = r;
-    rgba[offset + 1] = g;
-    rgba[offset + 2] = b;
-    rgba[offset + 3] = 255;
-}
-
-fn clamp_u8(value: i32) -> u8 {
-    value.clamp(0, 255) as u8
 }
 
 fn software_decoder_name(mime_type: &str) -> Option<&'static str> {

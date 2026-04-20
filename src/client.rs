@@ -211,8 +211,6 @@ const ALVR_DEFAULT_IPD_M: f32 = 0.064;
 /// Default IPD scale — exposed so `android.rs` can pass it to `tune::init`.
 /// The actual live value is read from `tune::ipd_scale()` each time a ViewsConfig is sent.
 pub const ALVR_IPD_SCALE_DEFAULT: f32 = 1.0;
-// Keep the const for clarity but reads always use tune::ipd_scale() at runtime.
-const ALVR_IPD_SCALE: f32 = ALVR_IPD_SCALE_DEFAULT;
 const ALVR_HEAD_PATH: &str = "/user/head";
 
 static ALVR_CONTROL_LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
@@ -250,8 +248,8 @@ fn latest_head_tracking_pose() -> Option<AlvrHeadTrackingPose> {
     LATEST_HEAD_TRACKING_POSE.lock().ok().and_then(|pose| *pose)
 }
 
-/// Returns the current IPD in metres, already scaled by ALVR_IPD_SCALE, ready to send to ALVR.
-/// The state stores the scaled IPD; do NOT multiply by ALVR_IPD_SCALE again at the call site.
+/// Returns the current IPD in metres, already scaled by `tune::ipd_scale()`,
+/// ready to send to ALVR. Do not multiply by the tune scale again at the call site.
 fn current_alvr_ipd_m() -> f32 {
     latest_alvr_views_config()
         .map(|state| state.config.ipd_m)
@@ -298,7 +296,7 @@ pub(crate) fn update_alvr_views_config_from_pimax(
         down: -vertical_tan,
     };
     let config = ViewsConfig {
-        // current_alvr_ipd_m() already returns the scaled IPD; do NOT multiply by ALVR_IPD_SCALE again.
+        // current_alvr_ipd_m() already returns the scaled IPD.
         ipd_m: current_alvr_ipd_m(),
         fov: [fov, fov],
     };
