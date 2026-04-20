@@ -416,7 +416,6 @@ extern "C" {
 extern "C" {
     fn eglGetDisplay(display_id: *mut c_void) -> EGLDisplay;
     fn eglGetCurrentDisplay() -> EGLDisplay;
-    fn eglGetCurrentContext() -> EGLContext;
     fn eglGetError() -> i32;
     fn eglGetProcAddress(procname: *const i8) -> *const c_void;
     fn eglInitialize(dpy: EGLDisplay, major: *mut i32, minor: *mut i32) -> u32;
@@ -567,15 +566,7 @@ const ALVR_BUTTON_GRIP: u32 = 1 << 3;
 const ALVR_BUTTON_AX: u32 = 1 << 4;
 const ALVR_BUTTON_BY: u32 = 1 << 5;
 
-#[derive(Clone, Copy, Debug)]
-enum SubmittedImageHandleKind {
-    TextureId,
-    EglImage,
-    EglClientBuffer,
-    HardwareBufferPtr,
-}
-
-const PIMAX_SUBMITTED_HANDLE_KIND: SubmittedImageHandleKind = SubmittedImageHandleKind::TextureId;
+const PIMAX_SUBMITTED_HANDLE_KIND_LABEL: &str = "TextureId";
 #[derive(Debug, Default, Clone)]
 pub struct PimaxProbeReport {
     pub pxr_version: Option<String>,
@@ -3266,129 +3257,6 @@ fn create_identity_uv_map_texture(samples: i32) -> Result<UvMapTexture> {
     Ok(UvMapTexture { texture, size })
 }
 
-fn create_presentation_surface<'local>(
-    env: &mut jni::JNIEnv<'local>,
-    context: &JObject<'local>,
-) -> Result<JObject<'local>> {
-    let display_key = env
-        .new_string("display")
-        .context("create display service key")?;
-    let display_manager = env
-        .call_method(
-            context,
-            "getSystemService",
-            "(Ljava/lang/String;)Ljava/lang/Object;",
-            &[JValue::Object(&JObject::from(display_key))],
-        )
-        .context("get display service")?
-        .l()
-        .context("decode display service")?;
-    let displays = env
-        .call_method(
-            &display_manager,
-            "getDisplays",
-            "()[Landroid/view/Display;",
-            &[],
-        )
-        .context("enumerate displays")?
-        .l()
-        .context("decode display array")?;
-    let displays = JObjectArray::from(displays);
-    let display_count = env.get_array_length(&displays).context("count displays")?;
-    if display_count == 0 {
-        bail!("no displays available");
-    }
-
-    let mut chosen_display: Option<JObject<'local>> = None;
-    let mut chosen_display_id = 0;
-    let mut chosen_display_name = String::new();
-
-    for index in 0..display_count {
-        let display = env
-            .get_object_array_element(&displays, index)
-            .with_context(|| format!("get display {index}"))?;
-        let display_id = env
-            .call_method(&display, "getDisplayId", "()I", &[])
-            .context("query display id")?
-            .i()
-            .context("decode display id")?;
-        let display_name_obj = env
-            .call_method(&display, "getName", "()Ljava/lang/String;", &[])
-            .context("query display name")?
-            .l()
-            .context("decode display name")?;
-        let display_name =
-            object_to_string(env, display_name_obj).context("display name string")?;
-        let display_flags = env
-            .call_method(&display, "getFlags", "()I", &[])
-            .context("query display flags")?
-            .i()
-            .context("decode display flags")?;
-        info!("display candidate #{display_id} name={display_name} flags=0x{display_flags:08x}");
-
-        let is_presentation_display = (display_flags & 0x8) != 0
-            && matches!(
-                display_name.as_str(),
-                "PxrScreenShot" | "PxrScreenRecord" | "PxrScreenCast"
-            );
-        if is_presentation_display {
-            chosen_display = Some(display);
-            chosen_display_id = display_id;
-            chosen_display_name = display_name;
-            break;
-        }
-    }
-
-    let display = chosen_display.context("choose suitable presentation display")?;
-    info!("attempting PxrPresentation on display #{chosen_display_id} named {chosen_display_name}");
-
-    call_static_void(env, "android/os/Looper", "prepare", "()V", &[])
-        .context("prepare looper for PxrPresentation")?;
-    let presentation = env
-        .new_object(
-            "com/pimax/pxrapi/xrcasting/PxrPresentation",
-            "(Landroid/content/Context;Landroid/view/Display;)V",
-            &[JValue::Object(context), JValue::Object(&display)],
-        )
-        .map_err(|err| {
-            if let Some(summary) = take_java_exception_summary(env) {
-                warn!("PxrPresentation constructor threw: {summary}");
-            }
-            err
-        })
-        .context("create PxrPresentation")?;
-    if let Err(err) = env.call_method(&presentation, "show", "()V", &[]) {
-        let summary = take_java_exception_summary(env)
-            .unwrap_or_else(|| "Java exception was thrown".to_string());
-        bail!("show PxrPresentation: {summary}; {err:#}");
-    }
-    thread::sleep(Duration::from_millis(250));
-
-    let surface_view = env
-        .get_field(
-            &presentation,
-            "mSurfaceView",
-            "Lcom/pimax/pxrapi/xrcasting/PxrPresentation$SxrPresentationSurfaceView;",
-        )
-        .context("get presentation surface view")?
-        .l()
-        .context("decode presentation surface view")?;
-    let holder = env
-        .call_method(
-            &surface_view,
-            "getHolder",
-            "()Landroid/view/SurfaceHolder;",
-            &[],
-        )
-        .context("get presentation surface holder")?
-        .l()
-        .context("decode presentation surface holder")?;
-    env.call_method(&holder, "getSurface", "()Landroid/view/Surface;", &[])
-        .context("get presentation surface")?
-        .l()
-        .context("decode presentation surface")
-}
-
 fn capture_activity_window<'local>(
     env: &mut jni::JNIEnv<'local>,
     timeout: Duration,
@@ -3551,11 +3419,6 @@ fn wait_for_activity_native_window(timeout: Duration) -> Result<ndk::native_wind
 
         thread::sleep(Duration::from_millis(100));
     }
-}
-
-fn current_android_thread_id(env: &mut jni::JNIEnv<'_>) -> Result<i32> {
-    call_static_int(env, "android/os/Process", "myTid", "()I", &[])
-        .context("get current Android thread id")
 }
 
 fn gl_string(name: u32) -> Option<String> {
@@ -3882,80 +3745,6 @@ fn initialize_window_egl_context(
     }
 }
 
-fn initialize_window_egl_context_from_surface(
-    env: &jni::JNIEnv<'_>,
-    surface: &JObject<'_>,
-) -> Result<EglState> {
-    let native_window = unsafe {
-        ndk::native_window::NativeWindow::from_surface(env.get_native_interface(), surface.as_raw())
-    }
-    .context("convert Java Surface to ANativeWindow")?;
-    initialize_window_egl_context(native_window)
-}
-
-fn ensure_gl_context(
-    env: &jni::JNIEnv<'_>,
-    surface: Option<&JObject<'_>>,
-) -> Result<Option<EglState>> {
-    unsafe {
-        let current_context = eglGetCurrentContext();
-        if !current_context.is_null() {
-            info!(
-                "using existing EGL context from runtime: {:?}",
-                current_context
-            );
-            return Ok(None);
-        }
-    }
-
-    if let Some(surface) = surface {
-        let egl_state = initialize_window_egl_context_from_surface(env, surface)
-            .context("initialize EGL window context from Java Surface")?;
-        return Ok(Some(egl_state));
-    }
-
-    if let Some(native_window) = ndk_glue::native_window() {
-        let egl_state = initialize_window_egl_context((*native_window).clone())
-            .context("initialize EGL window context")?;
-        return Ok(Some(egl_state));
-    }
-
-    let egl_state = initialize_pbuffer_egl_context().context("initialize EGL pbuffer context")?;
-    Ok(Some(egl_state))
-}
-
-fn ensure_offscreen_gl_context() -> Result<Option<EglState>> {
-    unsafe {
-        let current_context = eglGetCurrentContext();
-        if !current_context.is_null() {
-            info!(
-                "using existing EGL context from runtime: {:?}",
-                current_context
-            );
-            return Ok(None);
-        }
-    }
-
-    let egl_state = initialize_pbuffer_egl_context().context("initialize offscreen EGL context")?;
-    Ok(Some(egl_state))
-}
-
-fn render_eye_clear(width: i32, height: i32, color: [u8; 4]) {
-    let red = color[0] as f32 / 255.0;
-    let green = color[1] as f32 / 255.0;
-    let blue = color[2] as f32 / 255.0;
-    let alpha = color[3] as f32 / 255.0;
-
-    unsafe {
-        glViewport(0, 0, width.max(1), height.max(1));
-        prepare_solid_color_clear_state();
-        glClearColor(red, green, blue, alpha);
-        glClear(GL_COLOR_BUFFER_BIT);
-        glFlush();
-        glFinish();
-    }
-}
-
 fn render_window_surface_mirror(
     egl_state: Option<&EglState>,
     frame_index: i32,
@@ -4115,11 +3904,7 @@ fn create_hardware_buffer_eye_render_target(width: i32, height: i32) -> Result<E
 }
 
 fn use_hardware_buffer_eye_targets() -> bool {
-    !(PIMAX_SUBMITTED_TEXTURE_TYPE == "kTypeTexture"
-        && matches!(
-            PIMAX_SUBMITTED_HANDLE_KIND,
-            SubmittedImageHandleKind::TextureId
-        ))
+    false
 }
 
 fn create_eye_render_target(width: i32, height: i32) -> Result<EyeRenderTarget> {
@@ -4142,8 +3927,7 @@ fn create_eye_render_target(width: i32, height: i32) -> Result<EyeRenderTarget> 
         }
     } else {
         info!(
-            "using plain GL eye textures because submission path is {PIMAX_SUBMITTED_TEXTURE_TYPE} via {:?}",
-            PIMAX_SUBMITTED_HANDLE_KIND
+            "using plain GL eye textures because submission path is {PIMAX_SUBMITTED_TEXTURE_TYPE} via {PIMAX_SUBMITTED_HANDLE_KIND_LABEL}",
         );
     }
     let mut texture = 0_u32;
@@ -4200,51 +3984,17 @@ fn create_eye_render_target(width: i32, height: i32) -> Result<EyeRenderTarget> 
     })
 }
 
-fn truncate_native_handle(label: &str, raw: usize) -> Result<i32> {
-    if raw == 0 {
-        bail!("{label} handle is null");
-    }
-    if raw >> 32 != 0 {
-        warn!(
-            "{label} handle 0x{raw:016x} exceeds 32 bits; submitting truncated low word 0x{:08x}",
-            raw as u32
-        );
-    }
-    Ok(raw as u32 as i32)
-}
-
 fn submitted_image_handle(target: &EyeRenderTarget) -> Result<i32> {
-    match PIMAX_SUBMITTED_HANDLE_KIND {
-        SubmittedImageHandleKind::TextureId => Ok(target.texture as i32),
-        SubmittedImageHandleKind::EglImage => {
-            let egl_image = target
-                .egl_image
-                .context("missing EGLImage for kTypeImage submission")?;
-            truncate_native_handle("EGLImageKHR", egl_image as usize)
-        }
-        SubmittedImageHandleKind::EglClientBuffer => {
-            let client_buffer = target
-                .egl_client_buffer
-                .context("missing EGLClientBuffer for kTypeImage submission")?;
-            truncate_native_handle("EGLClientBuffer", client_buffer as usize)
-        }
-        SubmittedImageHandleKind::HardwareBufferPtr => {
-            let hardware_buffer = target
-                .hardware_buffer
-                .as_ref()
-                .context("missing AHardwareBuffer for kTypeImage submission")?;
-            truncate_native_handle("AHardwareBuffer", hardware_buffer.as_ptr() as usize)
-        }
-    }
+    Ok(target.texture as i32)
 }
 
 fn log_submission_handle_strategy(pair: &EyeBufferPair) {
     let left_handle = submitted_image_handle(&pair.left);
     let right_handle = submitted_image_handle(&pair.right);
     info!(
-        "submitting layers as {} via {:?}: left={{tex={}, egl_image={:?}, client_buffer={:?}, ahb={:?}, handle={:?}}} right={{tex={}, egl_image={:?}, client_buffer={:?}, ahb={:?}, handle={:?}}}",
+        "submitting layers as {} via {}: left={{tex={}, egl_image={:?}, client_buffer={:?}, ahb={:?}, handle={:?}}} right={{tex={}, egl_image={:?}, client_buffer={:?}, ahb={:?}, handle={:?}}}",
         PIMAX_SUBMITTED_TEXTURE_TYPE,
-        PIMAX_SUBMITTED_HANDLE_KIND,
+        PIMAX_SUBMITTED_HANDLE_KIND_LABEL,
         pair.left.texture,
         pair.left.egl_image.map(|value| value as usize),
         pair.left.egl_client_buffer.map(|value| value as usize),
