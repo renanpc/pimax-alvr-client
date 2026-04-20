@@ -1568,14 +1568,11 @@ public final class VrRenderActivity extends NativeActivity {
     // =========================================================================================
     // Controller polling
     //
-    // Pimax controllers ("nrfinput_left" / "nrfinput_right") show up as standard Android
-    // InputDevices. Buttons arrive via KeyEvents, analog axes via MotionEvents — both are
-    // captured in dispatch overrides above. The ControllerPoller thread:
-    //   1. Detects connect/disconnect by enumerating InputDevices.
-    //   2. Reads battery from sysfs (paths reverse-engineered from stock Pimax APK).
-    //   3. Pushes a state snapshot to native at 30 Hz.
-    //
-    // Bit-to-button mapping is provisional — diagnostic logs will validate against hardware.
+    // The live controller path is the native Pimax SDK poller in pimax.rs
+    // (sxrControllerStartTracking / sxrControllerGetState). This Android
+    // InputDevice poller is intentionally disabled and kept only as a diagnostic fallback:
+    // early Crystal experiments showed face buttons on nrfinput_* sometimes surfaced here,
+    // while trigger, grip, stick axes, and pose required the native Pimax runtime.
     // =========================================================================================
 
     private static final long CONTROLLER_POLL_INTERVAL_MS = 33;

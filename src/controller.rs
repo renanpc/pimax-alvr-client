@@ -5,8 +5,10 @@
 //! This module manages VR controller state and translates it into the ALVR
 //! protocol format. Controller data flows through three stages:
 //!
-//! 1. **Java polling** (`VrRenderActivity.ControllerPoller`) queries the Pimax
-//!    runtime at ~30 Hz and calls JNI to push raw state into Rust.
+//! 1. **Native Pimax polling** (`pimax.rs`) uses `sxrControllerStartTracking`
+//!    / `sxrControllerGetState` and normalizes the Crystal controller bitmask,
+//!    axes, and pose into this module. A disabled Java `InputDevice` fallback is
+//!    still present in `VrRenderActivity` for diagnostics only.
 //! 2. **This module** caches the latest state in a global `Mutex` and provides
 //!    converters that produce ALVR-compatible `ButtonEntry` and `DeviceMotion`
 //!    values.
@@ -16,19 +18,16 @@
 //!
 //! # Button Mapping
 //!
-//! The Pimax runtime reports buttons as a bitmask from `ControllerQueryInt`.
-//! Each bit is mapped to an OpenXR interaction profile path string, which is
-//! then hashed to a `u64` path ID via `protocol::hash_string`. The ALVR server
-//! uses these path IDs to drive SteamVR input bindings.
-//!
-//! The bit-to-path mapping is based on the Qualcomm SVR / Pimax controller
-//! layout. Initial deployment should enable diagnostic logging to verify the
-//! mapping against physical hardware.
+//! The native Pimax runtime reports buttons as a vendor bitmask. `pimax.rs`
+//! maps those vendor bits into the compact ALVR bit layout documented below.
+//! This module maps that normalized bit layout to OpenXR interaction profile
+//! path strings, then hashes each path to the `u64` IDs expected by the ALVR
+//! server and SteamVR bindings.
 //!
 //! # Thread Safety
 //!
-//! `LATEST_CONTROLLER_STATE` is protected by a `std::sync::Mutex`. The Java
-//! poller thread writes at 30 Hz; the Rust tracking thread reads at 90 Hz.
+//! `LATEST_CONTROLLER_STATE` is protected by a `std::sync::Mutex`. The native
+//! Pimax poller writes at 50 Hz; the Rust tracking thread reads at 90 Hz.
 //! Contention is minimal because both hold the lock for microseconds.
 
 use std::sync::Mutex;
