@@ -126,6 +126,14 @@ public final class VrRenderActivity extends NativeActivity {
     /** How often to reassert standalone panel mode while the VR activity is alive. */
     private static final long PIMAX_PC_SWITCH_GUARD_INTERVAL_MS = 2_000L;
 
+    /** Startup grace before an absent proximity sample is treated as off-head. */
+    private static final long PROXIMITY_UNKNOWN_SLEEP_GRACE_MS =
+            ProximityWakePolicy.UNKNOWN_SLEEP_GRACE_MS;
+
+    /** Far samples must remain stable before the app lets Pimax put the panel to sleep. */
+    private static final long PROXIMITY_FAR_SLEEP_GRACE_MS =
+            ProximityWakePolicy.FAR_SLEEP_GRACE_MS;
+
     // ---- Pimax hardware bridge constants ---------------------------------------------
 
     /**
@@ -172,11 +180,8 @@ public final class VrRenderActivity extends NativeActivity {
     /** Main-thread handler that keeps Pimax's PC/DP switch path disabled during Wi-Fi streaming. */
     private Handler pcSwitchGuardHandler;
 
-    /** True while the proximity sensor reports that the headset is near the face. */
-    private boolean headsetNear;
-
-    /** True after the proximity sensor has reported at least one near/far sample. */
-    private boolean proximityStateKnown;
+    /** Testable state machine for proximity-driven display wake/sleep decisions. */
+    private final ProximityWakePolicy proximityWakePolicy = new ProximityWakePolicy();
 
     /** Latest screen-on/off state that should be forwarded to native when it becomes ready. */
     private boolean pendingNativeScreenOn = true;
@@ -201,6 +206,37 @@ public final class VrRenderActivity extends NativeActivity {
         @Override
         public void run() {
             retryDisplayWakeIfNeeded();
+        }
+    };
+
+    /** Allows normal off-head sleep if Android never delivers an initial proximity sample. */
+    private final Runnable proximityUnknownSleepRunnable = new Runnable() {
+        @Override
+        public void run() {
+            ProximityWakePolicy.Action action = proximityWakePolicy.onUnknownSleepGraceElapsed();
+            if (action != ProximityWakePolicy.Action.UNKNOWN_FAR) {
+                return;
+            }
+            Log.i(TAG, "proximity state still unknown after startup grace; assuming off-head");
+            if (nativeLibrariesLoaded) {
+                nativeNotifyProximity(false);
+            }
+            allowDisplaySleep("proximity unknown grace elapsed");
+        }
+    };
+
+    /** Confirms that a far reading stayed stable before releasing the display wake lock. */
+    private final Runnable proximityFarSleepRunnable = new Runnable() {
+        @Override
+        public void run() {
+            ProximityWakePolicy.Action action = proximityWakePolicy.onFarSleepGraceElapsed();
+            if (action != ProximityWakePolicy.Action.FAR_STABLE) {
+                return;
+            }
+            if (nativeLibrariesLoaded) {
+                nativeNotifyProximity(false);
+            }
+            handleHeadsetFar("proximity far stable");
         }
     };
 
@@ -296,15 +332,16 @@ public final class VrRenderActivity extends NativeActivity {
             // The proximity sensor typically returns 0 (near) or 5+ cm (far) on Pimax devices.
             float distance = event != null && event.values.length > 0 ? event.values[0] : Float.NaN;
             boolean isNear = distance < 1.0f;
-            proximityStateKnown = true;
-            headsetNear = isNear;
-            if (nativeLibrariesLoaded) {
-                nativeNotifyProximity(isNear);
-            }
-            if (isNear) {
+            stopProximityUnknownSleep("proximity sample");
+            ProximityWakePolicy.Action action = proximityWakePolicy.onProximitySample(isNear);
+            if (action == ProximityWakePolicy.Action.NEAR) {
+                cancelProximityFarSleep("proximity near");
+                if (nativeLibrariesLoaded) {
+                    nativeNotifyProximity(true);
+                }
                 runOnUiThread(() -> handleHeadsetNear("proximity near"));
-            } else {
-                runOnUiThread(() -> handleHeadsetFar("proximity far"));
+            } else if (action == ProximityWakePolicy.Action.FAR_PENDING) {
+                scheduleProximityFarSleep("proximity far");
             }
         }
 
@@ -418,10 +455,10 @@ public final class VrRenderActivity extends NativeActivity {
         }
         Log.i(TAG, "flushing deferred native state: " + reason
                 + " screenOn=" + pendingNativeScreenOn
-                + " headsetNear=" + headsetNear);
+                + " headsetNear=" + proximityWakePolicy.isHeadsetNear());
         resetNativeShutdown(reason);
         nativeNotifyScreen(pendingNativeScreenOn);
-        nativeNotifyProximity(headsetNear);
+        nativeNotifyProximity(proximityWakePolicy.isHeadsetNear());
         registerPimaxHardwareBridge();
         registerProximitySensor();
         startControllerPoller();
@@ -431,11 +468,14 @@ public final class VrRenderActivity extends NativeActivity {
      * Reasserts the display wake path on the UI thread when the headset is put back on.
      */
     private void handleHeadsetNear(String reason) {
+        cancelProximityFarSleep(reason);
         setPimaxEyechipEnabled(false, reason);
         PowerManager powerManager = (PowerManager) getSystemService(POWER_SERVICE);
         if (powerManager != null && !powerManager.isInteractive()) {
             Log.i(TAG, "headset near while Android display is not interactive; waiting for Pimax screen-on: "
                     + reason);
+            forceScreenWakeLock(reason);
+            startDisplayWakeRetry(reason);
             return;
         }
         pendingNativeScreenOn = true;
@@ -549,6 +589,7 @@ public final class VrRenderActivity extends NativeActivity {
         super.onCreate(savedInstanceState);
         Log.i(TAG, "VrRenderActivity.onCreate");
         paused = false;
+        proximityWakePolicy.setPaused(false);
         nativeShutdownRequested = false;
         pendingNativeScreenOn = true;
         // Clear any stale native shutdown flag from a previous session.
@@ -560,7 +601,7 @@ public final class VrRenderActivity extends NativeActivity {
         setPimaxEyechipEnabled(false, "onCreate active streaming");
         startPimaxPcSwitchGuard("onCreate active streaming");
         registerScreenReceiver();
-        acquireScreenWakeLock("onCreate");
+        keepDisplayAwake("onCreate");
         registerPimaxHardwareBridge();
         registerProximitySensor();
         startControllerPoller();
@@ -585,6 +626,7 @@ public final class VrRenderActivity extends NativeActivity {
         super.onResume();
         Log.i(TAG, "VrRenderActivity.onResume");
         paused = false;
+        proximityWakePolicy.setPaused(false);
         // Guard against resuming after a shutdown request — a stale render loop should
         // not run as it may produce garbled visuals or crash.
         if (nativeShutdownRequested) {
@@ -632,6 +674,7 @@ public final class VrRenderActivity extends NativeActivity {
     protected void onPause() {
         Log.i(TAG, "VrRenderActivity.onPause");
         paused = true;
+        proximityWakePolicy.setPaused(true);
         // Reduce refresh rate to save power — full 90 Hz is only needed while actively tracking.
         trySetPeakRefreshRate(72.0f, "onPause");
         // Note: native render loop and wake lock remain alive here.
@@ -651,6 +694,7 @@ public final class VrRenderActivity extends NativeActivity {
     protected void onStop() {
         Log.i(TAG, "VrRenderActivity.onStop");
         paused = true;
+        proximityWakePolicy.setPaused(true);
         // Note: native render loop and wake lock remain alive here.
         Log.i(TAG, "keeping native render loop and wake lock alive after onStop; Pimax XR entry can stop the activity");
         super.onStop();
@@ -671,10 +715,13 @@ public final class VrRenderActivity extends NativeActivity {
     protected void onDestroy() {
         Log.i(TAG, "VrRenderActivity.onDestroy");
         paused = true;
+        proximityWakePolicy.setPaused(true);
         // Signal the native render loop to shut down.
         requestNativeShutdown("onDestroy");
         stopControllerPoller();
         stopDisplayWakeRetry("onDestroy");
+        stopProximityUnknownSleep("onDestroy");
+        cancelProximityFarSleep("onDestroy");
         stopPimaxPcSwitchGuard("onDestroy");
         unregisterProximitySensor();
         unregisterPimaxHardwareBridge();
@@ -792,6 +839,7 @@ public final class VrRenderActivity extends NativeActivity {
      */
     private void shutdownAndFinish(String reason) {
         paused = true;
+        proximityWakePolicy.setPaused(true);
         setPimaxEyechipEnabled(true, "explicit shutdown: " + reason);
         requestNativeShutdown(reason);
         unregisterScreenReceiver();
@@ -927,20 +975,70 @@ public final class VrRenderActivity extends NativeActivity {
 
     /** Returns true until proximity is known, and then only while the headset is worn. */
     private boolean shouldKeepDisplayAwakeForProximity() {
-        return !proximityStateKnown || headsetNear;
+        return proximityWakePolicy.shouldKeepDisplayAwakeForProximity();
     }
 
     /** Enables the normal VR keep-awake policy while the headset is being worn. */
     private void keepDisplayAwake(String reason) {
         getWindow().addFlags(WINDOW_KEEP_AWAKE_FLAGS);
         acquireScreenWakeLock(reason);
+        if (!proximityWakePolicy.isProximityStateKnown()) {
+            scheduleProximityUnknownSleep(reason);
+        }
     }
 
     /** Allows Pimax's own off-head timeout to turn the panel off while preserving PC-switch guard. */
     private void allowDisplaySleep(String reason) {
+        stopProximityUnknownSleep(reason);
+        cancelProximityFarSleep(reason);
         getWindow().clearFlags(WINDOW_KEEP_AWAKE_FLAGS);
         releaseScreenWakeLock();
         Log.i(TAG, "allowing display sleep while off-head: " + reason);
+    }
+
+    /** Schedules the off-head fallback used before the first proximity sample arrives. */
+    private void scheduleProximityUnknownSleep(String reason) {
+        if (screenWakeHandler == null
+                || proximityWakePolicy.isProximityStateKnown()
+                || proximityWakePolicy.isPaused()) {
+            return;
+        }
+        screenWakeHandler.removeCallbacks(proximityUnknownSleepRunnable);
+        screenWakeHandler.postDelayed(
+                proximityUnknownSleepRunnable, PROXIMITY_UNKNOWN_SLEEP_GRACE_MS);
+        Log.i(TAG, "scheduled proximity-unknown sleep fallback: " + reason);
+    }
+
+    /** Cancels the proximity-unknown fallback once real state is known or sleep is allowed. */
+    private void stopProximityUnknownSleep(String reason) {
+        if (screenWakeHandler == null) {
+            return;
+        }
+        screenWakeHandler.removeCallbacks(proximityUnknownSleepRunnable);
+        Log.i(TAG, "stopped proximity-unknown sleep fallback: " + reason);
+    }
+
+    /** Schedules a confirmation delay for noisy proximity-far readings. */
+    private void scheduleProximityFarSleep(String reason) {
+        if (proximityWakePolicy.isPaused()) {
+            return;
+        }
+        if (screenWakeHandler == null) {
+            screenWakeHandler = new Handler(Looper.getMainLooper());
+        }
+        Log.i(TAG, "scheduled proximity-far sleep confirmation: " + reason);
+        screenWakeHandler.removeCallbacks(proximityFarSleepRunnable);
+        screenWakeHandler.postDelayed(proximityFarSleepRunnable, PROXIMITY_FAR_SLEEP_GRACE_MS);
+    }
+
+    /** Cancels a pending far confirmation when the sensor reports near again. */
+    private void cancelProximityFarSleep(String reason) {
+        if (screenWakeHandler != null) {
+            screenWakeHandler.removeCallbacks(proximityFarSleepRunnable);
+        }
+        if (proximityWakePolicy.cancelPendingFar()) {
+            Log.i(TAG, "cancelled proximity-far sleep confirmation: " + reason);
+        }
     }
 
     /**
@@ -1153,7 +1251,7 @@ public final class VrRenderActivity extends NativeActivity {
 
     /** Retry wake pokes until the display becomes interactive or the retry budget is used up. */
     private void retryDisplayWakeIfNeeded() {
-        if (!headsetNear) {
+        if (!proximityWakePolicy.isHeadsetNear()) {
             return;
         }
         PowerManager powerManager = (PowerManager) getSystemService(POWER_SERVICE);
