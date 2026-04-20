@@ -36,3 +36,5 @@ jadx_output/
 .claude/
 .mcp.json
 tools/vr-diagnostic-tool/
+CLAUDE.md
+.codex/
