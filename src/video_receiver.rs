@@ -315,7 +315,6 @@ struct IntermediateFbo {
 #[derive(Clone, Copy, Debug)]
 struct FramebufferLumaStats {
     center_pixel: [u8; 4],
-    samples: u32,
     average_luma: f32,
     dark_percent: f32,
     bright_percent: f32,
@@ -941,7 +940,6 @@ fn readback_framebuffer_luma_stats(
 
     FramebufferLumaStats {
         center_pixel,
-        samples,
         average_luma,
         dark_percent: if samples > 0 {
             (dark_samples as f32 / samples as f32) * 100.0

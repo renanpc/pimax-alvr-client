@@ -474,7 +474,6 @@ const GL_COLOR_BUFFER_BIT: u32 = 0x0000_4000;
 const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
 const GL_FRAMEBUFFER: u32 = 0x8D40;
 const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
-const GL_NO_ERROR: u32 = 0;
 const GL_FRAMEBUFFER_BINDING: u32 = 0x8CA6;
 const GL_FLOAT: u32 = 0x1406;
 const GL_VENDOR: u32 = 0x1F00;
@@ -1651,7 +1650,6 @@ struct PimaxControllerRuntime {
     client: GlobalRef,
     handle: i32,
     native_fd: i32,
-    fd_size: usize,
     ring_mapping: Option<PimaxControllerRingMapping>,
     last_ring_sample: Vec<u8>,
     last_ring_change_log: Instant,
@@ -2075,7 +2073,6 @@ fn start_pimax_controller_runtime(
         client,
         handle,
         native_fd,
-        fd_size,
         ring_mapping,
         last_ring_sample: Vec::new(),
         last_ring_change_log: Instant::now()
