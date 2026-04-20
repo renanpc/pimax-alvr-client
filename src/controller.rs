@@ -213,11 +213,7 @@ struct ButtonBitMap {
     right_suffix: &'static str,
 }
 
-/// Pimax button bitmask → OpenXR path mapping.
-///
-/// These bit positions are based on the Qualcomm SVR controller layout.
-/// Verify against actual hardware output using the diagnostic logs, then
-/// adjust as needed.
+/// Normalized Pimax button bitmask → OpenXR path mapping.
 ///
 /// Bit assignments after native Pimax normalization:
 ///   0 = trigger click
