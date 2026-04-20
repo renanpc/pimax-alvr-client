@@ -139,7 +139,7 @@
 use anyhow::bail;
 use anyhow::{Context, Result};
 use jni::{
-    objects::{GlobalRef, JClass, JFloatArray, JIntArray, JObject, JObjectArray, JString, JValue},
+    objects::{GlobalRef, JClass, JObject, JObjectArray, JString, JValue},
     JavaVM,
 };
 use log::{error, info, warn};
@@ -150,11 +150,19 @@ use std::os::raw::c_void;
 use std::{
     ffi::CStr,
     ffi::CString,
-    ptr,
+    mem, ptr,
     sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant},
 };
+
+/// Whether to run the expensive reflective Pimax SDK introspection during startup.
+///
+/// This is useful while reverse-engineering the controller/input surface, but it can
+/// take long enough to trip the Android launch timeout on some boots. Keep the
+/// default path lightweight so the headset gets a frame up quickly.
+const PIMAX_VERBOSE_STARTUP_INTROSPECTION: bool = false;
+const ENABLE_NATIVE_PIMAX_CONTROLLER_RUNTIME: bool = true;
 
 type EGLDisplay = *mut c_void;
 type EGLConfig = *mut c_void;
@@ -169,6 +177,17 @@ type EGLClientBuffer = *mut c_void;
 /// activity is paused, stopped, or destroyed.
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Global flag that asks the render loop to reassert Pimax presentation state.
+///
+/// Raised when the headset comes back on-face or the screen reports itself on again.
+static PRESENTATION_REFRESH_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Latest headset proximity state reported by the Android activity.
+///
+/// The render loop uses this to avoid waking the panel immediately after Pimax's
+/// own proximity state-machine has intentionally put it to sleep off-head.
+static HEADSET_NEAR: AtomicBool = AtomicBool::new(false);
+
 /// Check if shutdown has been requested
 fn is_shutdown_requested() -> bool {
     SHUTDOWN_REQUESTED.load(Ordering::SeqCst)
@@ -181,6 +200,19 @@ fn reset_shutdown_requested() {
 fn request_shutdown(reason: &str) {
     SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
     log::info!("Pimax shutdown requested: {reason}");
+}
+
+fn request_presentation_refresh(reason: &str) {
+    PRESENTATION_REFRESH_REQUESTED.store(true, Ordering::SeqCst);
+    log::info!("Pimax presentation refresh requested: {reason}");
+}
+
+fn take_presentation_refresh_requested() -> bool {
+    PRESENTATION_REFRESH_REQUESTED.swap(false, Ordering::SeqCst)
+}
+
+fn is_headset_near() -> bool {
+    HEADSET_NEAR.load(Ordering::SeqCst)
 }
 
 #[no_mangle]
@@ -215,7 +247,12 @@ pub extern "system" fn Java_com_pimax_alvr_client_VrRenderActivity_nativeNotifyP
     _class: JClass<'_>,
     is_near: jni::sys::jboolean,
 ) {
-    info!("Pimax proximity state changed: near={}", is_near != 0);
+    let is_near = is_near != 0;
+    HEADSET_NEAR.store(is_near, Ordering::SeqCst);
+    info!("Pimax proximity state changed: near={is_near}");
+    if is_near {
+        request_presentation_refresh("proximity near");
+    }
 }
 
 #[no_mangle]
@@ -224,7 +261,68 @@ pub extern "system" fn Java_com_pimax_alvr_client_VrRenderActivity_nativeNotifyS
     _class: JClass<'_>,
     is_screen_on: jni::sys::jboolean,
 ) {
-    info!("Pimax screen state changed: on={}", is_screen_on != 0);
+    let is_screen_on = is_screen_on != 0;
+    info!("Pimax screen state changed: on={is_screen_on}");
+    if is_screen_on && is_headset_near() {
+        request_presentation_refresh("screen on");
+    }
+}
+
+fn jhand_to_controller_hand(hand: jni::sys::jint) -> Option<crate::controller::Hand> {
+    match hand {
+        0 => Some(crate::controller::Hand::Left),
+        1 => Some(crate::controller::Hand::Right),
+        other => {
+            warn!("ignoring controller JNI call with invalid hand index {other}");
+            None
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_pimax_alvr_client_VrRenderActivity_nativeNotifyControllerState(
+    _env: jni::JNIEnv<'_>,
+    _class: JClass<'_>,
+    hand: jni::sys::jint,
+    handle: jni::sys::jint,
+    buttons_pressed: jni::sys::jint,
+    buttons_touched: jni::sys::jint,
+    trigger: jni::sys::jfloat,
+    grip: jni::sys::jfloat,
+    thumbstick_x: jni::sys::jfloat,
+    thumbstick_y: jni::sys::jfloat,
+    battery: jni::sys::jint,
+) {
+    let Some(hand) = jhand_to_controller_hand(hand) else {
+        return;
+    };
+    let state = crate::controller::SingleControllerState {
+        connected: true,
+        handle,
+        motion: None,
+        buttons_pressed: buttons_pressed as u32,
+        buttons_touched: buttons_touched as u32,
+        trigger,
+        grip,
+        thumbstick_x,
+        thumbstick_y,
+        battery_percent: battery.clamp(0, 100) as u8,
+        last_updated: std::time::Instant::now(),
+    };
+    crate::controller::update_controller_state(hand, state);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_pimax_alvr_client_VrRenderActivity_nativeNotifyControllerConnection(
+    _env: jni::JNIEnv<'_>,
+    _class: JClass<'_>,
+    hand: jni::sys::jint,
+    connected: jni::sys::jboolean,
+) {
+    let Some(hand) = jhand_to_controller_hand(hand) else {
+        return;
+    };
+    crate::controller::update_controller_connection(hand, connected != 0);
 }
 
 // Signal handler setup (platform-specific)
@@ -318,7 +416,6 @@ extern "C" {
 extern "C" {
     fn eglGetDisplay(display_id: *mut c_void) -> EGLDisplay;
     fn eglGetCurrentDisplay() -> EGLDisplay;
-    fn eglGetCurrentContext() -> EGLContext;
     fn eglGetError() -> i32;
     fn eglGetProcAddress(procname: *const i8) -> *const c_void;
     fn eglInitialize(dpy: EGLDisplay, major: *mut i32, minor: *mut i32) -> u32;
@@ -366,7 +463,6 @@ const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
 const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
 const GL_TEXTURE_WRAP_S: u32 = 0x2802;
 const GL_TEXTURE_WRAP_T: u32 = 0x2803;
-const GL_NEAREST: i32 = 0x2600;
 const GL_LINEAR: i32 = 0x2601;
 const GL_CLAMP_TO_EDGE: i32 = 0x812F;
 const GL_RG: u32 = 0x8227;
@@ -376,7 +472,6 @@ const GL_COLOR_BUFFER_BIT: u32 = 0x0000_4000;
 const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
 const GL_FRAMEBUFFER: u32 = 0x8D40;
 const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
-const GL_NO_ERROR: u32 = 0;
 const GL_FRAMEBUFFER_BINDING: u32 = 0x8CA6;
 const GL_FLOAT: u32 = 0x1406;
 const GL_VENDOR: u32 = 0x1F00;
@@ -412,16 +507,66 @@ const PIMAX_PROMOTE_TO_POSITIONAL_TRACKING: bool = false;
 const TRACKING_MODE_ROTATION: i32 = 1;
 const TRACKING_MODE_POSITION: i32 = 2;
 const TRACKING_MODE_ROTATION_POSITION: i32 = TRACKING_MODE_ROTATION | TRACKING_MODE_POSITION;
+const PIMAX_CONTROLLER_QUERY_INTERVAL: Duration = Duration::from_secs(1);
+const PIMAX_CONTROLLER_RING_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
+const PIMAX_CONTROLLER_RING_MAX_CHANGE_LOG_WORDS: usize = 32;
+const PIMAX_NATIVE_CONTROLLER_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const PIMAX_NATIVE_CONTROLLER_CHANGE_LOG_INTERVAL: Duration = Duration::from_millis(250);
+const PIMAX_NATIVE_CONTROLLER_BATTERY_INTERVAL: Duration = Duration::from_secs(1);
+const PIMAX_NATIVE_CONTROLLER_STATE_SIZE: usize = 0xd0;
+const PIMAX_NATIVE_CONTROLLER_MAX_CHANGE_LOG_WORDS: usize = 24;
 
-#[derive(Clone, Copy, Debug)]
-enum SubmittedImageHandleKind {
-    TextureId,
-    EglImage,
-    EglClientBuffer,
-    HardwareBufferPtr,
-}
+const PIMAX_CONTROLLER_QUERY_BATTERY: i32 = 0;
+const PIMAX_CONTROLLER_QUERY_ACTIVE_BUTTONS: i32 = 4;
+const PIMAX_CONTROLLER_QUERY_ACTIVE_2D_ANALOGS: i32 = 5;
+const PIMAX_CONTROLLER_QUERY_ACTIVE_1D_ANALOGS: i32 = 6;
+const PIMAX_CONTROLLER_QUERY_ACTIVE_TOUCH_BUTTONS: i32 = 7;
 
-const PIMAX_SUBMITTED_HANDLE_KIND: SubmittedImageHandleKind = SubmittedImageHandleKind::TextureId;
+const PIMAX_BUTTON_ONE: u32 = 1;
+const PIMAX_BUTTON_TWO: u32 = 2;
+const PIMAX_BUTTON_THREE: u32 = 4;
+const PIMAX_BUTTON_FOUR: u32 = 8;
+const PIMAX_BUTTON_BACK: u32 = 512;
+const PIMAX_BUTTON_START: u32 = 256;
+const PIMAX_BUTTON_PRIMARY_INDEX_TRIGGER: u32 = 8192;
+const PIMAX_BUTTON_PRIMARY_HAND_TRIGGER: u32 = 16384;
+const PIMAX_BUTTON_PRIMARY_THUMBSTICK: u32 = 32768;
+const PIMAX_BUTTON_PRIMARY_THUMBSTICK_UP: u32 = 65536;
+const PIMAX_BUTTON_PRIMARY_THUMBSTICK_DOWN: u32 = 131072;
+const PIMAX_BUTTON_PRIMARY_THUMBSTICK_LEFT: u32 = 262144;
+const PIMAX_BUTTON_PRIMARY_THUMBSTICK_RIGHT: u32 = 524288;
+const PIMAX_BUTTON_SECONDARY_INDEX_TRIGGER: u32 = 2097152;
+const PIMAX_BUTTON_SECONDARY_HAND_TRIGGER: u32 = 4194304;
+const PIMAX_BUTTON_SECONDARY_THUMBSTICK: u32 = 8388608;
+const PIMAX_BUTTON_SECONDARY_THUMBSTICK_UP: u32 = 16777216;
+const PIMAX_BUTTON_SECONDARY_THUMBSTICK_DOWN: u32 = 33554432;
+const PIMAX_BUTTON_SECONDARY_THUMBSTICK_LEFT: u32 = 67108864;
+const PIMAX_BUTTON_SECONDARY_THUMBSTICK_RIGHT: u32 = 134217728;
+
+const PIMAX_TOUCH_ONE: u32 = 1;
+const PIMAX_TOUCH_TWO: u32 = 2;
+const PIMAX_TOUCH_THREE: u32 = 4;
+const PIMAX_TOUCH_FOUR: u32 = 8;
+const PIMAX_TOUCH_PRIMARY_THUMBSTICK: u32 = 16;
+const PIMAX_TOUCH_SECONDARY_THUMBSTICK: u32 = 32;
+const PIMAX_NATIVE_TOUCH_TRIGGER: u32 = 0x0000_2000;
+const PIMAX_NATIVE_TOUCH_GRIP: u32 = 0x0000_4000;
+
+const PIMAX_AXIS_1D_PRIMARY_INDEX_TRIGGER: u32 = 1 << 0;
+const PIMAX_AXIS_1D_SECONDARY_INDEX_TRIGGER: u32 = 1 << 1;
+const PIMAX_AXIS_1D_PRIMARY_HAND_TRIGGER: u32 = 1 << 2;
+const PIMAX_AXIS_1D_SECONDARY_HAND_TRIGGER: u32 = 1 << 3;
+const PIMAX_AXIS_2D_PRIMARY_THUMBSTICK: u32 = 1 << 0;
+const PIMAX_AXIS_2D_SECONDARY_THUMBSTICK: u32 = 1 << 1;
+
+const ALVR_BUTTON_TRIGGER: u32 = 1 << 0;
+const ALVR_BUTTON_THUMBSTICK_CLICK: u32 = 1 << 1;
+const ALVR_BUTTON_MENU: u32 = 1 << 2;
+const ALVR_BUTTON_GRIP: u32 = 1 << 3;
+const ALVR_BUTTON_AX: u32 = 1 << 4;
+const ALVR_BUTTON_BY: u32 = 1 << 5;
+
+const PIMAX_SUBMITTED_HANDLE_KIND_LABEL: &str = "TextureId";
 #[derive(Debug, Default, Clone)]
 pub struct PimaxProbeReport {
     pub pxr_version: Option<String>,
@@ -1167,10 +1312,12 @@ fn read_pimax_head_tracking_pose<'local>(
         get_float_field(env, &rotation, "w").context("get Pimax head rotation.w")?,
     );
 
+    // Pimax reports head height with the opposite vertical sign from ALVR.
+    // Without this, SteamVR places the user's eyes below the floor.
+    let position = glam::vec3(raw_position.x, -raw_position.y, raw_position.z);
     // Conjugate the Pimax quaternion so ALVR receives the correct rotation
     // direction. Without this, yaw and pitch are inverted (looking left
     // turns the camera right, looking down turns it up).
-    let position = raw_position;
     let orientation = raw_orientation.conjugate();
 
     if !position.x.is_finite() || !position.y.is_finite() || !position.z.is_finite() {
@@ -1256,6 +1403,1435 @@ fn dump_class_schema(env: &mut jni::JNIEnv<'_>, class_name: &str) -> Result<()> 
     }
 
     Ok(())
+}
+
+fn java_value_to_string(env: &mut jni::JNIEnv<'_>, value: &JObject<'_>) -> Result<String> {
+    let text = call_static_object(
+        env,
+        "java/lang/String",
+        "valueOf",
+        "(Ljava/lang/Object;)Ljava/lang/String;",
+        &[JValue::Object(value)],
+    )
+    .context("call String.valueOf")?;
+    object_to_string(env, text).context("convert String.valueOf result")
+}
+
+fn dump_object_declared_fields(
+    env: &mut jni::JNIEnv<'_>,
+    object: &JObject<'_>,
+    label: &str,
+) -> Result<()> {
+    if object.is_null() {
+        info!("{label}: <null>");
+        return Ok(());
+    }
+
+    let class = env
+        .call_method(object, "getClass", "()Ljava/lang/Class;", &[])
+        .context("get object class")?
+        .l()
+        .context("decode object class")?;
+    let class_name: String = env
+        .call_method(&class, "getName", "()Ljava/lang/String;", &[])
+        .context("get object class name")?
+        .l()
+        .context("decode object class name")
+        .and_then(|object| object_to_string(env, object).context("object class name string"))?;
+    let object_text = java_value_to_string(env, object).unwrap_or_else(|err| format!("{err:#}"));
+    info!("{label}: class={class_name} value={object_text}");
+
+    let fields = env
+        .call_method(
+            &class,
+            "getDeclaredFields",
+            "()[Ljava/lang/reflect/Field;",
+            &[],
+        )
+        .context("get object declared fields")?
+        .l()
+        .context("decode object declared fields")?;
+    let fields = JObjectArray::from(fields);
+    let count = env
+        .get_array_length(&fields)
+        .context("count object declared fields")?;
+    info!("{label}: {count} declared fields");
+
+    for index in 0..count {
+        let field = env
+            .get_object_array_element(&fields, index)
+            .with_context(|| format!("get object declared field {index}"))?;
+        let _ = env.call_method(&field, "setAccessible", "(Z)V", &[JValue::Bool(1)]);
+        let field_name: String = env
+            .call_method(&field, "getName", "()Ljava/lang/String;", &[])
+            .context("get object field name")?
+            .l()
+            .context("decode object field name")
+            .and_then(|object| object_to_string(env, object).context("object field name string"))?;
+        let type_obj = env
+            .call_method(&field, "getType", "()Ljava/lang/Class;", &[])
+            .context("get object field type")?
+            .l()
+            .context("decode object field type")?;
+        let type_name: String = env
+            .call_method(&type_obj, "getName", "()Ljava/lang/String;", &[])
+            .context("get object field type name")?
+            .l()
+            .context("decode object field type name")
+            .and_then(|object| {
+                object_to_string(env, object).context("object field type name string")
+            })?;
+        let value = match env.call_method(
+            &field,
+            "get",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[JValue::Object(object)],
+        ) {
+            Ok(value) => value.l().context("decode reflected field value")?,
+            Err(err) => {
+                let summary = take_java_exception_summary(env)
+                    .unwrap_or_else(|| "no pending Java exception summary".to_string());
+                warn!("{label}.{field_name}: unable to read field: {err:#}; {summary}");
+                continue;
+            }
+        };
+        let value_text = java_value_to_string(env, &value).unwrap_or_else(|err| format!("{err:#}"));
+        info!("{label}.{field_name}: type={type_name} value={value_text}");
+    }
+
+    Ok(())
+}
+
+fn get_declared_int_field_by_name(
+    env: &mut jni::JNIEnv<'_>,
+    object: &JObject<'_>,
+    field_name: &str,
+) -> Result<i32> {
+    let class = env
+        .call_method(object, "getClass", "()Ljava/lang/Class;", &[])
+        .context("get object class")?
+        .l()
+        .context("decode object class")?;
+    let field_name_obj = JObject::from(
+        env.new_string(field_name)
+            .context("create reflected field name")?,
+    );
+    let field = match env.call_method(
+        &class,
+        "getDeclaredField",
+        "(Ljava/lang/String;)Ljava/lang/reflect/Field;",
+        &[JValue::Object(&field_name_obj)],
+    ) {
+        Ok(field) => field.l().context("decode reflected field")?,
+        Err(err) => {
+            let summary = take_java_exception_summary(env)
+                .unwrap_or_else(|| "no pending Java exception summary".to_string());
+            bail!("getDeclaredField({field_name}) failed: {err:#}; {summary}");
+        }
+    };
+    let _ = env.call_method(&field, "setAccessible", "(Z)V", &[JValue::Bool(1)]);
+    let value = match env.call_method(
+        &field,
+        "getInt",
+        "(Ljava/lang/Object;)I",
+        &[JValue::Object(object)],
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            let summary = take_java_exception_summary(env)
+                .unwrap_or_else(|| "no pending Java exception summary".to_string());
+            bail!("Field.getInt({field_name}) failed: {err:#}; {summary}");
+        }
+    };
+    value.i().context("decode reflected int field")
+}
+
+fn infer_controller_start_handle(
+    env: &mut jni::JNIEnv<'_>,
+    start_info: &JObject<'_>,
+) -> Option<i32> {
+    for name in [
+        "handle",
+        "mHandle",
+        "m_handle",
+        "controllerHandle",
+        "mControllerHandle",
+        "controller_handle",
+        "fd",
+        "mFd",
+    ] {
+        if let Ok(handle) = get_declared_int_field_by_name(env, start_info, name) {
+            info!("ControllerStartInfo inferred handle from {name}={handle}");
+            return Some(handle);
+        }
+    }
+    warn!("ControllerStartInfo handle field was not inferred from known names");
+    None
+}
+
+fn pvr_service_controller_start<'local>(
+    env: &mut jni::JNIEnv<'local>,
+    client: &GlobalRef,
+    service: &str,
+) -> Result<JObject<'local>> {
+    let service = JObject::from(
+        env.new_string(service)
+            .context("create ControllerStart service string")?,
+    );
+    let value = match env.call_method(
+        client.as_obj(),
+        "ControllerStart",
+        "(Ljava/lang/String;)Lcom/pimax/pxrapi/controller/ControllerStartInfo;",
+        &[JValue::Object(&service)],
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            let summary = take_java_exception_summary(env)
+                .unwrap_or_else(|| "no pending Java exception summary".to_string());
+            bail!("call PvrServiceClient.ControllerStart failed: {err:#}; {summary}");
+        }
+    };
+    value.l().context("decode ControllerStartInfo")
+}
+
+fn pvr_service_controller_stop(
+    env: &mut jni::JNIEnv<'_>,
+    client: &GlobalRef,
+    handle: i32,
+) -> Result<()> {
+    if let Err(err) = env.call_method(
+        client.as_obj(),
+        "ControllerStop",
+        "(I)V",
+        &[JValue::Int(handle)],
+    ) {
+        let summary = take_java_exception_summary(env)
+            .unwrap_or_else(|| "no pending Java exception summary".to_string());
+        bail!("call PvrServiceClient.ControllerStop({handle}) failed: {err:#}; {summary}");
+    }
+    Ok(())
+}
+
+fn pvr_service_controller_query_int(
+    env: &mut jni::JNIEnv<'_>,
+    client: &GlobalRef,
+    handle: i32,
+    query_type: i32,
+) -> Result<i32> {
+    let value = match env.call_method(
+        client.as_obj(),
+        "ControllerQueryInt",
+        "(II)I",
+        &[JValue::Int(handle), JValue::Int(query_type)],
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            let summary = take_java_exception_summary(env)
+                .unwrap_or_else(|| "no pending Java exception summary".to_string());
+            bail!(
+                "call PvrServiceClient.ControllerQueryInt({handle}, {query_type}) failed: {err:#}; {summary}"
+            );
+        }
+    };
+    value.i().context("decode ControllerQueryInt result")
+}
+
+struct PimaxControllerRuntime {
+    client: GlobalRef,
+    handle: i32,
+    native_fd: i32,
+    ring_mapping: Option<PimaxControllerRingMapping>,
+    last_ring_sample: Vec<u8>,
+    last_ring_change_log: Instant,
+    last_poll: Instant,
+    last_query_poll: Instant,
+    last_buttons: u32,
+    last_touches: u32,
+    last_active_1d: u32,
+    last_active_2d: u32,
+    last_battery: i32,
+    poll_count: u64,
+}
+
+struct PimaxControllerRingMapping {
+    ptr: *mut u8,
+    len: usize,
+}
+
+fn clamp_battery_percent(value: i32) -> u8 {
+    value.clamp(0, 100) as u8
+}
+
+fn has_flag(value: u32, flag: u32) -> bool {
+    (value & flag) != 0
+}
+
+fn derive_stick_axis(negative: bool, positive: bool) -> f32 {
+    match (negative, positive) {
+        (true, false) => -1.0,
+        (false, true) => 1.0,
+        _ => 0.0,
+    }
+}
+
+fn map_pimax_controller_ring_buffer(
+    native_fd: i32,
+    fd_size: usize,
+) -> Option<PimaxControllerRingMapping> {
+    if native_fd < 0 || fd_size == 0 {
+        warn!(
+            "Pimax controller ring buffer unavailable: native_fd={} fd_size={}",
+            native_fd, fd_size
+        );
+        return None;
+    }
+
+    let ptr = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            fd_size,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            native_fd,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        warn!(
+            "Pimax controller ring buffer mmap failed: native_fd={} fd_size={} errno={}",
+            native_fd,
+            fd_size,
+            std::io::Error::last_os_error()
+        );
+        return None;
+    }
+
+    info!(
+        "Pimax controller ring buffer mapped: native_fd={} fd_size={} ptr={ptr:p}",
+        native_fd, fd_size
+    );
+    Some(PimaxControllerRingMapping {
+        ptr: ptr.cast(),
+        len: fd_size,
+    })
+}
+
+fn unmap_pimax_controller_ring_buffer(mapping: PimaxControllerRingMapping) {
+    let result = unsafe { libc::munmap(mapping.ptr.cast::<c_void>(), mapping.len) };
+    if result != 0 {
+        warn!(
+            "Pimax controller ring buffer munmap failed: ptr={:p} len={} errno={}",
+            mapping.ptr,
+            mapping.len,
+            std::io::Error::last_os_error()
+        );
+    } else {
+        info!(
+            "Pimax controller ring buffer unmapped: ptr={:p} len={}",
+            mapping.ptr, mapping.len
+        );
+    }
+}
+
+fn close_pimax_controller_fd(native_fd: i32) {
+    if native_fd < 0 {
+        return;
+    }
+    let result = unsafe { libc::close(native_fd) };
+    if result != 0 {
+        warn!(
+            "Pimax controller native fd close failed: fd={} errno={}",
+            native_fd,
+            std::io::Error::last_os_error()
+        );
+    } else {
+        info!("Pimax controller native fd closed: fd={native_fd}");
+    }
+}
+
+fn checksum_bytes(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+fn format_hex_bytes(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(bytes.len().saturating_mul(3));
+    for (index, byte) in bytes.iter().enumerate() {
+        if index > 0 {
+            text.push(' ');
+        }
+        text.push_str(&format!("{byte:02x}"));
+    }
+    text
+}
+
+fn sample_pimax_controller_ring_buffer(runtime: &mut PimaxControllerRuntime) {
+    let Some(mapping) = runtime.ring_mapping.as_ref() else {
+        return;
+    };
+    let sample_len = mapping.len;
+    if sample_len == 0 {
+        return;
+    }
+
+    let sample = unsafe { std::slice::from_raw_parts(mapping.ptr, sample_len) };
+    if runtime.last_ring_sample.len() != sample_len {
+        runtime.last_ring_sample.clear();
+        runtime.last_ring_sample.extend_from_slice(sample);
+        info!(
+            "Pimax controller ring initial sample: len={} checksum=0x{:016x} head={} tail={}",
+            sample_len,
+            checksum_bytes(sample),
+            format_hex_bytes(&sample[..sample_len.min(64)]),
+            format_hex_bytes(&sample[sample_len.saturating_sub(64)..])
+        );
+        return;
+    }
+
+    let mut changed_words = Vec::new();
+    let mut changed_word_count = 0_usize;
+    for offset in (0..sample_len).step_by(4) {
+        let end = (offset + 4).min(sample_len);
+        if sample[offset..end] != runtime.last_ring_sample[offset..end] {
+            changed_word_count += 1;
+            let mut before = [0_u8; 4];
+            let mut after = [0_u8; 4];
+            before[..end - offset].copy_from_slice(&runtime.last_ring_sample[offset..end]);
+            after[..end - offset].copy_from_slice(&sample[offset..end]);
+            if changed_words.len() < PIMAX_CONTROLLER_RING_MAX_CHANGE_LOG_WORDS {
+                changed_words.push((
+                    offset,
+                    u32::from_le_bytes(before),
+                    u32::from_le_bytes(after),
+                ));
+            }
+        }
+    }
+
+    if changed_word_count == 0 {
+        return;
+    }
+
+    let should_log = runtime.last_ring_change_log.elapsed() >= Duration::from_millis(250)
+        || runtime.poll_count <= 10;
+    if should_log {
+        let changes = changed_words
+            .iter()
+            .map(|(offset, before, after)| format!("0x{offset:04x}:0x{before:08x}->0x{after:08x}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        info!(
+            "Pimax controller ring changed: poll_count={} changed_words={} checksum=0x{:016x} changes=[{}]",
+            runtime.poll_count,
+            changed_word_count,
+            checksum_bytes(sample),
+            changes
+        );
+        runtime.last_ring_change_log = Instant::now();
+    }
+
+    runtime.last_ring_sample.copy_from_slice(sample);
+}
+
+fn push_pimax_controller_states(
+    runtime: &mut PimaxControllerRuntime,
+    buttons: u32,
+    touches: u32,
+    active_1d: u32,
+    active_2d: u32,
+    battery: i32,
+) {
+    let mut left_buttons = 0_u32;
+    let mut right_buttons = 0_u32;
+
+    if has_flag(buttons, PIMAX_BUTTON_PRIMARY_INDEX_TRIGGER) {
+        left_buttons |= ALVR_BUTTON_TRIGGER;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_PRIMARY_HAND_TRIGGER) {
+        left_buttons |= ALVR_BUTTON_GRIP;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_PRIMARY_THUMBSTICK) {
+        left_buttons |= ALVR_BUTTON_THUMBSTICK_CLICK;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_BACK) {
+        left_buttons |= ALVR_BUTTON_MENU;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_THREE) {
+        left_buttons |= ALVR_BUTTON_AX;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_FOUR) {
+        left_buttons |= ALVR_BUTTON_BY;
+    }
+
+    if has_flag(buttons, PIMAX_BUTTON_SECONDARY_INDEX_TRIGGER) {
+        right_buttons |= ALVR_BUTTON_TRIGGER;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_SECONDARY_HAND_TRIGGER) {
+        right_buttons |= ALVR_BUTTON_GRIP;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_SECONDARY_THUMBSTICK) {
+        right_buttons |= ALVR_BUTTON_THUMBSTICK_CLICK;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_START) {
+        right_buttons |= ALVR_BUTTON_MENU;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_ONE) {
+        right_buttons |= ALVR_BUTTON_AX;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_TWO) {
+        right_buttons |= ALVR_BUTTON_BY;
+    }
+
+    let mut left_touches = 0_u32;
+    let mut right_touches = 0_u32;
+    if has_flag(touches, PIMAX_TOUCH_PRIMARY_THUMBSTICK) {
+        left_touches |= ALVR_BUTTON_THUMBSTICK_CLICK;
+    }
+    if has_flag(touches, PIMAX_TOUCH_THREE) {
+        left_touches |= ALVR_BUTTON_AX;
+    }
+    if has_flag(touches, PIMAX_TOUCH_FOUR) {
+        left_touches |= ALVR_BUTTON_BY;
+    }
+    if has_flag(touches, PIMAX_TOUCH_SECONDARY_THUMBSTICK) {
+        right_touches |= ALVR_BUTTON_THUMBSTICK_CLICK;
+    }
+    if has_flag(touches, PIMAX_TOUCH_ONE) {
+        right_touches |= ALVR_BUTTON_AX;
+    }
+    if has_flag(touches, PIMAX_TOUCH_TWO) {
+        right_touches |= ALVR_BUTTON_BY;
+    }
+
+    let left_trigger_active = has_flag(active_1d, PIMAX_AXIS_1D_PRIMARY_INDEX_TRIGGER)
+        || has_flag(buttons, PIMAX_BUTTON_PRIMARY_INDEX_TRIGGER);
+    let right_trigger_active = has_flag(active_1d, PIMAX_AXIS_1D_SECONDARY_INDEX_TRIGGER)
+        || has_flag(buttons, PIMAX_BUTTON_SECONDARY_INDEX_TRIGGER);
+    let left_grip_active = has_flag(active_1d, PIMAX_AXIS_1D_PRIMARY_HAND_TRIGGER)
+        || has_flag(buttons, PIMAX_BUTTON_PRIMARY_HAND_TRIGGER);
+    let right_grip_active = has_flag(active_1d, PIMAX_AXIS_1D_SECONDARY_HAND_TRIGGER)
+        || has_flag(buttons, PIMAX_BUTTON_SECONDARY_HAND_TRIGGER);
+
+    let left_stick_active = has_flag(active_2d, PIMAX_AXIS_2D_PRIMARY_THUMBSTICK)
+        || has_flag(buttons, PIMAX_BUTTON_PRIMARY_THUMBSTICK);
+    let right_stick_active = has_flag(active_2d, PIMAX_AXIS_2D_SECONDARY_THUMBSTICK)
+        || has_flag(buttons, PIMAX_BUTTON_SECONDARY_THUMBSTICK);
+
+    let left_thumbstick_x = if left_stick_active {
+        derive_stick_axis(
+            has_flag(buttons, PIMAX_BUTTON_PRIMARY_THUMBSTICK_LEFT),
+            has_flag(buttons, PIMAX_BUTTON_PRIMARY_THUMBSTICK_RIGHT),
+        )
+    } else {
+        0.0
+    };
+    let left_thumbstick_y = if left_stick_active {
+        derive_stick_axis(
+            has_flag(buttons, PIMAX_BUTTON_PRIMARY_THUMBSTICK_DOWN),
+            has_flag(buttons, PIMAX_BUTTON_PRIMARY_THUMBSTICK_UP),
+        )
+    } else {
+        0.0
+    };
+    let right_thumbstick_x = if right_stick_active {
+        derive_stick_axis(
+            has_flag(buttons, PIMAX_BUTTON_SECONDARY_THUMBSTICK_LEFT),
+            has_flag(buttons, PIMAX_BUTTON_SECONDARY_THUMBSTICK_RIGHT),
+        )
+    } else {
+        0.0
+    };
+    let right_thumbstick_y = if right_stick_active {
+        derive_stick_axis(
+            has_flag(buttons, PIMAX_BUTTON_SECONDARY_THUMBSTICK_DOWN),
+            has_flag(buttons, PIMAX_BUTTON_SECONDARY_THUMBSTICK_UP),
+        )
+    } else {
+        0.0
+    };
+
+    let now = Instant::now();
+    let battery = clamp_battery_percent(battery);
+    crate::controller::update_controller_state(
+        crate::controller::Hand::Left,
+        crate::controller::SingleControllerState {
+            connected: true,
+            handle: runtime.handle,
+            motion: None,
+            buttons_pressed: left_buttons,
+            buttons_touched: left_touches,
+            trigger: if left_trigger_active { 1.0 } else { 0.0 },
+            grip: if left_grip_active { 1.0 } else { 0.0 },
+            thumbstick_x: left_thumbstick_x,
+            thumbstick_y: left_thumbstick_y,
+            battery_percent: battery,
+            last_updated: now,
+        },
+    );
+    crate::controller::update_controller_state(
+        crate::controller::Hand::Right,
+        crate::controller::SingleControllerState {
+            connected: true,
+            handle: runtime.handle,
+            motion: None,
+            buttons_pressed: right_buttons,
+            buttons_touched: right_touches,
+            trigger: if right_trigger_active { 1.0 } else { 0.0 },
+            grip: if right_grip_active { 1.0 } else { 0.0 },
+            thumbstick_x: right_thumbstick_x,
+            thumbstick_y: right_thumbstick_y,
+            battery_percent: battery,
+            last_updated: now,
+        },
+    );
+
+    runtime.poll_count = runtime.poll_count.wrapping_add(1);
+    let changed = buttons != runtime.last_buttons
+        || touches != runtime.last_touches
+        || active_1d != runtime.last_active_1d
+        || active_2d != runtime.last_active_2d
+        || battery as i32 != runtime.last_battery;
+    if changed || runtime.poll_count <= 5 || runtime.poll_count % 120 == 0 {
+        info!(
+            "Pimax controller SDK poll: count={} handle={} raw_buttons=0x{buttons:08x} raw_touches=0x{touches:08x} active_1d=0x{active_1d:08x} active_2d=0x{active_2d:08x} battery={} left_buttons=0x{left_buttons:08x} right_buttons=0x{right_buttons:08x} left_stick=({left_thumbstick_x:.1},{left_thumbstick_y:.1}) right_stick=({right_thumbstick_x:.1},{right_thumbstick_y:.1})",
+            runtime.poll_count, runtime.handle, battery
+        );
+    }
+    runtime.last_buttons = buttons;
+    runtime.last_touches = touches;
+    runtime.last_active_1d = active_1d;
+    runtime.last_active_2d = active_2d;
+    runtime.last_battery = battery as i32;
+}
+
+fn start_pimax_controller_runtime(
+    env: &mut jni::JNIEnv<'_>,
+    context: &JObject<'_>,
+) -> Result<Option<PimaxControllerRuntime>> {
+    let Some(default_service) = probe_pvr_controller_defaults(env) else {
+        warn!("Pimax controller SDK runtime disabled: default service unavailable");
+        return Ok(None);
+    };
+
+    let client =
+        create_pvr_service_client(env, context).context("create controller runtime client")?;
+    if let Err(err) = connect_pvr_service_client(env, &client) {
+        warn!("Pimax controller SDK runtime Connect failed: {err:#}");
+        return Ok(None);
+    }
+    if let Err(err) = wait_for_pvr_service_interface(env, &client, Duration::from_secs(3)) {
+        warn!("Pimax controller SDK runtime service wait failed: {err:#}");
+        if let Err(disconnect_err) = disconnect_pvr_service_client(env, &client) {
+            warn!("Pimax controller SDK runtime disconnect after failed wait failed: {disconnect_err:#}");
+        }
+        return Ok(None);
+    }
+
+    let start_info = match pvr_service_controller_start(env, &client, &default_service) {
+        Ok(info) => info,
+        Err(err) => {
+            warn!("Pimax controller SDK runtime ControllerStart failed: {err:#}");
+            if let Err(disconnect_err) = disconnect_pvr_service_client(env, &client) {
+                warn!(
+                    "Pimax controller SDK runtime disconnect after failed start failed: {disconnect_err:#}"
+                );
+            }
+            return Ok(None);
+        }
+    };
+    if let Err(err) = dump_object_declared_fields(env, &start_info, "ControllerRuntimeStartInfo") {
+        warn!("failed to dump ControllerRuntimeStartInfo: {err:#}");
+    }
+    let Some(handle) = infer_controller_start_handle(env, &start_info) else {
+        if let Err(disconnect_err) = disconnect_pvr_service_client(env, &client) {
+            warn!(
+                "Pimax controller SDK runtime disconnect after missing handle failed: {disconnect_err:#}"
+            );
+        }
+        bail!("ControllerStart succeeded but no controller handle was found");
+    };
+    let native_fd = get_declared_int_field_by_name(env, &start_info, "m_nativeFd").unwrap_or(-1);
+    let fd_size =
+        get_declared_int_field_by_name(env, &start_info, "m_fd_size").unwrap_or_default() as usize;
+    let ring_mapping = map_pimax_controller_ring_buffer(native_fd, fd_size);
+    info!(
+        "Pimax controller SDK runtime started: service={default_service} handle={handle} native_fd={native_fd} fd_size={fd_size}"
+    );
+
+    Ok(Some(PimaxControllerRuntime {
+        client,
+        handle,
+        native_fd,
+        ring_mapping,
+        last_ring_sample: Vec::new(),
+        last_ring_change_log: Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now),
+        last_poll: Instant::now()
+            .checked_sub(PIMAX_CONTROLLER_RING_SAMPLE_INTERVAL)
+            .unwrap_or_else(Instant::now),
+        last_query_poll: Instant::now()
+            .checked_sub(PIMAX_CONTROLLER_QUERY_INTERVAL)
+            .unwrap_or_else(Instant::now),
+        last_buttons: u32::MAX,
+        last_touches: u32::MAX,
+        last_active_1d: u32::MAX,
+        last_active_2d: u32::MAX,
+        last_battery: i32::MIN,
+        poll_count: 0,
+    }))
+}
+
+fn poll_pimax_controller_runtime(env: &mut jni::JNIEnv<'_>, runtime: &mut PimaxControllerRuntime) {
+    if runtime.last_poll.elapsed() >= PIMAX_CONTROLLER_RING_SAMPLE_INTERVAL {
+        runtime.last_poll = Instant::now();
+        sample_pimax_controller_ring_buffer(runtime);
+    }
+
+    if runtime.last_query_poll.elapsed() < PIMAX_CONTROLLER_QUERY_INTERVAL {
+        return;
+    }
+    runtime.last_query_poll = Instant::now();
+
+    let query = |env: &mut jni::JNIEnv<'_>, query_type| {
+        pvr_service_controller_query_int(env, &runtime.client, runtime.handle, query_type)
+    };
+    let battery = match query(env, PIMAX_CONTROLLER_QUERY_BATTERY) {
+        Ok(value) => value,
+        Err(err) => {
+            warn!("Pimax controller SDK battery query failed: {err:#}");
+            return;
+        }
+    };
+    let buttons = match query(env, PIMAX_CONTROLLER_QUERY_ACTIVE_BUTTONS) {
+        Ok(value) => value as u32,
+        Err(err) => {
+            warn!("Pimax controller SDK active-buttons query failed: {err:#}");
+            return;
+        }
+    };
+    let active_2d = match query(env, PIMAX_CONTROLLER_QUERY_ACTIVE_2D_ANALOGS) {
+        Ok(value) => value as u32,
+        Err(err) => {
+            warn!("Pimax controller SDK active-2d query failed: {err:#}");
+            return;
+        }
+    };
+    let active_1d = match query(env, PIMAX_CONTROLLER_QUERY_ACTIVE_1D_ANALOGS) {
+        Ok(value) => value as u32,
+        Err(err) => {
+            warn!("Pimax controller SDK active-1d query failed: {err:#}");
+            return;
+        }
+    };
+    let touches = match query(env, PIMAX_CONTROLLER_QUERY_ACTIVE_TOUCH_BUTTONS) {
+        Ok(value) => value as u32,
+        Err(err) => {
+            warn!("Pimax controller SDK active-touch query failed: {err:#}");
+            return;
+        }
+    };
+
+    push_pimax_controller_states(runtime, buttons, touches, active_1d, active_2d, battery);
+}
+
+fn stop_pimax_controller_runtime(env: &mut jni::JNIEnv<'_>, mut runtime: PimaxControllerRuntime) {
+    if let Err(err) = pvr_service_controller_stop(env, &runtime.client, runtime.handle) {
+        warn!(
+            "Pimax controller SDK runtime ControllerStop({}) failed: {err:#}",
+            runtime.handle
+        );
+    } else {
+        info!(
+            "Pimax controller SDK runtime stopped handle={}",
+            runtime.handle
+        );
+    }
+    if let Err(err) = disconnect_pvr_service_client(env, &runtime.client) {
+        warn!("Pimax controller SDK runtime Disconnect failed: {err:#}");
+    }
+    if let Some(mapping) = runtime.ring_mapping.take() {
+        unmap_pimax_controller_ring_buffer(mapping);
+    }
+    close_pimax_controller_fd(runtime.native_fd);
+    crate::controller::update_controller_connection(crate::controller::Hand::Left, false);
+    crate::controller::update_controller_connection(crate::controller::Hand::Right, false);
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PimaxNativeControllerState {
+    bytes: [u8; PIMAX_NATIVE_CONTROLLER_STATE_SIZE],
+}
+
+impl Default for PimaxNativeControllerState {
+    fn default() -> Self {
+        Self {
+            bytes: [0; PIMAX_NATIVE_CONTROLLER_STATE_SIZE],
+        }
+    }
+}
+
+type SxrControllerStartTrackingFn = unsafe extern "C" fn(*const libc::c_char) -> i32;
+type SxrControllerStopTrackingFn = unsafe extern "C" fn(i32);
+type SxrControllerGetStateFn = unsafe extern "C" fn(i32, i32) -> PimaxNativeControllerState;
+
+struct PimaxNativeControllerApi {
+    dl_handle: *mut c_void,
+    start_tracking: SxrControllerStartTrackingFn,
+    stop_tracking: SxrControllerStopTrackingFn,
+    get_state: SxrControllerGetStateFn,
+}
+
+struct PimaxNativeControllerRuntime {
+    api: PimaxNativeControllerApi,
+    controllers: Vec<PimaxNativeControllerHandle>,
+    last_poll: Instant,
+    last_change_log: Instant,
+    poll_count: u64,
+}
+
+struct PimaxNativeControllerHandle {
+    hand: crate::controller::Hand,
+    descriptor: CString,
+    handle: i32,
+    last_state: PimaxNativeControllerState,
+    last_parsed: PimaxNativeControllerParsed,
+    last_battery: u8,
+    last_battery_poll: Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PimaxNativeControllerParsed {
+    orientation: glam::Quat,
+    position: glam::Vec3,
+    linear_velocity: glam::Vec3,
+    angular_velocity: glam::Vec3,
+    timestamp_ns: u64,
+    buttons: u32,
+    touches: u32,
+    thumbstick_x: f32,
+    thumbstick_y: f32,
+    trigger: f32,
+    grip: f32,
+}
+
+impl Default for PimaxNativeControllerParsed {
+    fn default() -> Self {
+        Self {
+            orientation: glam::Quat::IDENTITY,
+            position: glam::Vec3::ZERO,
+            linear_velocity: glam::Vec3::ZERO,
+            angular_velocity: glam::Vec3::ZERO,
+            timestamp_ns: 0,
+            buttons: 0,
+            touches: 0,
+            thumbstick_x: 0.0,
+            thumbstick_y: 0.0,
+            trigger: 0.0,
+            grip: 0.0,
+        }
+    }
+}
+
+fn dlerror_string() -> String {
+    let err = unsafe { libc::dlerror() };
+    if err.is_null() {
+        "unknown dlerror".to_string()
+    } else {
+        unsafe { CStr::from_ptr(err) }
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+unsafe fn load_pimax_native_symbol<T: Copy>(dl_handle: *mut c_void, name: &str) -> Result<T> {
+    let symbol_name = CString::new(name).with_context(|| format!("create symbol name {name}"))?;
+    libc::dlerror();
+    let raw = libc::dlsym(dl_handle, symbol_name.as_ptr());
+    if raw.is_null() {
+        bail!("dlsym({name}) failed: {}", dlerror_string());
+    }
+    Ok(mem::transmute_copy::<*mut c_void, T>(&raw))
+}
+
+fn open_pimax_native_controller_api() -> Result<Option<PimaxNativeControllerApi>> {
+    let library = CString::new("libpxrapi.so").context("create libpxrapi.so name")?;
+    unsafe {
+        libc::dlerror();
+    }
+    let dl_handle = unsafe { libc::dlopen(library.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+    if dl_handle.is_null() {
+        warn!(
+            "native Pimax controller runtime disabled: dlopen(libpxrapi.so) failed: {}",
+            dlerror_string()
+        );
+        return Ok(None);
+    }
+
+    let load_result = unsafe {
+        let start_tracking = load_pimax_native_symbol::<SxrControllerStartTrackingFn>(
+            dl_handle,
+            "sxrControllerStartTracking",
+        )?;
+        let stop_tracking = load_pimax_native_symbol::<SxrControllerStopTrackingFn>(
+            dl_handle,
+            "sxrControllerStopTracking",
+        )?;
+        let get_state = load_pimax_native_symbol::<SxrControllerGetStateFn>(
+            dl_handle,
+            "sxrControllerGetState",
+        )?;
+        Ok::<_, anyhow::Error>(PimaxNativeControllerApi {
+            dl_handle,
+            start_tracking,
+            stop_tracking,
+            get_state,
+        })
+    };
+
+    match load_result {
+        Ok(api) => Ok(Some(api)),
+        Err(err) => {
+            unsafe {
+                libc::dlclose(dl_handle);
+            }
+            Err(err).context("load native Pimax controller symbols")
+        }
+    }
+}
+
+fn close_pimax_native_controller_api(api: PimaxNativeControllerApi) {
+    let result = unsafe { libc::dlclose(api.dl_handle) };
+    if result != 0 {
+        warn!("dlclose(libpxrapi.so) failed: {}", dlerror_string());
+    }
+}
+
+fn read_u32_at(bytes: &[u8], offset: usize) -> u32 {
+    let Some(window) = bytes.get(offset..offset + 4) else {
+        return 0;
+    };
+    u32::from_le_bytes([window[0], window[1], window[2], window[3]])
+}
+
+fn read_u64_at(bytes: &[u8], offset: usize) -> u64 {
+    let Some(window) = bytes.get(offset..offset + 8) else {
+        return 0;
+    };
+    u64::from_le_bytes([
+        window[0], window[1], window[2], window[3], window[4], window[5], window[6], window[7],
+    ])
+}
+
+fn read_f32_at(bytes: &[u8], offset: usize) -> f32 {
+    f32::from_bits(read_u32_at(bytes, offset))
+}
+
+fn read_vec3_at(bytes: &[u8], offset: usize) -> glam::Vec3 {
+    let value = glam::vec3(
+        read_f32_at(bytes, offset),
+        read_f32_at(bytes, offset + 4),
+        read_f32_at(bytes, offset + 8),
+    );
+    if value.is_finite() {
+        value
+    } else {
+        glam::Vec3::ZERO
+    }
+}
+
+fn sanitize_pimax_quat(raw: glam::Quat) -> glam::Quat {
+    if !raw.is_finite() {
+        return glam::Quat::IDENTITY;
+    }
+    let length_squared = raw.length_squared();
+    if !(0.001..=4.0).contains(&length_squared) {
+        return glam::Quat::IDENTITY;
+    }
+    raw.normalize()
+}
+
+fn normalize_pimax_native_axis(value: f32) -> f32 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    if value.abs() > 2.0 {
+        ((value - 128.0) / 127.0).clamp(-1.0, 1.0)
+    } else {
+        value.clamp(-1.0, 1.0)
+    }
+}
+
+fn normalize_pimax_native_trigger(value: f32) -> f32 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    if value > 1.5 {
+        (value / 255.0).clamp(0.0, 1.0)
+    } else {
+        value.clamp(0.0, 1.0)
+    }
+}
+
+fn parse_pimax_native_controller_state(
+    state: &PimaxNativeControllerState,
+) -> PimaxNativeControllerParsed {
+    let bytes = &state.bytes;
+    let orientation = sanitize_pimax_quat(glam::Quat::from_xyzw(
+        read_f32_at(bytes, 0x00),
+        read_f32_at(bytes, 0x04),
+        read_f32_at(bytes, 0x08),
+        read_f32_at(bytes, 0x0c),
+    ));
+    let position = read_vec3_at(bytes, 0x10);
+    let angular_velocity = read_vec3_at(bytes, 0x1c);
+    let linear_velocity = read_vec3_at(bytes, 0x28);
+    let timestamp_ns = read_u64_at(bytes, 0x38);
+    let buttons = read_u32_at(bytes, 0x40);
+    let thumbstick_x = normalize_pimax_native_axis(read_f32_at(bytes, 0x44));
+    let thumbstick_y = normalize_pimax_native_axis(read_f32_at(bytes, 0x48));
+    let trigger = normalize_pimax_native_trigger(read_f32_at(bytes, 0x64));
+    let grip = normalize_pimax_native_trigger(read_f32_at(bytes, 0x6c));
+    let touches = read_u32_at(bytes, 0x84);
+
+    PimaxNativeControllerParsed {
+        orientation,
+        position,
+        linear_velocity,
+        angular_velocity,
+        timestamp_ns,
+        buttons,
+        touches,
+        thumbstick_x,
+        thumbstick_y,
+        trigger,
+        grip,
+    }
+}
+
+fn format_pimax_native_state_changes(
+    before: &PimaxNativeControllerState,
+    after: &PimaxNativeControllerState,
+) -> String {
+    let mut changed_words = Vec::new();
+    for offset in (0..PIMAX_NATIVE_CONTROLLER_STATE_SIZE).step_by(4) {
+        let old = read_u32_at(&before.bytes, offset);
+        let new = read_u32_at(&after.bytes, offset);
+        if old != new {
+            if changed_words.len() < PIMAX_NATIVE_CONTROLLER_MAX_CHANGE_LOG_WORDS {
+                changed_words.push(format!("0x{offset:02x}:0x{old:08x}->0x{new:08x}"));
+            } else {
+                break;
+            }
+        }
+    }
+    changed_words.join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn controller_grip_pose_offset_uses_tuned_pitch_degrees() {
+        let offset =
+            pimax_native_controller_grip_pose_offset_from_degrees(glam::vec3(45.0, 0.0, 0.0));
+        let grip_up = offset * glam::Vec3::Y;
+        let expected_up = glam::vec3(
+            0.0,
+            std::f32::consts::FRAC_1_SQRT_2,
+            std::f32::consts::FRAC_1_SQRT_2,
+        );
+        assert!((grip_up - expected_up).length() < 1.0e-5);
+    }
+}
+
+fn read_pimax_controller_battery(hand: crate::controller::Hand) -> Option<u8> {
+    let path = match hand {
+        crate::controller::Hand::Left => "/sys/class/pimax_controller/controller_left/battery",
+        crate::controller::Hand::Right => "/sys/class/pimax_controller/controller_right/battery",
+    };
+    let text = std::fs::read_to_string(path).ok()?;
+    let value = text.trim().parse::<i32>().ok()?;
+    Some(clamp_battery_percent(value))
+}
+
+fn map_pimax_native_buttons(
+    _hand: crate::controller::Hand,
+    parsed: &PimaxNativeControllerParsed,
+) -> (u32, u32) {
+    let mut pressed = 0_u32;
+    let mut touched = 0_u32;
+    let buttons = parsed.buttons;
+    let touches = parsed.touches;
+
+    if has_flag(buttons, PIMAX_BUTTON_PRIMARY_INDEX_TRIGGER)
+        || has_flag(buttons, PIMAX_BUTTON_SECONDARY_INDEX_TRIGGER)
+        || parsed.trigger > 0.2
+    {
+        pressed |= ALVR_BUTTON_TRIGGER;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_PRIMARY_HAND_TRIGGER)
+        || has_flag(buttons, PIMAX_BUTTON_SECONDARY_HAND_TRIGGER)
+        || parsed.grip > 0.2
+    {
+        pressed |= ALVR_BUTTON_GRIP;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_PRIMARY_THUMBSTICK)
+        || has_flag(buttons, PIMAX_BUTTON_SECONDARY_THUMBSTICK)
+    {
+        pressed |= ALVR_BUTTON_THUMBSTICK_CLICK;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_BACK) || has_flag(buttons, PIMAX_BUTTON_START) {
+        pressed |= ALVR_BUTTON_MENU;
+    }
+
+    // Crystal OG native sxrControllerGetState reports the face buttons as the
+    // low two bits for both hands: left X/right A = bit 0, left Y/right B = bit 1.
+    // Keep the older THREE/FOUR constants as a harmless fallback for the Binder
+    // query layout seen in Pimax/Qualcomm docs.
+    if has_flag(buttons, PIMAX_BUTTON_ONE) || has_flag(buttons, PIMAX_BUTTON_THREE) {
+        pressed |= ALVR_BUTTON_AX;
+    }
+    if has_flag(buttons, PIMAX_BUTTON_TWO) || has_flag(buttons, PIMAX_BUTTON_FOUR) {
+        pressed |= ALVR_BUTTON_BY;
+    }
+
+    if has_flag(touches, PIMAX_NATIVE_TOUCH_TRIGGER) || parsed.trigger > 0.01 {
+        touched |= ALVR_BUTTON_TRIGGER;
+    }
+    if has_flag(touches, PIMAX_NATIVE_TOUCH_GRIP) || parsed.grip > 0.01 {
+        touched |= ALVR_BUTTON_GRIP;
+    }
+    if has_flag(touches, PIMAX_TOUCH_PRIMARY_THUMBSTICK)
+        || has_flag(touches, PIMAX_TOUCH_SECONDARY_THUMBSTICK)
+    {
+        touched |= ALVR_BUTTON_THUMBSTICK_CLICK;
+    }
+    if has_flag(touches, PIMAX_TOUCH_ONE) || has_flag(touches, PIMAX_TOUCH_THREE) {
+        touched |= ALVR_BUTTON_AX;
+    }
+    if has_flag(touches, PIMAX_TOUCH_TWO) || has_flag(touches, PIMAX_TOUCH_FOUR) {
+        touched |= ALVR_BUTTON_BY;
+    }
+
+    (pressed, touched)
+}
+
+fn pimax_native_controller_grip_pose_offset_from_degrees(rotation_deg: glam::Vec3) -> glam::Quat {
+    glam::Quat::from_euler(
+        glam::EulerRot::XYZ,
+        rotation_deg.x.to_radians(),
+        rotation_deg.y.to_radians(),
+        rotation_deg.z.to_radians(),
+    )
+    .normalize()
+}
+
+fn pimax_native_controller_grip_pose_offset() -> glam::Quat {
+    // Native sxrControllerGetState's model basis is pitched forward relative
+    // to ALVR/OpenXR grip poses. A full +90 degree axis swap overcorrects on
+    // Crystal OG, so keep the offset live-tunable while calibrating hardware.
+    pimax_native_controller_grip_pose_offset_from_degrees(crate::tune::controller_rotation_deg())
+}
+
+fn convert_pimax_native_controller_motion(
+    parsed: &PimaxNativeControllerParsed,
+) -> crate::client::DeviceMotion {
+    let grip_orientation =
+        (parsed.orientation * pimax_native_controller_grip_pose_offset()).normalize();
+
+    crate::client::DeviceMotion {
+        pose: crate::client::Pose {
+            orientation: grip_orientation,
+            // The native position stream already tracks the user's motion in
+            // the expected up/down direction; do not mirror Y here.
+            position: parsed.position,
+        },
+        linear_velocity: parsed.linear_velocity,
+        angular_velocity: parsed.angular_velocity,
+    }
+}
+
+fn push_pimax_native_controller_state(
+    controller: &PimaxNativeControllerHandle,
+    parsed: PimaxNativeControllerParsed,
+) {
+    let (buttons_pressed, buttons_touched) = map_pimax_native_buttons(controller.hand, &parsed);
+    let motion = convert_pimax_native_controller_motion(&parsed);
+
+    crate::controller::update_controller_state(
+        controller.hand,
+        crate::controller::SingleControllerState {
+            connected: true,
+            handle: controller.handle,
+            motion: Some(motion),
+            buttons_pressed,
+            buttons_touched,
+            trigger: parsed.trigger,
+            grip: parsed.grip,
+            thumbstick_x: parsed.thumbstick_x,
+            thumbstick_y: parsed.thumbstick_y,
+            battery_percent: controller.last_battery,
+            last_updated: Instant::now(),
+        },
+    );
+}
+
+fn start_pimax_native_controller_runtime() -> Result<Option<PimaxNativeControllerRuntime>> {
+    let Some(api) = open_pimax_native_controller_api()? else {
+        return Ok(None);
+    };
+
+    let mut controllers = Vec::new();
+    for (hand, descriptor) in [
+        (crate::controller::Hand::Left, "left"),
+        (crate::controller::Hand::Right, "right"),
+    ] {
+        let descriptor = CString::new(descriptor).context("create native controller descriptor")?;
+        let handle = unsafe { (api.start_tracking)(descriptor.as_ptr()) };
+        if handle < 0 {
+            warn!(
+                "native Pimax controller start failed: hand={hand:?} descriptor={} handle={handle}",
+                descriptor.to_string_lossy()
+            );
+            continue;
+        }
+        let battery = read_pimax_controller_battery(hand).unwrap_or(100);
+        info!(
+            "native Pimax controller started: hand={hand:?} descriptor={} handle={handle} battery={battery}",
+            descriptor.to_string_lossy()
+        );
+        crate::controller::update_controller_connection(hand, true);
+        controllers.push(PimaxNativeControllerHandle {
+            hand,
+            descriptor,
+            handle,
+            last_state: PimaxNativeControllerState::default(),
+            last_parsed: PimaxNativeControllerParsed::default(),
+            last_battery: battery,
+            last_battery_poll: Instant::now()
+                .checked_sub(PIMAX_NATIVE_CONTROLLER_BATTERY_INTERVAL)
+                .unwrap_or_else(Instant::now),
+        });
+    }
+
+    if controllers.is_empty() {
+        warn!("native Pimax controller runtime disabled: no controller handles started");
+        close_pimax_native_controller_api(api);
+        return Ok(None);
+    }
+
+    info!(
+        "native Pimax controller runtime active: handles={}",
+        controllers
+            .iter()
+            .map(|controller| format!("{:?}:{}", controller.hand, controller.handle))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    Ok(Some(PimaxNativeControllerRuntime {
+        api,
+        controllers,
+        last_poll: Instant::now()
+            .checked_sub(PIMAX_NATIVE_CONTROLLER_POLL_INTERVAL)
+            .unwrap_or_else(Instant::now),
+        last_change_log: Instant::now()
+            .checked_sub(PIMAX_NATIVE_CONTROLLER_CHANGE_LOG_INTERVAL)
+            .unwrap_or_else(Instant::now),
+        poll_count: 0,
+    }))
+}
+
+fn poll_pimax_native_controller_runtime(runtime: &mut PimaxNativeControllerRuntime) {
+    if runtime.last_poll.elapsed() < PIMAX_NATIVE_CONTROLLER_POLL_INTERVAL {
+        return;
+    }
+    runtime.last_poll = Instant::now();
+    runtime.poll_count = runtime.poll_count.wrapping_add(1);
+
+    let can_log_change =
+        runtime.last_change_log.elapsed() >= PIMAX_NATIVE_CONTROLLER_CHANGE_LOG_INTERVAL;
+    let mut logged_change = false;
+
+    for controller in &mut runtime.controllers {
+        if controller.last_battery_poll.elapsed() >= PIMAX_NATIVE_CONTROLLER_BATTERY_INTERVAL {
+            if let Some(battery) = read_pimax_controller_battery(controller.hand) {
+                controller.last_battery = battery;
+            }
+            controller.last_battery_poll = Instant::now();
+        }
+
+        let state = unsafe { (runtime.api.get_state)(controller.handle, 0) };
+        let parsed = parse_pimax_native_controller_state(&state);
+        let state_changed = state != controller.last_state;
+        let controls_changed = parsed.buttons != controller.last_parsed.buttons
+            || parsed.touches != controller.last_parsed.touches
+            || (parsed.trigger - controller.last_parsed.trigger).abs() > 0.01
+            || (parsed.grip - controller.last_parsed.grip).abs() > 0.01
+            || (parsed.thumbstick_x - controller.last_parsed.thumbstick_x).abs() > 0.01
+            || (parsed.thumbstick_y - controller.last_parsed.thumbstick_y).abs() > 0.01;
+
+        let should_log_control_change =
+            controls_changed && (can_log_change || runtime.poll_count <= 5);
+        let should_log_initial_state = state_changed && runtime.poll_count <= 5;
+
+        if should_log_control_change || should_log_initial_state {
+            let changes = format_pimax_native_state_changes(&controller.last_state, &state);
+            info!(
+                "native Pimax controller control state: count={} hand={:?} descriptor={} handle={} buttons=0x{:08x} touches=0x{:08x} trigger={:.3} grip={:.3} stick=({:.3},{:.3}) pos=({:.3},{:.3},{:.3}) rot=({:.3},{:.3},{:.3},{:.3}) timestamp_ns={} battery={} changes=[{}]",
+                runtime.poll_count,
+                controller.hand,
+                controller.descriptor.to_string_lossy(),
+                controller.handle,
+                parsed.buttons,
+                parsed.touches,
+                parsed.trigger,
+                parsed.grip,
+                parsed.thumbstick_x,
+                parsed.thumbstick_y,
+                parsed.position.x,
+                parsed.position.y,
+                parsed.position.z,
+                parsed.orientation.x,
+                parsed.orientation.y,
+                parsed.orientation.z,
+                parsed.orientation.w,
+                parsed.timestamp_ns,
+                controller.last_battery,
+                changes
+            );
+            logged_change = true;
+        } else if runtime.poll_count <= 5 || runtime.poll_count % 180 == 0 {
+            info!(
+                "native Pimax controller poll: count={} hand={:?} handle={} buttons=0x{:08x} touches=0x{:08x} trigger={:.3} grip={:.3} stick=({:.3},{:.3}) pos=({:.3},{:.3},{:.3}) rot=({:.3},{:.3},{:.3},{:.3}) battery={}",
+                runtime.poll_count,
+                controller.hand,
+                controller.handle,
+                parsed.buttons,
+                parsed.touches,
+                parsed.trigger,
+                parsed.grip,
+                parsed.thumbstick_x,
+                parsed.thumbstick_y,
+                parsed.position.x,
+                parsed.position.y,
+                parsed.position.z,
+                parsed.orientation.x,
+                parsed.orientation.y,
+                parsed.orientation.z,
+                parsed.orientation.w,
+                controller.last_battery
+            );
+        }
+
+        push_pimax_native_controller_state(controller, parsed);
+        controller.last_state = state;
+        controller.last_parsed = parsed;
+    }
+
+    if logged_change {
+        runtime.last_change_log = Instant::now();
+    }
+}
+
+fn stop_pimax_native_controller_runtime(runtime: PimaxNativeControllerRuntime) {
+    for controller in &runtime.controllers {
+        unsafe {
+            (runtime.api.stop_tracking)(controller.handle);
+        }
+        info!(
+            "native Pimax controller stopped: hand={:?} descriptor={} handle={}",
+            controller.hand,
+            controller.descriptor.to_string_lossy(),
+            controller.handle
+        );
+        crate::controller::update_controller_connection(controller.hand, false);
+    }
+    close_pimax_native_controller_api(runtime.api);
+}
+
+fn probe_pvr_controller_defaults(env: &mut jni::JNIEnv<'_>) -> Option<String> {
+    match call_static_string(
+        env,
+        "com/pimax/vrservice/PxrServiceApi",
+        "ControllerGetDefaultService",
+        "()Ljava/lang/String;",
+        &[],
+    ) {
+        Ok(service) => {
+            info!("PxrServiceApi.ControllerGetDefaultService() -> {service}");
+            Some(service)
+        }
+        Err(err) => {
+            warn!("PxrServiceApi.ControllerGetDefaultService() failed: {err:#}");
+            None
+        }
+    }
+    .inspect(|_| {
+        match call_static_int(
+            env,
+            "com/pimax/vrservice/PxrServiceApi",
+            "ControllerGetDefaultBufferCnt",
+            "()I",
+            &[],
+        ) {
+            Ok(count) => info!("PxrServiceApi.ControllerGetDefaultBufferCnt() -> {count}"),
+            Err(err) => warn!("PxrServiceApi.ControllerGetDefaultBufferCnt() failed: {err:#}"),
+        }
+    })
+}
+
+fn probe_pvr_controller_client(
+    env: &mut jni::JNIEnv<'_>,
+    context: &JObject<'_>,
+    default_service: Option<&str>,
+) -> Result<()> {
+    let Some(default_service) = default_service else {
+        warn!("skipping ControllerStart probe because default controller service is unavailable");
+        return Ok(());
+    };
+
+    info!("starting short-lived PvrServiceClient controller probe");
+    let client =
+        create_pvr_service_client(env, context).context("create controller probe client")?;
+    let mut connected = false;
+    let mut started_handle = None;
+
+    let probe_result = (|| -> Result<()> {
+        connect_pvr_service_client(env, &client).context("connect controller probe client")?;
+        connected = true;
+        wait_for_pvr_service_interface(env, &client, Duration::from_secs(3))
+            .context("wait for controller probe service interface")?;
+        info!("PvrServiceClient controller probe connected");
+
+        let start_info = pvr_service_controller_start(env, &client, default_service)
+            .with_context(|| format!("ControllerStart({default_service})"))?;
+        dump_object_declared_fields(env, &start_info, "ControllerStartInfo")
+            .context("dump ControllerStartInfo")?;
+        started_handle = infer_controller_start_handle(env, &start_info);
+        Ok(())
+    })();
+
+    if let Some(handle) = started_handle {
+        if let Err(err) = pvr_service_controller_stop(env, &client, handle) {
+            warn!("ControllerStop({handle}) failed during probe cleanup: {err:#}");
+        } else {
+            info!("ControllerStop({handle}) succeeded during probe cleanup");
+        }
+    }
+    if connected {
+        if let Err(err) = disconnect_pvr_service_client(env, &client) {
+            warn!("PvrServiceClient.Disconnect failed after controller probe: {err:#}");
+        } else {
+            info!("PvrServiceClient controller probe disconnected");
+        }
+    }
+
+    probe_result
 }
 
 fn dump_enum_constants(env: &mut jni::JNIEnv<'_>, class_name: &str) -> Result<()> {
@@ -1399,6 +2975,48 @@ fn dump_all_methods(env: &mut jni::JNIEnv<'_>, class_name: &str) -> Result<()> {
             .and_then(|object| object_to_string(env, object).context("method signature string"))?;
         info!("{class_name_text}::{signature}");
     }
+    Ok(())
+}
+
+fn dump_declared_inner_classes(env: &mut jni::JNIEnv<'_>, class_name: &str) -> Result<()> {
+    let class_name_text = class_name.to_string();
+    let class_name = env
+        .new_string(class_name)
+        .context("create class name string")?;
+    let class_name_obj = JObject::from(class_name);
+    let class = call_static_object(
+        env,
+        "java/lang/Class",
+        "forName",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        &[JValue::Object(&class_name_obj)],
+    )
+    .with_context(|| format!("load class {class_name_text}"))?;
+
+    let classes = env
+        .call_method(&class, "getDeclaredClasses", "()[Ljava/lang/Class;", &[])
+        .context("get declared inner classes")?
+        .l()
+        .context("decode declared inner classes")?;
+    let classes = JObjectArray::from(classes);
+    let count = env
+        .get_array_length(&classes)
+        .context("count declared inner classes")?;
+    info!("{class_name_text} has {count} declared inner classes");
+
+    for index in 0..count {
+        let class = env
+            .get_object_array_element(&classes, index)
+            .with_context(|| format!("get declared inner class {index}"))?;
+        let name: String = env
+            .call_method(&class, "getName", "()Ljava/lang/String;", &[])
+            .context("get inner class name")?
+            .l()
+            .context("decode inner class name")
+            .and_then(|object| object_to_string(env, object).context("inner class name string"))?;
+        info!("{class_name_text} inner class: {name}");
+    }
+
     Ok(())
 }
 
@@ -1580,30 +3198,6 @@ fn set_float_array_field(
         .with_context(|| format!("set float array field {name}"))
 }
 
-fn make_float_array<'local>(
-    env: &mut jni::JNIEnv<'local>,
-    values: &[f32],
-) -> Result<JFloatArray<'local>> {
-    let array = env
-        .new_float_array(values.len() as i32)
-        .context("create float array")?;
-    env.set_float_array_region(&array, 0, values)
-        .context("fill float array")?;
-    Ok(array)
-}
-
-fn make_int_array<'local>(
-    env: &mut jni::JNIEnv<'local>,
-    values: &[i32],
-) -> Result<JIntArray<'local>> {
-    let array = env
-        .new_int_array(values.len() as i32)
-        .context("create int array")?;
-    env.set_int_array_region(&array, 0, values)
-        .context("fill int array")?;
-    Ok(array)
-}
-
 fn set_simple_layout_coords(env: &mut jni::JNIEnv<'_>, coords: &JObject<'_>) -> Result<()> {
     set_float_array_field(env, coords, "LowerLeftPos", &[-1.0, -1.0, 0.0, 1.0])?;
     set_float_array_field(env, coords, "LowerRightPos", &[1.0, -1.0, 0.0, 1.0])?;
@@ -1623,66 +3217,6 @@ fn set_simple_layout_coords(env: &mut jni::JNIEnv<'_>, coords: &JObject<'_>) -> 
         ],
     )?;
     Ok(())
-}
-
-fn create_test_texture() -> u32 {
-    let mut texture = 0_u32;
-    unsafe {
-        glGenTextures(1, &mut texture as *mut u32);
-        glBindTexture(GL_TEXTURE_2D, texture);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-        let pixels: [u8; 16] = [
-            255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
-        ];
-        glTexImage2D(
-            GL_TEXTURE_2D,
-            0,
-            GL_RGBA8,
-            2,
-            2,
-            0,
-            GL_RGBA,
-            GL_UNSIGNED_BYTE,
-            pixels.as_ptr().cast(),
-        );
-        glFlush();
-    }
-    texture
-}
-
-fn create_solid_texture(width: i32, height: i32, color: [u8; 4]) -> u32 {
-    let mut texture = 0_u32;
-    let width = width.max(1);
-    let height = height.max(1);
-    let mut pixels = vec![0_u8; (width as usize) * (height as usize) * 4];
-    for chunk in pixels.chunks_exact_mut(4) {
-        chunk.copy_from_slice(&color);
-    }
-    unsafe {
-        glGenTextures(1, &mut texture as *mut u32);
-        glBindTexture(GL_TEXTURE_2D, texture);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(
-            GL_TEXTURE_2D,
-            0,
-            GL_RGBA8,
-            width,
-            height,
-            0,
-            GL_RGBA,
-            GL_UNSIGNED_BYTE,
-            pixels.as_ptr().cast(),
-        );
-        glFlush();
-    }
-    texture
 }
 
 fn create_identity_uv_map_texture(samples: i32) -> Result<UvMapTexture> {
@@ -1721,129 +3255,6 @@ fn create_identity_uv_map_texture(samples: i32) -> Result<UvMapTexture> {
     }
 
     Ok(UvMapTexture { texture, size })
-}
-
-fn create_presentation_surface<'local>(
-    env: &mut jni::JNIEnv<'local>,
-    context: &JObject<'local>,
-) -> Result<JObject<'local>> {
-    let display_key = env
-        .new_string("display")
-        .context("create display service key")?;
-    let display_manager = env
-        .call_method(
-            context,
-            "getSystemService",
-            "(Ljava/lang/String;)Ljava/lang/Object;",
-            &[JValue::Object(&JObject::from(display_key))],
-        )
-        .context("get display service")?
-        .l()
-        .context("decode display service")?;
-    let displays = env
-        .call_method(
-            &display_manager,
-            "getDisplays",
-            "()[Landroid/view/Display;",
-            &[],
-        )
-        .context("enumerate displays")?
-        .l()
-        .context("decode display array")?;
-    let displays = JObjectArray::from(displays);
-    let display_count = env.get_array_length(&displays).context("count displays")?;
-    if display_count == 0 {
-        bail!("no displays available");
-    }
-
-    let mut chosen_display: Option<JObject<'local>> = None;
-    let mut chosen_display_id = 0;
-    let mut chosen_display_name = String::new();
-
-    for index in 0..display_count {
-        let display = env
-            .get_object_array_element(&displays, index)
-            .with_context(|| format!("get display {index}"))?;
-        let display_id = env
-            .call_method(&display, "getDisplayId", "()I", &[])
-            .context("query display id")?
-            .i()
-            .context("decode display id")?;
-        let display_name_obj = env
-            .call_method(&display, "getName", "()Ljava/lang/String;", &[])
-            .context("query display name")?
-            .l()
-            .context("decode display name")?;
-        let display_name =
-            object_to_string(env, display_name_obj).context("display name string")?;
-        let display_flags = env
-            .call_method(&display, "getFlags", "()I", &[])
-            .context("query display flags")?
-            .i()
-            .context("decode display flags")?;
-        info!("display candidate #{display_id} name={display_name} flags=0x{display_flags:08x}");
-
-        let is_presentation_display = (display_flags & 0x8) != 0
-            && matches!(
-                display_name.as_str(),
-                "PxrScreenShot" | "PxrScreenRecord" | "PxrScreenCast"
-            );
-        if is_presentation_display {
-            chosen_display = Some(display);
-            chosen_display_id = display_id;
-            chosen_display_name = display_name;
-            break;
-        }
-    }
-
-    let display = chosen_display.context("choose suitable presentation display")?;
-    info!("attempting PxrPresentation on display #{chosen_display_id} named {chosen_display_name}");
-
-    call_static_void(env, "android/os/Looper", "prepare", "()V", &[])
-        .context("prepare looper for PxrPresentation")?;
-    let presentation = env
-        .new_object(
-            "com/pimax/pxrapi/xrcasting/PxrPresentation",
-            "(Landroid/content/Context;Landroid/view/Display;)V",
-            &[JValue::Object(context), JValue::Object(&display)],
-        )
-        .map_err(|err| {
-            if let Some(summary) = take_java_exception_summary(env) {
-                warn!("PxrPresentation constructor threw: {summary}");
-            }
-            err
-        })
-        .context("create PxrPresentation")?;
-    if let Err(err) = env.call_method(&presentation, "show", "()V", &[]) {
-        let summary = take_java_exception_summary(env)
-            .unwrap_or_else(|| "Java exception was thrown".to_string());
-        bail!("show PxrPresentation: {summary}; {err:#}");
-    }
-    thread::sleep(Duration::from_millis(250));
-
-    let surface_view = env
-        .get_field(
-            &presentation,
-            "mSurfaceView",
-            "Lcom/pimax/pxrapi/xrcasting/PxrPresentation$SxrPresentationSurfaceView;",
-        )
-        .context("get presentation surface view")?
-        .l()
-        .context("decode presentation surface view")?;
-    let holder = env
-        .call_method(
-            &surface_view,
-            "getHolder",
-            "()Landroid/view/SurfaceHolder;",
-            &[],
-        )
-        .context("get presentation surface holder")?
-        .l()
-        .context("decode presentation surface holder")?;
-    env.call_method(&holder, "getSurface", "()Landroid/view/Surface;", &[])
-        .context("get presentation surface")?
-        .l()
-        .context("decode presentation surface")
 }
 
 fn capture_activity_window<'local>(
@@ -2008,11 +3419,6 @@ fn wait_for_activity_native_window(timeout: Duration) -> Result<ndk::native_wind
 
         thread::sleep(Duration::from_millis(100));
     }
-}
-
-fn current_android_thread_id(env: &mut jni::JNIEnv<'_>) -> Result<i32> {
-    call_static_int(env, "android/os/Process", "myTid", "()I", &[])
-        .context("get current Android thread id")
 }
 
 fn gl_string(name: u32) -> Option<String> {
@@ -2339,80 +3745,6 @@ fn initialize_window_egl_context(
     }
 }
 
-fn initialize_window_egl_context_from_surface(
-    env: &jni::JNIEnv<'_>,
-    surface: &JObject<'_>,
-) -> Result<EglState> {
-    let native_window = unsafe {
-        ndk::native_window::NativeWindow::from_surface(env.get_native_interface(), surface.as_raw())
-    }
-    .context("convert Java Surface to ANativeWindow")?;
-    initialize_window_egl_context(native_window)
-}
-
-fn ensure_gl_context(
-    env: &jni::JNIEnv<'_>,
-    surface: Option<&JObject<'_>>,
-) -> Result<Option<EglState>> {
-    unsafe {
-        let current_context = eglGetCurrentContext();
-        if !current_context.is_null() {
-            info!(
-                "using existing EGL context from runtime: {:?}",
-                current_context
-            );
-            return Ok(None);
-        }
-    }
-
-    if let Some(surface) = surface {
-        let egl_state = initialize_window_egl_context_from_surface(env, surface)
-            .context("initialize EGL window context from Java Surface")?;
-        return Ok(Some(egl_state));
-    }
-
-    if let Some(native_window) = ndk_glue::native_window() {
-        let egl_state = initialize_window_egl_context((*native_window).clone())
-            .context("initialize EGL window context")?;
-        return Ok(Some(egl_state));
-    }
-
-    let egl_state = initialize_pbuffer_egl_context().context("initialize EGL pbuffer context")?;
-    Ok(Some(egl_state))
-}
-
-fn ensure_offscreen_gl_context() -> Result<Option<EglState>> {
-    unsafe {
-        let current_context = eglGetCurrentContext();
-        if !current_context.is_null() {
-            info!(
-                "using existing EGL context from runtime: {:?}",
-                current_context
-            );
-            return Ok(None);
-        }
-    }
-
-    let egl_state = initialize_pbuffer_egl_context().context("initialize offscreen EGL context")?;
-    Ok(Some(egl_state))
-}
-
-fn render_eye_clear(width: i32, height: i32, color: [u8; 4]) {
-    let red = color[0] as f32 / 255.0;
-    let green = color[1] as f32 / 255.0;
-    let blue = color[2] as f32 / 255.0;
-    let alpha = color[3] as f32 / 255.0;
-
-    unsafe {
-        glViewport(0, 0, width.max(1), height.max(1));
-        prepare_solid_color_clear_state();
-        glClearColor(red, green, blue, alpha);
-        glClear(GL_COLOR_BUFFER_BIT);
-        glFlush();
-        glFinish();
-    }
-}
-
 fn render_window_surface_mirror(
     egl_state: Option<&EglState>,
     frame_index: i32,
@@ -2572,11 +3904,7 @@ fn create_hardware_buffer_eye_render_target(width: i32, height: i32) -> Result<E
 }
 
 fn use_hardware_buffer_eye_targets() -> bool {
-    !(PIMAX_SUBMITTED_TEXTURE_TYPE == "kTypeTexture"
-        && matches!(
-            PIMAX_SUBMITTED_HANDLE_KIND,
-            SubmittedImageHandleKind::TextureId
-        ))
+    false
 }
 
 fn create_eye_render_target(width: i32, height: i32) -> Result<EyeRenderTarget> {
@@ -2599,8 +3927,7 @@ fn create_eye_render_target(width: i32, height: i32) -> Result<EyeRenderTarget> 
         }
     } else {
         info!(
-            "using plain GL eye textures because submission path is {PIMAX_SUBMITTED_TEXTURE_TYPE} via {:?}",
-            PIMAX_SUBMITTED_HANDLE_KIND
+            "using plain GL eye textures because submission path is {PIMAX_SUBMITTED_TEXTURE_TYPE} via {PIMAX_SUBMITTED_HANDLE_KIND_LABEL}",
         );
     }
     let mut texture = 0_u32;
@@ -2657,51 +3984,17 @@ fn create_eye_render_target(width: i32, height: i32) -> Result<EyeRenderTarget> 
     })
 }
 
-fn truncate_native_handle(label: &str, raw: usize) -> Result<i32> {
-    if raw == 0 {
-        bail!("{label} handle is null");
-    }
-    if raw >> 32 != 0 {
-        warn!(
-            "{label} handle 0x{raw:016x} exceeds 32 bits; submitting truncated low word 0x{:08x}",
-            raw as u32
-        );
-    }
-    Ok(raw as u32 as i32)
-}
-
 fn submitted_image_handle(target: &EyeRenderTarget) -> Result<i32> {
-    match PIMAX_SUBMITTED_HANDLE_KIND {
-        SubmittedImageHandleKind::TextureId => Ok(target.texture as i32),
-        SubmittedImageHandleKind::EglImage => {
-            let egl_image = target
-                .egl_image
-                .context("missing EGLImage for kTypeImage submission")?;
-            truncate_native_handle("EGLImageKHR", egl_image as usize)
-        }
-        SubmittedImageHandleKind::EglClientBuffer => {
-            let client_buffer = target
-                .egl_client_buffer
-                .context("missing EGLClientBuffer for kTypeImage submission")?;
-            truncate_native_handle("EGLClientBuffer", client_buffer as usize)
-        }
-        SubmittedImageHandleKind::HardwareBufferPtr => {
-            let hardware_buffer = target
-                .hardware_buffer
-                .as_ref()
-                .context("missing AHardwareBuffer for kTypeImage submission")?;
-            truncate_native_handle("AHardwareBuffer", hardware_buffer.as_ptr() as usize)
-        }
-    }
+    Ok(target.texture as i32)
 }
 
 fn log_submission_handle_strategy(pair: &EyeBufferPair) {
     let left_handle = submitted_image_handle(&pair.left);
     let right_handle = submitted_image_handle(&pair.right);
     info!(
-        "submitting layers as {} via {:?}: left={{tex={}, egl_image={:?}, client_buffer={:?}, ahb={:?}, handle={:?}}} right={{tex={}, egl_image={:?}, client_buffer={:?}, ahb={:?}, handle={:?}}}",
+        "submitting layers as {} via {}: left={{tex={}, egl_image={:?}, client_buffer={:?}, ahb={:?}, handle={:?}}} right={{tex={}, egl_image={:?}, client_buffer={:?}, ahb={:?}, handle={:?}}}",
         PIMAX_SUBMITTED_TEXTURE_TYPE,
-        PIMAX_SUBMITTED_HANDLE_KIND,
+        PIMAX_SUBMITTED_HANDLE_KIND_LABEL,
         pair.left.texture,
         pair.left.egl_image.map(|value| value as usize),
         pair.left.egl_client_buffer.map(|value| value as usize),
@@ -3082,25 +4375,70 @@ fn prepare_solid_color_clear_state() {
     }
 }
 
-fn readback_center_pixel(target: &EyeRenderTarget) -> [u8; 4] {
+struct EyeLumaStats {
+    center_pixel: [u8; 4],
+    samples: u32,
+    average_luma: f32,
+    dark_percent: f32,
+    bright_percent: f32,
+}
+
+fn pixel_luma(pixel: [u8; 4]) -> f32 {
+    (0.2126 * pixel[0] as f32) + (0.7152 * pixel[1] as f32) + (0.0722 * pixel[2] as f32)
+}
+
+fn readback_eye_luma_stats(target: &EyeRenderTarget) -> EyeLumaStats {
+    let sample_steps = [1_i32, 3, 5, 7, 9];
     let mut pixel = [0_u8; 4];
+    let mut center_pixel = [0_u8; 4];
+    let mut samples = 0_u32;
+    let mut dark_samples = 0_u32;
+    let mut bright_samples = 0_u32;
+    let mut total_luma = 0.0_f32;
 
     unsafe {
         let previous_framebuffer = current_framebuffer_binding().max(0) as u32;
         glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
-        glReadPixels(
-            (target.width / 2).max(0),
-            (target.height / 2).max(0),
-            1,
-            1,
-            GL_RGBA,
-            GL_UNSIGNED_BYTE,
-            pixel.as_mut_ptr().cast(),
-        );
+
+        for y_step in sample_steps {
+            for x_step in sample_steps {
+                let x = ((target.width.max(1) - 1) * x_step / 10).max(0);
+                let y = ((target.height.max(1) - 1) * y_step / 10).max(0);
+                glReadPixels(
+                    x,
+                    y,
+                    1,
+                    1,
+                    GL_RGBA,
+                    GL_UNSIGNED_BYTE,
+                    pixel.as_mut_ptr().cast(),
+                );
+                if x_step == 5 && y_step == 5 {
+                    center_pixel = pixel;
+                }
+                let luma = pixel_luma(pixel);
+                total_luma += luma;
+                samples += 1;
+                if luma < 8.0 {
+                    dark_samples += 1;
+                }
+                if luma > 32.0 {
+                    bright_samples += 1;
+                }
+            }
+        }
+
         glBindFramebuffer(GL_FRAMEBUFFER, previous_framebuffer);
     }
 
-    pixel
+    let sample_count = samples.max(1) as f32;
+    EyeLumaStats {
+        center_pixel,
+        samples,
+        average_luma: total_luma / sample_count,
+        dark_percent: (dark_samples as f32 * 100.0) / sample_count,
+        bright_percent: (bright_samples as f32 * 100.0) / sample_count,
+    }
 }
 
 fn current_framebuffer_binding() -> i32 {
@@ -3232,6 +4570,121 @@ fn cleanup_pimax_render_session(
     }
 }
 
+fn refresh_pimax_presentation(
+    env: &mut jni::JNIEnv<'_>,
+    context: &JObject<'_>,
+    pvr_service_client: Option<&GlobalRef>,
+    reason: &str,
+) {
+    info!("refreshing Pimax presentation state: {reason}");
+
+    let mut temp_client_connected = false;
+
+    if let Some(client) = pvr_service_client {
+        cycle_pimax_vr_mode_refresh(env, client, "PvrServiceClient");
+    } else {
+        let temp_client = match create_pvr_service_client(env, context) {
+            Ok(client) => Some(client),
+            Err(err) => {
+                warn!(
+                    "failed to create temporary PvrServiceClient for presentation refresh: {err:#}"
+                );
+                None
+            }
+        };
+        if let Some(client) = temp_client.as_ref() {
+            if let Err(err) = connect_pvr_service_client(env, client) {
+                warn!("temporary PvrServiceClient.Connect failed during refresh: {err:#}");
+            } else {
+                temp_client_connected = true;
+                match wait_for_pvr_service_interface(env, client, Duration::from_secs(1)) {
+                    Ok(()) => {
+                        info!("temporary PvrServiceClient connected for presentation refresh")
+                    }
+                    Err(err) => warn!(
+                        "temporary PvrServiceClient did not connect cleanly during refresh: {err:#}"
+                    ),
+                }
+                cycle_pimax_vr_mode_refresh(env, client, "temporary PvrServiceClient");
+            }
+        }
+        match call_static_int(
+            env,
+            "com/pimax/vrservice/PxrServiceApi",
+            "SetDisplayInterruptCapture",
+            "(II)I",
+            &[JValue::Int(0), JValue::Int(1)],
+        ) {
+            Ok(result) => info!("PxrServiceApi.SetDisplayInterruptCapture(VSYNC, 1) -> {result}"),
+            Err(err) => warn!("PxrServiceApi.SetDisplayInterruptCapture(VSYNC, 1) failed: {err:#}"),
+        }
+
+        if temp_client_connected {
+            if let Some(client) = temp_client.as_ref() {
+                if let Err(err) = disconnect_pvr_service_client(env, client) {
+                    warn!("temporary PvrServiceClient.Disconnect failed after refresh: {err:#}");
+                } else {
+                    info!("temporary PvrServiceClient disconnected after presentation refresh");
+                }
+            }
+        }
+    }
+
+    if let Err(err) = call_static_void(
+        env,
+        "com/pimax/pxrapi/PxrApi",
+        "enablePresentation",
+        "(Landroid/content/Context;Z)V",
+        &[JValue::Object(context), JValue::Bool(1)],
+    ) {
+        warn!("PxrApi.enablePresentation(true) failed while refreshing presentation: {err:#}");
+    } else {
+        info!("PxrApi.enablePresentation(true) requested while refreshing presentation");
+    }
+
+    if let Err(err) = call_static_void(
+        env,
+        "com/pimax/pxrapi/PxrApi",
+        "startVsync",
+        "(Landroid/content/Context;)V",
+        &[JValue::Object(context)],
+    ) {
+        warn!("PxrApi.startVsync failed while refreshing presentation: {err:#}");
+    } else {
+        info!("PxrApi.startVsync requested while refreshing presentation");
+    }
+}
+
+fn cycle_pimax_vr_mode_refresh(env: &mut jni::JNIEnv<'_>, client: &GlobalRef, client_label: &str) {
+    match pvr_service_set_display_interrupt_capture(env, client, 0, 1) {
+        Ok(result) => info!("{client_label}.SetDisplayInterruptCapture(VSYNC, 1) -> {result}"),
+        Err(err) => warn!("{client_label}.SetDisplayInterruptCapture(VSYNC, 1) failed: {err:#}"),
+    }
+    match pvr_service_stop_vr_mode(env, client) {
+        Ok(result) => info!("{client_label}.StopVRMode() during refresh -> {result}"),
+        Err(err) => warn!("{client_label}.StopVRMode() during refresh failed: {err:#}"),
+    }
+    thread::sleep(Duration::from_millis(50));
+    match pvr_service_start_vr_mode(env, client) {
+        Ok(()) => info!("{client_label}.StartVRMode() during refresh succeeded"),
+        Err(err) => {
+            warn!("{client_label}.StartVRMode() during refresh failed (will try resume): {err:#}");
+            match pvr_service_resume_vr_mode(env, client) {
+                Ok(result) => info!("{client_label}.ResumeVRMode() during refresh -> {result}"),
+                Err(err) => warn!("{client_label}.ResumeVRMode() during refresh failed: {err:#}"),
+            }
+        }
+    }
+    for ui_type in ["vr_first_frame_ready", "6dofWarning_low_quality"] {
+        match pvr_service_hide_system_ui(env, client, ui_type) {
+            Ok(()) => info!("{client_label}.HideSystemUI({ui_type}) during refresh"),
+            Err(err) => {
+                warn!("{client_label}.HideSystemUI({ui_type}) during refresh failed: {err:#}")
+            }
+        }
+    }
+}
+
 fn try_begin_and_submit_frame<'local>(
     env: &mut jni::JNIEnv<'local>,
     context: &JObject<'local>,
@@ -3249,10 +4702,14 @@ fn try_begin_and_submit_frame<'local>(
     info!("requested NativeActivity headset window flags");
     let display_wake_lock = match create_display_wake_lock(env, context) {
         Ok(wake_lock) => {
-            if let Err(err) = acquire_display_wake_lock(env, &wake_lock) {
-                warn!("failed to acquire display wake lock: {err:#}");
+            if is_headset_near() {
+                if let Err(err) = acquire_display_wake_lock(env, &wake_lock) {
+                    warn!("failed to acquire display wake lock: {err:#}");
+                } else {
+                    info!("acquired display wake lock for headset session");
+                }
             } else {
-                info!("acquired display wake lock for headset session");
+                info!("created display wake lock but left it released until headset is worn");
             }
             Some(wake_lock)
         }
@@ -3488,8 +4945,8 @@ fn try_begin_and_submit_frame<'local>(
     let display_refresh = get_float_field(env, &device_info, "displayRefreshRateHz")?;
     let fov_x = get_float_field(env, &device_info, "targetFovXRad")?;
     let fov_y = get_float_field(env, &device_info, "targetFovYRad")?;
-    let eye_convergence_m = get_float_field(env, &device_info, "targetEyeConvergence")
-        .unwrap_or(0.0);
+    let eye_convergence_m =
+        get_float_field(env, &device_info, "targetEyeConvergence").unwrap_or(0.0);
     info!("Pimax targetEyeConvergence: {eye_convergence_m:.4} m");
     match call_static_float(
         env,
@@ -3508,7 +4965,8 @@ fn try_begin_and_submit_frame<'local>(
         )
     })
     .or_else(|_| call_method_float(env, &outer, "pxrGetInterpupillaryDistance", "()F", &[]))
-    .or_else(|_| call_method_float(env, &outer, "sxrGetInterpupillaryDistance", "()F", &[])) {
+    .or_else(|_| call_method_float(env, &outer, "sxrGetInterpupillaryDistance", "()F", &[]))
+    {
         Ok(runtime_ipd) => {
             info!("Pimax runtime IPD reported by PxrApi: raw={runtime_ipd:.3}");
             crate::client::update_alvr_ipd_from_pimax(runtime_ipd);
@@ -3522,7 +4980,9 @@ fn try_begin_and_submit_frame<'local>(
                     crate::client::update_alvr_ipd_from_pimax(raw_ipd);
                 }
                 None => {
-                    warn!("persist.sys.pmx.ipd system property unavailable; keeping default ALVR IPD");
+                    warn!(
+                        "persist.sys.pmx.ipd system property unavailable; keeping default ALVR IPD"
+                    );
                 }
             }
         }
@@ -3573,7 +5033,13 @@ fn try_begin_and_submit_frame<'local>(
     }
     info!(
         "Pimax device info: display={}x{} eye={}x{} refresh={}Hz fov=({}, {}) convergence={:.4}m",
-        display_width, display_height, eye_width, eye_height, display_refresh, fov_x, fov_y,
+        display_width,
+        display_height,
+        eye_width,
+        eye_height,
+        display_refresh,
+        fov_x,
+        fov_y,
         eye_convergence_m
     );
     crate::client::update_alvr_views_config_from_pimax(fov_x, fov_y, eye_width, eye_height);
@@ -3842,10 +5308,50 @@ fn try_begin_and_submit_frame<'local>(
     if !render_window_surface_mirror_enabled {
         info!("NativeActivity surface mirror disabled for VR texture submission run");
     }
+    let mut native_controller_runtime = if ENABLE_NATIVE_PIMAX_CONTROLLER_RUNTIME {
+        match start_pimax_native_controller_runtime() {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                warn!("native Pimax controller runtime unavailable: {err:#}");
+                None
+            }
+        }
+    } else {
+        info!("native Pimax controller runtime disabled; using Java/Binder controller runtime");
+        None
+    };
+    let mut controller_runtime = if native_controller_runtime.is_some() {
+        info!("skipping Java/Binder controller runtime because native pxrapi controller runtime is active");
+        None
+    } else {
+        match start_pimax_controller_runtime(env, context) {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                warn!("Pimax controller SDK runtime unavailable: {err:#}");
+                None
+            }
+        }
+    };
     loop {
         if is_shutdown_requested() {
             info!("Pimax render loop exiting after shutdown request at frame {frame_index}");
             break;
+        }
+        if take_presentation_refresh_requested() {
+            if is_headset_near() {
+                if let Some(wake_lock) = display_wake_lock.as_ref() {
+                    if let Err(err) = acquire_display_wake_lock(env, wake_lock) {
+                        warn!("failed to acquire display wake lock for near-face refresh: {err:#}");
+                    } else {
+                        info!("acquired display wake lock for near-face refresh");
+                    }
+                }
+                let controller_client = controller_runtime.as_ref().map(|runtime| &runtime.client);
+                let presentation_client = controller_client.or(pvr_service_client);
+                refresh_pimax_presentation(env, context, presentation_client, "near-face wake");
+            } else {
+                info!("skipping presentation refresh while headset proximity is far");
+            }
         }
 
         let frame_start = Instant::now();
@@ -3860,6 +5366,11 @@ fn try_begin_and_submit_frame<'local>(
         let slot_index = (frame_index.rem_euclid(eye_buffers.len() as i32)) as usize;
         let current_buffers = &eye_buffers[slot_index];
         let mut submitted_video_timestamp = None::<u64>;
+        if let Some(runtime) = native_controller_runtime.as_mut() {
+            poll_pimax_native_controller_runtime(runtime);
+        } else if let Some(runtime) = controller_runtime.as_mut() {
+            poll_pimax_controller_runtime(env, runtime);
+        }
         if let Some(offset) = vsync_offset_nanos {
             let phase_start = Instant::now();
             if let Err(err) = pump_pimax_vsync(env, offset) {
@@ -4161,25 +5672,37 @@ fn try_begin_and_submit_frame<'local>(
         }
 
         if frame_index >= 0 && frame_index % 30 == 0 {
-            match is_power_interactive(env, context) {
-                Ok(true) => {
-                    if frame_index % 720 == 0 {
-                        info!("display power is still interactive at frame {frame_index}");
+            if !is_headset_near() {
+                if let Some(wake_lock) = display_wake_lock.as_ref() {
+                    if let Err(err) = release_display_wake_lock(env, wake_lock) {
+                        warn!("failed to release display wake lock while off-head: {err:#}");
+                    } else if frame_index % 720 == 0 {
+                        info!(
+                            "display wake lock remains released while headset proximity is far at frame {frame_index}"
+                        );
                     }
                 }
-                Ok(false) => {
-                    warn!(
-                        "display power became non-interactive at frame {frame_index}; re-acquiring wake lock"
-                    );
-                    if let Some(wake_lock) = display_wake_lock.as_ref() {
-                        if let Err(err) = acquire_display_wake_lock(env, wake_lock) {
-                            warn!("failed to reacquire display wake lock: {err:#}");
+            } else {
+                match is_power_interactive(env, context) {
+                    Ok(true) => {
+                        if frame_index % 720 == 0 {
+                            info!("display power is still interactive at frame {frame_index}");
                         }
                     }
+                    Ok(false) => {
+                        warn!(
+                            "display power became non-interactive at frame {frame_index}; headset is near, re-acquiring wake lock"
+                        );
+                        if let Some(wake_lock) = display_wake_lock.as_ref() {
+                            if let Err(err) = acquire_display_wake_lock(env, wake_lock) {
+                                warn!("failed to reacquire display wake lock: {err:#}");
+                            }
+                        }
+                    }
+                    Err(err) => warn!(
+                        "failed to query display interactive state at frame {frame_index}: {err:#}"
+                    ),
                 }
-                Err(err) => warn!(
-                    "failed to query display interactive state at frame {frame_index}: {err:#}"
-                ),
             }
         }
         if frame_index > 0 && frame_index % PIMAX_HIDE_SYSTEM_UI_EVERY_N_FRAMES == 0 {
@@ -4201,16 +5724,23 @@ fn try_begin_and_submit_frame<'local>(
             let phase_start = Instant::now();
             let framebuffer = current_framebuffer_binding();
             let gl_error = current_gl_error();
-            let left_pixel = readback_center_pixel(&current_buffers.left);
-            let right_pixel = readback_center_pixel(&current_buffers.right);
+            let left_stats = readback_eye_luma_stats(&current_buffers.left);
+            let right_stats = readback_eye_luma_stats(&current_buffers.right);
             readback_ms = duration_ms(phase_start.elapsed());
             info!(
-                "Pimax texture frame submitted: frame_index={frame_index} predicted_time={predicted_time:.3} fb={} left_tex={} right_tex={} left_pixel={:?} right_pixel={:?} gl_error=0x{gl_error:04x}",
+                "Pimax texture frame submitted: frame_index={frame_index} predicted_time={predicted_time:.3} fb={} left_tex={} right_tex={} left_pixel={:?} right_pixel={:?} left_luma_avg={:.1} left_dark_pct={:.1} left_bright_pct={:.1} right_luma_avg={:.1} right_dark_pct={:.1} right_bright_pct={:.1} samples={} gl_error=0x{gl_error:04x}",
                 framebuffer,
                 current_buffers.left.texture,
                 current_buffers.right.texture,
-                left_pixel,
-                right_pixel
+                left_stats.center_pixel,
+                right_stats.center_pixel,
+                left_stats.average_luma,
+                left_stats.dark_percent,
+                left_stats.bright_percent,
+                right_stats.average_luma,
+                right_stats.dark_percent,
+                right_stats.bright_percent,
+                left_stats.samples.min(right_stats.samples)
             );
         }
         if should_log_frame {
@@ -4224,6 +5754,12 @@ fn try_begin_and_submit_frame<'local>(
         thread::sleep(frame_interval);
     }
 
+    if let Some(runtime) = native_controller_runtime.take() {
+        stop_pimax_native_controller_runtime(runtime);
+    }
+    if let Some(runtime) = controller_runtime.take() {
+        stop_pimax_controller_runtime(env, runtime);
+    }
     cleanup_pimax_render_session(env, context, pvr_service_client, display_wake_lock.as_ref());
     Ok(())
 }
@@ -4309,57 +5845,124 @@ pub fn probe() -> PimaxProbeReport {
     ) {
         warn!("failed to dump matching PxrApi methods: {err:#}");
     }
-    if let Err(err) = dump_matching_methods(
-        &mut env,
-        "com.pimax.pxrapi.PxrApi",
-        &["Image", "Texture", "Vulkan"],
-    ) {
-        warn!("failed to dump image/texture/vulkan PxrApi methods: {err:#}");
-    }
-    if let Err(err) = dump_matching_methods(
-        &mut env,
-        "com.pimax.vrservice.PxrServiceApi",
-        &["DisplayInterrupt", "VRMode", "TrackingMode"],
-    ) {
-        warn!("failed to dump matching PxrServiceApi methods: {err:#}");
-    }
-    if let Err(err) = dump_enum_constants(&mut env, "com.pimax.pxrapi.PxrApi$sxrTextureType") {
-        warn!("failed to dump sxrTextureType constants: {err:#}");
-    }
-    if let Err(err) = dump_matching_fields(
-        &mut env,
-        "com.pimax.pxrapi.PxrApi$sxrRenderLayer",
-        &["image", "buffer", "vulkan", "gl"],
-    ) {
-        warn!("failed to dump matching sxrRenderLayer fields: {err:#}");
-    }
-    if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrRenderLayer") {
-        warn!("failed to dump sxrRenderLayer schema: {err:#}");
-    }
-    if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrDeviceInfo") {
-        warn!("failed to dump sxrDeviceInfo schema: {err:#}");
-    }
-    if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrFrameParams") {
-        warn!("failed to dump sxrFrameParams schema: {err:#}");
-    }
-    if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrHeadPoseState") {
-        warn!("failed to dump sxrHeadPoseState schema: {err:#}");
-    }
-    if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrHeadPose") {
-        warn!("failed to dump sxrHeadPose schema: {err:#}");
-    }
-    if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrVector3") {
-        warn!("failed to dump sxrVector3 schema: {err:#}");
-    }
-    if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrQuaternion") {
-        warn!("failed to dump sxrQuaternion schema: {err:#}");
-    }
-    if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrLayoutCoords") {
-        warn!("failed to dump sxrLayoutCoords schema: {err:#}");
-    }
-    if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrVulkanTexInfo") {
-        warn!("failed to dump sxrVulkanTexInfo schema: {err:#}");
-    }
+    let default_controller_service = if PIMAX_VERBOSE_STARTUP_INTROSPECTION {
+        if let Err(err) = dump_matching_methods(
+            &mut env,
+            "com.pimax.pxrapi.PxrApi",
+            &["Image", "Texture", "Vulkan"],
+        ) {
+            warn!("failed to dump image/texture/vulkan PxrApi methods: {err:#}");
+        }
+        if let Err(err) = dump_matching_methods(
+            &mut env,
+            "com.pimax.vrservice.PxrServiceApi",
+            &["DisplayInterrupt", "VRMode", "TrackingMode"],
+        ) {
+            warn!("failed to dump matching PxrServiceApi methods: {err:#}");
+        }
+        let controller_keywords = &[
+            "Controller",
+            "controller",
+            "Input",
+            "input",
+            "Button",
+            "button",
+            "Key",
+            "key",
+            "Trigger",
+            "trigger",
+            "Grip",
+            "grip",
+            "Joystick",
+            "joystick",
+            "Thumb",
+            "thumb",
+            "Stick",
+            "stick",
+            "Pose",
+            "pose",
+            "Tracking",
+            "tracking",
+            "Query",
+            "query",
+            "State",
+            "state",
+            "Haptic",
+            "haptic",
+            "Vibrator",
+            "vibrator",
+        ];
+        info!("probing Pimax controller/input SDK surface");
+        for class_name in [
+            "com.pimax.pxrapi.PxrApi",
+            "com.pimax.vrservice.PxrServiceApi",
+            "com.pimax.pxrapi.PvrServiceClient",
+            "com.pimax.vrservice.IPvrServiceInterface",
+        ] {
+            if let Err(err) = dump_matching_methods(&mut env, class_name, controller_keywords) {
+                warn!("failed to dump controller/input methods for {class_name}: {err:#}");
+            }
+            if let Err(err) = dump_matching_fields(&mut env, class_name, controller_keywords) {
+                warn!("failed to dump controller/input fields for {class_name}: {err:#}");
+            }
+            if let Err(err) = dump_declared_inner_classes(&mut env, class_name) {
+                warn!("failed to dump inner classes for {class_name}: {err:#}");
+            }
+        }
+        for class_name in [
+            "com.pimax.pxrapi.controller.ControllerStartInfo",
+            "com.pimax.pxrapi.controller.ControllerFd",
+            "com.pimax.pvrapi.controllers.IControllerInterfaceCallback",
+        ] {
+            if let Err(err) = dump_class_schema(&mut env, class_name) {
+                warn!("failed to dump controller class schema for {class_name}: {err:#}");
+            }
+            if let Err(err) = dump_all_methods(&mut env, class_name) {
+                warn!("failed to dump controller class methods for {class_name}: {err:#}");
+            }
+        }
+        if let Err(err) = dump_enum_constants(&mut env, "com.pimax.pxrapi.PxrApi$sxrTextureType") {
+            warn!("failed to dump sxrTextureType constants: {err:#}");
+        }
+        if let Err(err) = dump_matching_fields(
+            &mut env,
+            "com.pimax.pxrapi.PxrApi$sxrRenderLayer",
+            &["image", "buffer", "vulkan", "gl"],
+        ) {
+            warn!("failed to dump matching sxrRenderLayer fields: {err:#}");
+        }
+        if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrRenderLayer") {
+            warn!("failed to dump sxrRenderLayer schema: {err:#}");
+        }
+        if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrDeviceInfo") {
+            warn!("failed to dump sxrDeviceInfo schema: {err:#}");
+        }
+        if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrFrameParams") {
+            warn!("failed to dump sxrFrameParams schema: {err:#}");
+        }
+        if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrHeadPoseState") {
+            warn!("failed to dump sxrHeadPoseState schema: {err:#}");
+        }
+        if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrHeadPose") {
+            warn!("failed to dump sxrHeadPose schema: {err:#}");
+        }
+        if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrVector3") {
+            warn!("failed to dump sxrVector3 schema: {err:#}");
+        }
+        if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrQuaternion") {
+            warn!("failed to dump sxrQuaternion schema: {err:#}");
+        }
+        if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrLayoutCoords") {
+            warn!("failed to dump sxrLayoutCoords schema: {err:#}");
+        }
+        if let Err(err) = dump_class_schema(&mut env, "com.pimax.pxrapi.PxrApi$sxrVulkanTexInfo") {
+            warn!("failed to dump sxrVulkanTexInfo schema: {err:#}");
+        }
+        probe_pvr_controller_defaults(&mut env)
+    } else {
+        info!("skipping verbose Pimax startup introspection to keep launch responsive");
+        None
+    };
 
     report.pxr_version = call_static_string(
         &mut env,
@@ -4414,6 +6017,11 @@ pub fn probe() -> PimaxProbeReport {
             "PxrApi current tracking mode: {}",
             format_tracking_modes(mode)
         );
+    }
+    if let Err(err) =
+        probe_pvr_controller_client(&mut env, pxr_context, default_controller_service.as_deref())
+    {
+        warn!("PvrServiceClient controller probe failed: {err:#}");
     }
 
     let bootstrap_tracking_mode = select_bootstrap_tracking_mode(report.supported_tracking_modes);

@@ -25,15 +25,13 @@
 //!     │
 //!     ├── Load/create config ────────── /sdcard/Android/data/.../client.json
 //!     │
-//!     ├── Start debug RGBA receiver ─── Port 9950 (testing only)
+//!     ├── Optionally start debug RGBA ─ Port 9950 (diagnostic only)
 //!     │
 //!     ├── Start ALVR control listener ─ Port 9943 (server callback)
 //!     │
 //!     ├── Load server IP from config
 //!     │
-//!     ├── Discovery broadcasts ──────── 6 attempts to 255.255.255.255:9943
-//!     │
-//!     ├── Active connect attempt ────── Try connecting to configured server IP
+//!     ├── mDNS discovery ────────────── Advertise _alvr._tcp.local.
 //!     │
 //!     ├── pimax::probe() ────────────── Initialize Pimax XR, start render loop
 //!     │
@@ -57,33 +55,21 @@
 //! 2. **Panic Hook**: Capture Rust panics to logcat for debugging
 //! 3. **Tuning Server**: Start HTTP server on port 7878 for browser-based settings
 //! 4. **Config**: Load or create client.json with identity and settings
-//! 5. **Debug Receiver**: Start optional RGBA TCP receiver (port 9950) for testing
+//! 5. **Debug Receiver**: Optional RGBA TCP receiver (port 9950), disabled by default
 //! 6. **ALVR Listener**: Start TCP listener for server callback (port 9943)
-//! 7. **Discovery**: Broadcast client presence via UDP (6 attempts)
-//! 8. **Active Connect**: Attempt to connect to configured server IP
-//! 9. **Pimax Probe**: Initialize Pimax XR and enter render loop
+//! 7. **Discovery**: Advertise client presence via mDNS
+//! 8. **Pimax Probe**: Initialize Pimax XR and enter render loop
 //!
 //! # Server Connection Strategy
 //!
-//! The client uses a dual approach for connecting to the ALVR server:
+//! The client currently uses a passive callback/listener approach for connecting
+//! to the ALVR server:
 //!
-//! ## Passive Discovery (Broadcast)
+//! ## Passive Discovery
 //!
-//! - Sends 6 UDP broadcasts to 255.255.255.255:9943
+//! - Advertises `_alvr._tcp.local.` via mDNS
 //! - Waits for server to connect back (TCP to port 9943)
 //! - Works automatically when server is on same network
-//!
-//! ## Active Connection
-//!
-//! - Reads configured server IP from config
-//! - Attempts direct TCP connection to server:9944
-//! - Faster than waiting for discovery round-trip
-//! - Falls back gracefully if server not available
-//!
-//! Both approaches are used because:
-//! - Discovery works without configuration
-//! - Active connect is faster when IP is known
-//! - Having both improves reliability
 //!
 //! # Error Handling
 //!
@@ -115,10 +101,16 @@ use std::{sync::Once, thread, time::Duration};
 use android_logger::Config as AndroidLoggerConfig;
 use anyhow::{Context, Result};
 use log::{error, info, warn, LevelFilter};
-use tokio::runtime::Builder;
 
-use crate::{config, AlvrClient, ClientConfig};
 use crate::tune::set_server_status;
+use crate::{config, AlvrClient, ClientConfig};
+
+/// Enables the temporary raw-RGBA TCP frame ingress on port 9950.
+///
+/// Keep disabled for normal headset runs. It was useful while validating the
+/// compositor upload path, but the real ALVR stream should be the only active
+/// video ingress unless we are deliberately running that diagnostic.
+const ENABLE_DEBUG_RGBA_TCP_RECEIVER: bool = false;
 
 /// Logger initialization guard.
 ///
@@ -177,23 +169,21 @@ fn run_inner() -> Result<()> {
         config_path.display()
     );
 
-    let video_receiver = crate::video_receiver::get_video_receiver();
-    match crate::video_receiver::start_debug_rgba_tcp_receiver(
-        video_receiver,
-        crate::video_receiver::DEBUG_RGBA_STREAM_PORT,
-    ) {
-        Ok(()) => info!(
-            "debug RGBA TCP frame receiver ready on port {}",
-            crate::video_receiver::DEBUG_RGBA_STREAM_PORT
-        ),
-        Err(err) => warn!("debug RGBA TCP frame receiver unavailable: {err:#}"),
+    if ENABLE_DEBUG_RGBA_TCP_RECEIVER {
+        let video_receiver = crate::video_receiver::get_video_receiver();
+        match crate::video_receiver::start_debug_rgba_tcp_receiver(
+            video_receiver,
+            crate::video_receiver::DEBUG_RGBA_STREAM_PORT,
+        ) {
+            Ok(()) => info!(
+                "debug RGBA TCP frame receiver ready on port {}",
+                crate::video_receiver::DEBUG_RGBA_STREAM_PORT
+            ),
+            Err(err) => warn!("debug RGBA TCP frame receiver unavailable: {err:#}"),
+        }
+    } else {
+        info!("debug RGBA TCP frame receiver disabled for normal ALVR startup");
     }
-
-    let rt = Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("build tokio runtime")?;
-    let client = AlvrClient::new(config.clone());
 
     match crate::client::start_alvr_control_listener(config.clone()) {
         Ok(()) => info!("ALVR control listener ready for server callback"),
@@ -204,32 +194,30 @@ fn run_inner() -> Result<()> {
     let server_ip = crate::tune::get_server_ip();
     info!("configured server IP: {}", server_ip);
 
-    // Announce to the configured server (directed) and via broadcast
-    for attempt in 0..6 {
-        if let Err(err) = rt.block_on(client.announce()) {
-            warn!("ALVR discovery announcement attempt {attempt} failed: {err:#}");
-        }
-        thread::sleep(Duration::from_millis(500));
+    // Spawn mDNS discovery thread.
+    //
+    // Registers _alvr._tcp.local. via mDNS on first successful call.
+    // The ServiceDaemon re-announces automatically; subsequent loop iterations
+    // are no-ops unless the first registration failed (e.g. WiFi not yet up).
+    {
+        let discovery_config = config.clone();
+        thread::Builder::new()
+            .name("alvr-discovery".to_string())
+            .spawn(move || {
+                let discovery_client = AlvrClient::new(discovery_config);
+                let mut iteration = 0_u64;
+                loop {
+                    if let Err(err) = discovery_client.announce() {
+                        warn!("mDNS announce #{iteration} failed: {err:#}");
+                    }
+                    iteration = iteration.wrapping_add(1);
+                    thread::sleep(Duration::from_secs(5));
+                }
+            })
+            .context("spawn ALVR discovery thread")?;
     }
 
-    // Also try active connection to the configured server
-    if let Ok(ip) = server_ip.parse::<std::net::IpAddr>() {
-        info!("attempting active connection to server at {}", server_ip);
-        match rt.block_on(client.connect(ip)) {
-            Ok(session) => {
-                info!("successfully connected to ALVR server at {}", server_ip);
-                set_server_status("Connected".to_string());
-                // Keep session alive
-                std::mem::forget(session);
-            }
-            Err(err) => {
-                warn!("active connection to {} failed: {err:#}", server_ip);
-                set_server_status(format!("Waiting for server at {}", server_ip));
-            }
-        }
-    } else {
-        set_server_status(format!("Invalid server IP: {}", server_ip));
-    }
+    set_server_status(format!("Waiting for server at {}", server_ip));
 
     info!("entering Pimax runtime probe");
     let probe = crate::pimax::probe();

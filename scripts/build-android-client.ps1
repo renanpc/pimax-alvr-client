@@ -220,7 +220,7 @@ if ([string]::IsNullOrWhiteSpace($androidNdk)) {
 }
 
 $env:ANDROID_HOME = $androidHome
-$env:ANDROID_SDK_ROOT = $androidHome
+Remove-Item Env:ANDROID_SDK_ROOT -ErrorAction SilentlyContinue
 $env:ANDROID_NDK_ROOT = $androidNdk
 $env:ANDROID_NDK_HOME = $androidNdk
 
@@ -287,8 +287,8 @@ try {
     Invoke-ExternalCommand "javac compile" {
         & $javac `
             -encoding UTF-8 `
-            -source 8 `
-            -target 8 `
+            -Xlint:none `
+            --release 8 `
             -classpath $androidJar `
             -d $javaClassesDir `
             $javaSources

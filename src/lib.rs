@@ -1,15 +1,24 @@
+#![cfg_attr(not(target_os = "android"), allow(dead_code))]
+
 #[cfg(target_os = "android")]
 pub mod android;
 #[cfg(target_os = "android")]
 pub mod android_video_decoder;
 pub mod client;
 pub mod config;
-#[cfg(target_os = "android")]
-pub mod tune;
+pub mod controller;
 #[cfg(target_os = "android")]
 pub mod pimax;
 pub mod protocol;
 #[cfg(target_os = "android")]
+pub mod tune;
+#[cfg(not(target_os = "android"))]
+#[path = "tune_host.rs"]
+pub mod tune;
+#[cfg(target_os = "android")]
+pub mod video_receiver;
+#[cfg(not(target_os = "android"))]
+#[path = "video_receiver_host.rs"]
 pub mod video_receiver;
 
 pub use client::{AlvrClient, DiscoveredStreamer, SessionHandle};

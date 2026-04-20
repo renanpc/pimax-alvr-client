@@ -126,6 +126,33 @@ use crate::{
     protocol::{hash_string, DiscoveryPacket, ProtocolId},
 };
 
+/// Returns the WiFi IPv4 address by routing a dummy UDP packet.
+fn wifi_ipv4() -> Result<std::net::Ipv4Addr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").context("bind probe socket")?;
+    socket
+        .connect("8.8.8.8:53")
+        .context("connect probe socket")?;
+    match socket.local_addr()?.ip() {
+        IpAddr::V4(ip) => Ok(ip),
+        IpAddr::V6(_) => anyhow::bail!("only IPv4 supported for mDNS"),
+    }
+}
+
+/// Derives the ALVR protocol string from a semver version string.
+/// Stable releases use only the major version ("20").
+/// Pre-releases append the pre-release tag ("20-alpha.1").
+fn alvr_protocol_string(version_string: &str) -> String {
+    semver::Version::parse(version_string)
+        .map(|v| {
+            if v.pre.is_empty() {
+                v.major.to_string()
+            } else {
+                format!("{}-{}", v.major, v.pre)
+            }
+        })
+        .unwrap_or_else(|_| version_string.to_owned())
+}
+
 /// Shared handle to the ALVR control TCP stream.
 ///
 /// Wrapped in Arc<Mutex<>> because:
@@ -169,6 +196,9 @@ const ALVR_STATISTICS_STREAM_ID: u16 = 4;
 const ALVR_STREAM_LOG_EVERY: u64 = 3_600;
 const ALVR_INITIAL_IDR_REQUESTS: u32 = 5;
 const ALVR_TRACKING_SEND_INTERVAL: Duration = Duration::from_micros(13_889);
+// 30 Hz button send rate. Higher than typical OpenXR sample rate but well
+// below the 90 Hz tracking rate to avoid flooding the control TCP socket.
+const ALVR_BUTTONS_SEND_INTERVAL: Duration = Duration::from_millis(33);
 const ALVR_DEFAULT_FRAME_INTERVAL: Duration = Duration::from_micros(13_889);
 const ALVR_STATISTICS_HISTORY_SIZE: usize = 512;
 const ALVR_DEFAULT_IPD_M: f32 = 0.064;
@@ -181,8 +211,6 @@ const ALVR_DEFAULT_IPD_M: f32 = 0.064;
 /// Default IPD scale — exposed so `android.rs` can pass it to `tune::init`.
 /// The actual live value is read from `tune::ipd_scale()` each time a ViewsConfig is sent.
 pub const ALVR_IPD_SCALE_DEFAULT: f32 = 1.0;
-// Keep the const for clarity but reads always use tune::ipd_scale() at runtime.
-const ALVR_IPD_SCALE: f32 = ALVR_IPD_SCALE_DEFAULT;
 const ALVR_HEAD_PATH: &str = "/user/head";
 
 static ALVR_CONTROL_LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
@@ -220,8 +248,8 @@ fn latest_head_tracking_pose() -> Option<AlvrHeadTrackingPose> {
     LATEST_HEAD_TRACKING_POSE.lock().ok().and_then(|pose| *pose)
 }
 
-/// Returns the current IPD in metres, already scaled by ALVR_IPD_SCALE, ready to send to ALVR.
-/// The state stores the scaled IPD; do NOT multiply by ALVR_IPD_SCALE again at the call site.
+/// Returns the current IPD in metres, already scaled by `tune::ipd_scale()`,
+/// ready to send to ALVR. Do not multiply by the tune scale again at the call site.
 fn current_alvr_ipd_m() -> f32 {
     latest_alvr_views_config()
         .map(|state| state.config.ipd_m)
@@ -233,7 +261,11 @@ fn normalize_pimax_ipd_m(raw_ipd: f32) -> Option<f32> {
         return None;
     }
 
-    let ipd_m = if raw_ipd > 1.0 { raw_ipd / 1000.0 } else { raw_ipd };
+    let ipd_m = if raw_ipd > 1.0 {
+        raw_ipd / 1000.0
+    } else {
+        raw_ipd
+    };
     if !ipd_m.is_finite() || ipd_m <= 0.0 {
         return None;
     }
@@ -264,7 +296,7 @@ pub(crate) fn update_alvr_views_config_from_pimax(
         down: -vertical_tan,
     };
     let config = ViewsConfig {
-        // current_alvr_ipd_m() already returns the scaled IPD; do NOT multiply by ALVR_IPD_SCALE again.
+        // current_alvr_ipd_m() already returns the scaled IPD.
         ipd_m: current_alvr_ipd_m(),
         fov: [fov, fov],
     };
@@ -360,10 +392,16 @@ pub(crate) fn notify_ipd_scale_changed() {
         .map(|s| s.config.clone())
         .unwrap_or_else(default_views_config);
     config.ipd_m = physical * crate::tune::ipd_scale();
-    *state = Some(VersionedViewsConfig { version, config: config.clone() });
+    *state = Some(VersionedViewsConfig {
+        version,
+        config: config.clone(),
+    });
     info!(
         "tune: IPD scale changed → physical_m={:.4} scale={:.2} alvr_ipd_m={:.4} version={}",
-        physical, crate::tune::ipd_scale(), config.ipd_m, version
+        physical,
+        crate::tune::ipd_scale(),
+        config.ipd_m,
+        version
     );
 }
 
@@ -659,56 +697,56 @@ impl SessionHandle {
 
 pub struct AlvrClient {
     pub config: ClientConfig,
+    mdns_daemon: std::sync::Mutex<Option<mdns_sd::ServiceDaemon>>,
 }
 
 impl AlvrClient {
     pub fn new(config: ClientConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            mdns_daemon: std::sync::Mutex::new(None),
+        }
     }
 
-    /// Announce this client to an ALVR v20 server.
+    /// Advertise this client via mDNS so an ALVR v20 server can discover and
+    /// connect back on TCP port 9943.
     ///
-    /// ALVR discovery is one-way: the client broadcasts this packet, then the
-    /// server connects back to the client's TCP control listener if it trusts
-    /// the hostname.
-    pub async fn announce(&self) -> Result<()> {
-        let packet = DiscoveryPacket {
-            protocol_id: self.config.protocol_id(),
-            hostname: self.config.client_name.clone(),
-        };
+    /// First call registers the mDNS service; subsequent calls are no-ops
+    /// because the ServiceDaemon re-announces automatically. Retries on the
+    /// next call if the first attempt fails (e.g. WiFi not yet up).
+    pub fn announce(&self) -> Result<()> {
+        let mut guard = self.mdns_daemon.lock().unwrap();
+        if guard.is_some() {
+            return Ok(());
+        }
 
-        let socket = match TokioUdpSocket::bind((Ipv4Addr::UNSPECIFIED, self.config.discovery_port))
-            .await
-        {
-            Ok(socket) => socket,
-            Err(err) => {
-                warn!(
-                    "failed to bind ALVR discovery socket to source port {}; falling back to an ephemeral port: {err:#}",
-                    self.config.discovery_port
-                );
-                TokioUdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-                    .await
-                    .context("bind fallback ALVR discovery socket")?
-            }
-        };
-        socket.set_broadcast(true).context("enable broadcast")?;
+        let local_ip = IpAddr::V4(wifi_ipv4().context("get local IPv4 for mDNS")?);
+        let protocol_str = alvr_protocol_string(&self.config.version_string);
 
-        let broadcast = SocketAddr::from((Ipv4Addr::BROADCAST, self.config.discovery_port));
-        socket
-            .send_to(&packet.encode(), broadcast)
-            .await
-            .with_context(|| {
-                format!(
-                    "announce ALVR client {} protocol={} to {broadcast}",
-                    self.config.client_name, packet.protocol_id
-                )
-            })?;
+        let daemon = mdns_sd::ServiceDaemon::new().context("create mDNS ServiceDaemon")?;
+
+        let service_info = mdns_sd::ServiceInfo::new(
+            "_alvr._tcp.local.",
+            &format!("alvr-{}", self.config.client_name),
+            &format!("{}.local.", self.config.client_name),
+            local_ip,
+            self.config.discovery_port,
+            &[
+                ("protocol", protocol_str.as_str()),
+                ("device_id", self.config.client_name.as_str()),
+            ][..],
+        )
+        .context("build mDNS ServiceInfo")?;
+
+        daemon
+            .register(service_info)
+            .context("register mDNS service")?;
+
+        *guard = Some(daemon);
 
         info!(
-            "announced ALVR client {} protocol={} ({}) to {broadcast}",
-            self.config.client_name,
-            packet.protocol_id,
-            packet.protocol_id.as_u64()
+            "mDNS: registered _alvr._tcp.local. hostname={} addr={}:{} protocol={}",
+            self.config.client_name, local_ip, self.config.discovery_port, protocol_str
         );
         Ok(())
     }
@@ -857,9 +895,7 @@ fn handle_alvr_server_control(mut stream: StdTcpStream, config: &ClientConfig) -
         .context("set ALVR control write timeout")?;
 
     info!("ALVR server connected to client control listener from {peer}");
-    let capabilities = encode_video_streaming_capabilities(VideoStreamingCapabilities {
-        // Keep the packed foveated layout enabled; the non-foveated compare run
-        // was visibly blurrier on this headset.
+    let capabilities = VideoStreamingCapabilities {
         default_view_resolution: glam::UVec2::new(2880, 2880),
         supported_refresh_rates: vec![72.0, 90.0],
         microphone_sample_rate: 48_000,
@@ -867,12 +903,14 @@ fn handle_alvr_server_control(mut stream: StdTcpStream, config: &ClientConfig) -
         encoder_high_profile: true,
         encoder_10_bits: false,
         encoder_av1: false,
-        multimodal_protocol: true,
+        multimodal_protocol: false,
         prefer_10bit: false,
         prefer_full_range: true,
         preferred_encoding_gamma: 1.0,
         prefer_hdr: false,
-    })?;
+    };
+    let legacy_caps = encode_video_streaming_capabilities(&capabilities)
+        .context("encode ALVR capabilities to legacy format")?;
 
     send_framed(
         &mut stream,
@@ -880,7 +918,7 @@ fn handle_alvr_server_control(mut stream: StdTcpStream, config: &ClientConfig) -
             client_protocol_id: config.protocol_id().as_u64(),
             display_name: "Pimax Crystal OG ALVR Dev".to_string(),
             server_ip: peer.ip(),
-            streaming_capabilities: Some(capabilities),
+            streaming_capabilities: Some(legacy_caps),
         },
     )
     .context("send ALVR ConnectionAccepted")?;
@@ -1190,19 +1228,27 @@ fn send_minimal_tracking_stream(socket: StdUdpSocket, max_packet_size: usize) {
             timestamp: fallback_timestamp,
         });
         let timestamp = head_pose.timestamp;
+        let mut device_motions = Vec::with_capacity(3);
+        device_motions.push((
+            head_id,
+            DeviceMotion {
+                pose: Pose {
+                    orientation: head_pose.orientation,
+                    position: head_pose.position,
+                },
+                linear_velocity: glam::Vec3::ZERO,
+                angular_velocity: glam::Vec3::ZERO,
+            },
+        ));
+
+        let controller_snapshot = crate::controller::latest_controller_state();
+        device_motions.extend(crate::controller::build_controller_device_motions(
+            &controller_snapshot,
+        ));
+
         let tracking = Tracking {
             target_timestamp: timestamp,
-            device_motions: vec![(
-                head_id,
-                DeviceMotion {
-                    pose: Pose {
-                        orientation: head_pose.orientation,
-                        position: head_pose.position,
-                    },
-                    linear_velocity: glam::Vec3::ZERO,
-                    angular_velocity: glam::Vec3::ZERO,
-                },
-            )],
+            device_motions,
             hand_skeletons: [None, None],
             face_data: FaceData::default(),
         };
@@ -1292,9 +1338,11 @@ fn send_alvr_stream_header_packet<H: Serialize>(
 fn maintain_alvr_control_socket(writer: SharedControlWriter) {
     let mut next_keepalive = Instant::now();
     let mut next_idr_request = Instant::now();
+    let mut next_buttons_send = Instant::now();
     let mut idr_requests_sent = 0_u32;
     let mut last_views_config_version = latest_alvr_views_config().map(|state| state.version);
     let mut keepalives_sent = 0_u64;
+    let mut buttons_sent = 0_u64;
 
     loop {
         let now = Instant::now();
@@ -1342,6 +1390,25 @@ fn maintain_alvr_control_socket(writer: SharedControlWriter) {
                 idr_requests_sent, ALVR_INITIAL_IDR_REQUESTS
             );
             next_idr_request = now + ALVR_IDR_REQUEST_INTERVAL;
+        }
+
+        if now >= next_buttons_send {
+            let snapshot = crate::controller::latest_controller_state();
+            let entries = crate::controller::build_button_entries(&snapshot);
+            if !entries.is_empty() {
+                let entry_count = entries.len();
+                if let Err(err) =
+                    send_framed_locked(&writer, &ClientControlPacket::Buttons(entries))
+                {
+                    warn!("ALVR control maintenance thread exiting after Buttons send failure: {err:#}");
+                    break;
+                }
+                buttons_sent = buttons_sent.wrapping_add(1);
+                if buttons_sent <= 5 || buttons_sent % ALVR_STREAM_LOG_EVERY == 0 {
+                    info!("sent ALVR Buttons packet: count={buttons_sent} entries={entry_count}");
+                }
+            }
+            next_buttons_send = now + ALVR_BUTTONS_SEND_INTERVAL;
         }
 
         thread::sleep(Duration::from_millis(25));
@@ -1658,28 +1725,16 @@ struct VideoStreamingCapabilities {
 }
 
 fn encode_video_streaming_capabilities(
-    caps: VideoStreamingCapabilities,
+    caps: &VideoStreamingCapabilities,
 ) -> Result<VideoStreamingCapabilitiesLegacy> {
-    let caps_json = serde_json::to_value(&caps).context("encode video capabilities to JSON")?;
-    let mut supported_refresh_rates_plus_extra_data = Vec::new();
-
-    for rate in caps_json["supported_refresh_rates"]
-        .as_array()
-        .context("capabilities refresh rates are not an array")?
-    {
-        supported_refresh_rates_plus_extra_data
-            .push(rate.as_f64().context("refresh rate is not a number")? as f32);
+    let mut packed = caps.supported_refresh_rates.clone();
+    let json = serde_json::to_string(caps).context("encode capabilities JSON")?;
+    for byte in json.as_bytes() {
+        packed.push(-(*byte as f32));
     }
-    for byte in serde_json::to_string(&caps)
-        .context("encode video capabilities JSON string")?
-        .as_bytes()
-    {
-        supported_refresh_rates_plus_extra_data.push(-(*byte as f32));
-    }
-
     Ok(VideoStreamingCapabilitiesLegacy {
         default_view_resolution: caps.default_view_resolution,
-        supported_refresh_rates_plus_extra_data,
+        supported_refresh_rates_plus_extra_data: packed,
         microphone_sample_rate: caps.microphone_sample_rate,
     })
 }
@@ -1759,16 +1814,16 @@ impl Default for Fov {
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Default, Debug)]
-struct Pose {
-    orientation: glam::Quat,
-    position: glam::Vec3,
+pub(crate) struct Pose {
+    pub orientation: glam::Quat,
+    pub position: glam::Vec3,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Default, Debug)]
-struct DeviceMotion {
-    pose: Pose,
-    linear_velocity: glam::Vec3,
-    angular_velocity: glam::Vec3,
+pub(crate) struct DeviceMotion {
+    pub pose: Pose,
+    pub linear_velocity: glam::Vec3,
+    pub angular_velocity: glam::Vec3,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -1811,6 +1866,13 @@ fn default_views_config() -> ViewsConfig {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+struct BatteryInfo {
+    device_id: u64,
+    gauge_value: f32,
+    is_plugged: bool,
+}
+
 #[derive(Serialize, Deserialize)]
 enum ClientControlPacket {
     PlayspaceSync(Option<glam::Vec2>),
@@ -1818,6 +1880,9 @@ enum ClientControlPacket {
     KeepAlive,
     StreamReady,
     ViewsConfig(ViewsConfig),
+    Battery(BatteryInfo),
+    VideoErrorReport,
+    Buttons(Vec<crate::controller::ButtonEntry>),
 }
 
 #[cfg(test)]
@@ -1834,5 +1899,108 @@ mod tests {
         };
         let text = format!("{streamer:?}");
         assert!(text.contains("pimax"));
+    }
+
+    // Regression: ALVR v20 mDNS protocol TXT record uses the major version only
+    // for stable releases ("20"), and "<major>-<pre>" for prereleases. Anything
+    // else and the server filters us out of discovery.
+    #[test]
+    fn alvr_protocol_string_stable_uses_major_only() {
+        assert_eq!(alvr_protocol_string("20.14.1"), "20");
+        assert_eq!(alvr_protocol_string("21.0.0"), "21");
+    }
+
+    #[test]
+    fn alvr_protocol_string_prerelease_appends_pre_tag() {
+        assert_eq!(alvr_protocol_string("20.14.1-alpha.1"), "20-alpha.1");
+        assert_eq!(alvr_protocol_string("21.0.0-rc.2"), "21-rc.2");
+    }
+
+    #[test]
+    fn alvr_protocol_string_unparseable_falls_back_to_input() {
+        assert_eq!(alvr_protocol_string("not-a-version"), "not-a-version");
+    }
+
+    fn sample_capabilities() -> VideoStreamingCapabilities {
+        VideoStreamingCapabilities {
+            default_view_resolution: glam::UVec2::new(2880, 2880),
+            supported_refresh_rates: vec![72.0, 90.0],
+            microphone_sample_rate: 48_000,
+            supports_foveated_encoding: true,
+            encoder_high_profile: true,
+            encoder_10_bits: false,
+            encoder_av1: false,
+            multimodal_protocol: false,
+            prefer_10bit: false,
+            prefer_full_range: true,
+            preferred_encoding_gamma: 1.0,
+            prefer_hdr: false,
+        }
+    }
+
+    // Regression: ALVR v20.14.1 server expects the legacy capabilities wire
+    // format — refresh rates followed by JSON bytes packed as negative floats.
+    // Without this trick the server hangs up after ConnectionAccepted with
+    // "read ALVR frame length: failed to fill whole buffer".
+    #[test]
+    fn encode_capabilities_packs_json_as_negative_floats_after_refresh_rates() {
+        let caps = sample_capabilities();
+        let legacy = encode_video_streaming_capabilities(&caps).unwrap();
+
+        let refresh_rate_count = caps.supported_refresh_rates.len();
+        assert_eq!(
+            &legacy.supported_refresh_rates_plus_extra_data[..refresh_rate_count],
+            &caps.supported_refresh_rates[..],
+            "refresh rates must be at the head of the packed vector",
+        );
+
+        let json_bytes: Vec<u8> = legacy.supported_refresh_rates_plus_extra_data
+            [refresh_rate_count..]
+            .iter()
+            .map(|f| {
+                assert!(*f <= 0.0, "JSON byte floats must be non-positive");
+                (-*f) as u8
+            })
+            .collect();
+        let json_str = std::str::from_utf8(&json_bytes).expect("packed JSON is valid UTF-8");
+        let decoded: serde_json::Value =
+            serde_json::from_str(json_str).expect("packed JSON parses");
+
+        // Must use v20.14.1 field names (not the older "foveated_encoding").
+        assert!(decoded.get("supports_foveated_encoding").is_some());
+        assert!(decoded.get("multimodal_protocol").is_some());
+        assert!(decoded.get("prefer_10bit").is_some());
+        assert!(decoded.get("prefer_hdr").is_some());
+        assert_eq!(decoded["supports_foveated_encoding"], true);
+        assert_eq!(decoded["microphone_sample_rate"], 48_000);
+    }
+
+    #[test]
+    fn encode_capabilities_preserves_resolution_and_sample_rate() {
+        let caps = sample_capabilities();
+        let legacy = encode_video_streaming_capabilities(&caps).unwrap();
+        assert_eq!(legacy.default_view_resolution, caps.default_view_resolution);
+        assert_eq!(legacy.microphone_sample_rate, caps.microphone_sample_rate);
+    }
+
+    // Regression: bincode encodes enum variant index as u32 LE. ALVR v20
+    // server matches by ordinal — reorder the variants and the server
+    // mis-decodes every control packet.
+    #[test]
+    fn client_control_packet_variant_indices_match_alvr_v20() {
+        fn variant_index(packet: ClientControlPacket) -> u32 {
+            let bytes = bincode::serialize(&packet).expect("serialize control packet");
+            assert!(bytes.len() >= 4);
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        }
+
+        assert_eq!(variant_index(ClientControlPacket::PlayspaceSync(None)), 0);
+        assert_eq!(variant_index(ClientControlPacket::RequestIdr), 1);
+        assert_eq!(variant_index(ClientControlPacket::KeepAlive), 2);
+        assert_eq!(variant_index(ClientControlPacket::StreamReady), 3);
+        assert_eq!(
+            variant_index(ClientControlPacket::ViewsConfig(default_views_config())),
+            4,
+        );
     }
 }

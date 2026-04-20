@@ -122,7 +122,6 @@
 //! - `color_gain`: Contrast gain (default: 1.22)
 //! - `ipd_scale`: Stereo separation strength (default: 1.0)
 
-
 use std::ffi::{c_void, CString};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -220,8 +219,18 @@ extern "C" {
     fn glGetProgramiv(program: u32, pname: u32, params: *mut i32);
     fn glGetShaderInfoLog(shader: u32, buf_size: i32, length: *mut i32, info_log: *mut i8);
     fn glGetShaderiv(shader: u32, pname: u32, params: *mut i32);
+    fn glGetError() -> u32;
     fn glGetUniformLocation(program: u32, name: *const i8) -> i32;
     fn glLinkProgram(program: u32);
+    fn glReadPixels(
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        format: u32,
+        type_: u32,
+        pixels: *mut c_void,
+    );
     fn glShaderSource(shader: u32, count: i32, string: *const *const i8, length: *const i32);
     fn glTexParameteri(target: u32, pname: u32, param: i32);
     fn glTexSubImage2D(
@@ -238,7 +247,13 @@ extern "C" {
     fn glCheckFramebufferStatus(target: u32) -> u32;
     fn glDeleteFramebuffers(n: i32, framebuffers: *const u32);
     fn glFlush();
-    fn glFramebufferTexture2D(target: u32, attachment: u32, textarget: u32, texture: u32, level: i32);
+    fn glFramebufferTexture2D(
+        target: u32,
+        attachment: u32,
+        textarget: u32,
+        texture: u32,
+        level: i32,
+    );
     fn glGenFramebuffers(n: i32, framebuffers: *mut u32);
     fn glTexImage2D(
         target: u32,
@@ -295,6 +310,14 @@ struct IntermediateFbo {
     texture: u32,
     width: i32,
     height: i32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FramebufferLumaStats {
+    center_pixel: [u8; 4],
+    average_luma: f32,
+    dark_percent: f32,
+    bright_percent: f32,
 }
 
 struct BlitProgram {
@@ -857,6 +880,80 @@ fn current_framebuffer_binding() -> u32 {
     framebuffer.max(0) as u32
 }
 
+fn pixel_luma(pixel: [u8; 4]) -> f32 {
+    (0.2126 * pixel[0] as f32) + (0.7152 * pixel[1] as f32) + (0.0722 * pixel[2] as f32)
+}
+
+fn readback_framebuffer_luma_stats(
+    framebuffer: u32,
+    width: i32,
+    height: i32,
+) -> FramebufferLumaStats {
+    let sample_steps = [1_i32, 3, 5, 7, 9];
+    let mut pixel = [0_u8; 4];
+    let mut center_pixel = [0_u8; 4];
+    let mut samples = 0_u32;
+    let mut dark_samples = 0_u32;
+    let mut bright_samples = 0_u32;
+    let mut total_luma = 0.0_f32;
+
+    unsafe {
+        let previous_framebuffer = current_framebuffer_binding();
+        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+
+        for y_step in sample_steps {
+            for x_step in sample_steps {
+                let x = ((width.max(1) - 1) * x_step / 10).max(0);
+                let y = ((height.max(1) - 1) * y_step / 10).max(0);
+                glReadPixels(
+                    x,
+                    y,
+                    1,
+                    1,
+                    GL_RGBA,
+                    GL_UNSIGNED_BYTE,
+                    pixel.as_mut_ptr().cast(),
+                );
+                let luma = pixel_luma(pixel);
+                total_luma += luma;
+                if luma < 20.0 {
+                    dark_samples = dark_samples.saturating_add(1);
+                }
+                if luma > 80.0 {
+                    bright_samples = bright_samples.saturating_add(1);
+                }
+                samples = samples.saturating_add(1);
+                if x == width / 2 && y == height / 2 {
+                    center_pixel = pixel;
+                }
+            }
+        }
+
+        glBindFramebuffer(GL_FRAMEBUFFER, previous_framebuffer);
+    }
+
+    let average_luma = if samples > 0 {
+        total_luma / samples as f32
+    } else {
+        0.0
+    };
+
+    FramebufferLumaStats {
+        center_pixel,
+        average_luma,
+        dark_percent: if samples > 0 {
+            (dark_samples as f32 / samples as f32) * 100.0
+        } else {
+            0.0
+        },
+        bright_percent: if samples > 0 {
+            (bright_samples as f32 / samples as f32) * 100.0
+        } else {
+            0.0
+        },
+    }
+}
+
 /// Get or create the passthrough OES shader used in pass 1 of the two-pass blit.
 fn get_passthrough_oes_program() -> Result<PassthroughProgram> {
     let mut prog = PASSTHROUGH_OES_PROGRAM.lock();
@@ -994,7 +1091,13 @@ fn get_intermediate_fbo(width: i32, height: i32) -> Result<IntermediateFbo> {
             bail!("glGenFramebuffers returned 0 for intermediate FBO");
         }
         glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+        glFramebufferTexture2D(
+            GL_FRAMEBUFFER,
+            GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_2D,
+            texture,
+            0,
+        );
         let status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         if status != GL_FRAMEBUFFER_COMPLETE {
@@ -1045,8 +1148,8 @@ fn get_blit_program() -> Result<BlitProgram> {
     }
 
     // Pass 2 of two-pass blit always samples from a standard RGBA texture via GL_TEXTURE_2D.
-    let created = create_blit_program(false)
-        .context("create GL_TEXTURE_2D blit program for pass 2")?;
+    let created =
+        create_blit_program(false).context("create GL_TEXTURE_2D blit program for pass 2")?;
     *program = Some(BlitProgram {
         program: created.program,
         texture_target: created.texture_target,
@@ -1371,8 +1474,8 @@ pub(crate) fn render_ahardwarebuffer_to_target(
         load_egl_proc::<GlEglImageTargetTexture2dOes>("glEGLImageTargetTexture2DOES")
             .context("load glEGLImageTargetTexture2DOES")?;
 
-    let passthrough = get_passthrough_oes_program()
-        .context("get passthrough OES shader for pass 1")?;
+    let passthrough =
+        get_passthrough_oes_program().context("get passthrough OES shader for pass 1")?;
     let blit_program = get_blit_program().context("get blit shader for pass 2")?;
 
     let display = unsafe { eglGetCurrentDisplay() };
@@ -1424,6 +1527,8 @@ pub(crate) fn render_ahardwarebuffer_to_target(
         VideoFrameEye::Left => 0,
         VideoFrameEye::Right => 1,
     };
+    let count = AHB_BLIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let should_log_stats = count <= 5 || count % 120 == 0;
 
     unsafe {
         let previous_framebuffer = current_framebuffer_binding();
@@ -1450,9 +1555,32 @@ pub(crate) fn render_ahardwarebuffer_to_target(
         glBindTexture(GL_TEXTURE_EXTERNAL_OES, source_texture);
         glUniform1i(passthrough.texture_uniform, 0);
         // Live-tunable color expansion (adjustable via HTTP at :7878)
-        glUniform1f(passthrough.black_crush_uniform, crate::tune::color_black_crush());
+        glUniform1f(
+            passthrough.black_crush_uniform,
+            crate::tune::color_black_crush(),
+        );
         glUniform1f(passthrough.color_gain_uniform, crate::tune::color_gain());
         glDrawArrays(GL_TRIANGLES, 0, 3);
+        if should_log_stats {
+            let pass1_error = glGetError();
+            let pass1_stats = readback_framebuffer_luma_stats(
+                intermediate.framebuffer,
+                intermediate.width,
+                intermediate.height,
+            );
+            info!(
+                "AHB pass1 stats: eye={:?} source={}x{} intermediate={}x{} center_pixel={:?} luma_avg={:.1} dark_pct={:.1} bright_pct={:.1} gl_error=0x{pass1_error:04x}",
+                eye,
+                frame.width,
+                frame.height,
+                intermediate.width,
+                intermediate.height,
+                pass1_stats.center_pixel,
+                pass1_stats.average_luma,
+                pass1_stats.dark_percent,
+                pass1_stats.bright_percent,
+            );
+        }
 
         // Clean up pass 1
         glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
@@ -1531,6 +1659,21 @@ pub(crate) fn render_ahardwarebuffer_to_target(
             );
         }
         glDrawArrays(GL_TRIANGLES, 0, 3);
+        if should_log_stats {
+            let pass2_error = glGetError();
+            let pass2_stats =
+                readback_framebuffer_luma_stats(target.framebuffer, target.width, target.height);
+            info!(
+                "AHB pass2 stats: eye={:?} target={}x{} center_pixel={:?} luma_avg={:.1} dark_pct={:.1} bright_pct={:.1} gl_error=0x{pass2_error:04x}",
+                eye,
+                target.width,
+                target.height,
+                pass2_stats.center_pixel,
+                pass2_stats.average_luma,
+                pass2_stats.dark_percent,
+                pass2_stats.bright_percent,
+            );
+        }
 
         // Restore state
         glBindTexture(GL_TEXTURE_2D, 0);
@@ -1539,7 +1682,6 @@ pub(crate) fn render_ahardwarebuffer_to_target(
         glFlush();
     }
 
-    let count = AHB_BLIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if count <= 5 || count % 120 == 0 {
         info!(
             "two-pass blit to {:?} eye: source={}x{} intermediate={}x{} target={}x{} uv=({:.3},{:.3}) foveated={} blits={}",
