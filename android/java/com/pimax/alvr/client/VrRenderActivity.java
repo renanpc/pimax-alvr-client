@@ -742,6 +742,7 @@ public final class VrRenderActivity extends NativeActivity {
      *
      * @param hasFocus true if the window now has focus, false if it has lost focus
      */
+    @SuppressWarnings("deprecation")
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);

@@ -12,7 +12,7 @@ if (Test-Path $classesDir) {
 New-Item -ItemType Directory -Force -Path $classesDir | Out-Null
 
 Write-Host "Compiling proximity wake policy regression tests..."
-javac -encoding UTF-8 -source 8 -target 8 -d $classesDir $sourcePath $testPath
+javac -encoding UTF-8 -Xlint:-options --release 8 -d $classesDir $sourcePath $testPath
 if ($LASTEXITCODE -ne 0) {
     throw "javac failed with exit code $LASTEXITCODE"
 }
