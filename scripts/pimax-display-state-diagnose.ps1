@@ -215,13 +215,18 @@ $panelOff = (
     $actualState -eq "OFF" -or
     $actualBacklight -eq "0"
 )
-$physicalPanelBacklightOff = $panelActual -eq "0"
+# On Crystal OG, panel_actual can remain 0 even while the display is visibly on.
+# Prefer power/display state and explicit panel power/DPMS signals for off diagnosis.
+$physicalPanelBacklightOff = (
+    (-not [string]::IsNullOrWhiteSpace($panelBlPower) -and $panelBlPower -ne "0") -or
+    $drmDsiDpms -eq "Off"
+)
 $framebufferBlack = $screen.classification -in @("BLACK_FRAMEBUFFER", "VERY_DARK_FRAMEBUFFER")
 
-$diagnosis = if ($physicalPanelBacklightOff) {
-    "PHYSICAL_PANEL_BACKLIGHT_OFF"
-} elseif ($panelOff) {
+$diagnosis = if ($panelOff) {
     "PANEL_POWER_OFF"
+} elseif ($physicalPanelBacklightOff) {
+    "PHYSICAL_PANEL_BACKLIGHT_OFF"
 } elseif ($framebufferBlack) {
     "DISPLAY_ON_FRAMEBUFFER_BLACK"
 } elseif ($screen.classification -eq "NON_BLACK_FRAMEBUFFER") {

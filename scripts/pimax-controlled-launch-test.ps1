@@ -604,7 +604,8 @@ function Test-DisplayOff {
         $powerText -match "mWakefulness=Asleep" -or
         $displayText -match "mGlobalDisplayState=OFF" -or
         $displayText -match "mActualBacklight=0" -or
-        $panelText -match "(?m)^panel_actual=0$"
+        $panelText -match "(?m)^panel_bl_power=[1-9][0-9]*$" -or
+        $panelText -match "(?m)^drm_dsi_dpms=Off$"
     )
 }
 
