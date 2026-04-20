@@ -139,7 +139,7 @@
 use anyhow::bail;
 use anyhow::{Context, Result};
 use jni::{
-    objects::{GlobalRef, JClass, JFloatArray, JIntArray, JObject, JObjectArray, JString, JValue},
+    objects::{GlobalRef, JClass, JObject, JObjectArray, JString, JValue},
     JavaVM,
 };
 use log::{error, info, warn};
@@ -464,7 +464,6 @@ const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
 const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
 const GL_TEXTURE_WRAP_S: u32 = 0x2802;
 const GL_TEXTURE_WRAP_T: u32 = 0x2803;
-const GL_NEAREST: i32 = 0x2600;
 const GL_LINEAR: i32 = 0x2601;
 const GL_CLAMP_TO_EDGE: i32 = 0x812F;
 const GL_RG: u32 = 0x8227;
@@ -3208,30 +3207,6 @@ fn set_float_array_field(
         .with_context(|| format!("set float array field {name}"))
 }
 
-fn make_float_array<'local>(
-    env: &mut jni::JNIEnv<'local>,
-    values: &[f32],
-) -> Result<JFloatArray<'local>> {
-    let array = env
-        .new_float_array(values.len() as i32)
-        .context("create float array")?;
-    env.set_float_array_region(&array, 0, values)
-        .context("fill float array")?;
-    Ok(array)
-}
-
-fn make_int_array<'local>(
-    env: &mut jni::JNIEnv<'local>,
-    values: &[i32],
-) -> Result<JIntArray<'local>> {
-    let array = env
-        .new_int_array(values.len() as i32)
-        .context("create int array")?;
-    env.set_int_array_region(&array, 0, values)
-        .context("fill int array")?;
-    Ok(array)
-}
-
 fn set_simple_layout_coords(env: &mut jni::JNIEnv<'_>, coords: &JObject<'_>) -> Result<()> {
     set_float_array_field(env, coords, "LowerLeftPos", &[-1.0, -1.0, 0.0, 1.0])?;
     set_float_array_field(env, coords, "LowerRightPos", &[1.0, -1.0, 0.0, 1.0])?;
@@ -3251,66 +3226,6 @@ fn set_simple_layout_coords(env: &mut jni::JNIEnv<'_>, coords: &JObject<'_>) -> 
         ],
     )?;
     Ok(())
-}
-
-fn create_test_texture() -> u32 {
-    let mut texture = 0_u32;
-    unsafe {
-        glGenTextures(1, &mut texture as *mut u32);
-        glBindTexture(GL_TEXTURE_2D, texture);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-        let pixels: [u8; 16] = [
-            255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
-        ];
-        glTexImage2D(
-            GL_TEXTURE_2D,
-            0,
-            GL_RGBA8,
-            2,
-            2,
-            0,
-            GL_RGBA,
-            GL_UNSIGNED_BYTE,
-            pixels.as_ptr().cast(),
-        );
-        glFlush();
-    }
-    texture
-}
-
-fn create_solid_texture(width: i32, height: i32, color: [u8; 4]) -> u32 {
-    let mut texture = 0_u32;
-    let width = width.max(1);
-    let height = height.max(1);
-    let mut pixels = vec![0_u8; (width as usize) * (height as usize) * 4];
-    for chunk in pixels.chunks_exact_mut(4) {
-        chunk.copy_from_slice(&color);
-    }
-    unsafe {
-        glGenTextures(1, &mut texture as *mut u32);
-        glBindTexture(GL_TEXTURE_2D, texture);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(
-            GL_TEXTURE_2D,
-            0,
-            GL_RGBA8,
-            width,
-            height,
-            0,
-            GL_RGBA,
-            GL_UNSIGNED_BYTE,
-            pixels.as_ptr().cast(),
-        );
-        glFlush();
-    }
-    texture
 }
 
 fn create_identity_uv_map_texture(samples: i32) -> Result<UvMapTexture> {
