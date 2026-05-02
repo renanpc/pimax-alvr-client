@@ -25,7 +25,7 @@
 //!         ├── Receives eye textures from app
 //!         ├── Applies distortion correction
 //!         ├── Applies chromatic aberration correction
-//!         ├── Applies divergent warp (~0.248 NDC per eye)
+//!         ├── Applies divergent warp (~0.124 NDC per eye)
 //!         └── Scans out to display panels
 //! ```
 //!
@@ -136,8 +136,10 @@
 //!
 //! The `SHUTDOWN_REQUESTED` flag is checked each frame to exit cleanly.
 
+use crate::video_receiver::VideoFrameEye;
 use anyhow::bail;
 use anyhow::{Context, Result};
+use image::{codecs::jpeg::JpegEncoder, ColorType, ImageEncoder};
 use jni::{
     objects::{GlobalRef, JClass, JObject, JObjectArray, JString, JValue},
     JavaVM,
@@ -150,7 +152,11 @@ use std::os::raw::c_void;
 use std::{
     ffi::CStr,
     ffi::CString,
-    mem, ptr,
+    fs::{self, File},
+    io::{BufWriter, Write},
+    mem,
+    path::PathBuf,
+    ptr,
     sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant},
@@ -163,6 +169,7 @@ use std::{
 /// default path lightweight so the headset gets a frame up quickly.
 const PIMAX_VERBOSE_STARTUP_INTROSPECTION: bool = false;
 const ENABLE_NATIVE_PIMAX_CONTROLLER_RUNTIME: bool = true;
+const PIMAX_DUMP_FRAME_START: u32 = 120;
 
 type EGLDisplay = *mut c_void;
 type EGLConfig = *mut c_void;
@@ -325,6 +332,15 @@ pub extern "system" fn Java_com_pimax_alvr_client_VrRenderActivity_nativeNotifyC
     crate::controller::update_controller_connection(hand, connected != 0);
 }
 
+#[no_mangle]
+pub extern "system" fn Java_com_pimax_alvr_client_VrRenderActivity_nativeNotifyMicrophonePermission(
+    _env: jni::JNIEnv<'_>,
+    _class: JClass<'_>,
+    granted: jni::sys::jboolean,
+) {
+    crate::audio::set_microphone_permission_granted(granted != 0);
+}
+
 // Signal handler setup (platform-specific)
 #[cfg(target_os = "android")]
 extern "C" fn signal_handler(_sig: i32) {
@@ -410,6 +426,7 @@ extern "C" {
         type_: u32,
         pixels: *mut c_void,
     );
+    fn glPixelStorei(pname: u32, param: i32);
 }
 
 #[link(name = "EGL")]
@@ -459,6 +476,7 @@ extern "C" {
 const GL_TEXTURE_2D: u32 = 0x0DE1;
 const GL_RGBA: u32 = 0x1908;
 const GL_UNSIGNED_BYTE: u32 = 0x1401;
+const GL_HALF_FLOAT: u32 = 0x140B;
 const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
 const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
 const GL_TEXTURE_WRAP_S: u32 = 0x2802;
@@ -467,6 +485,7 @@ const GL_LINEAR: i32 = 0x2601;
 const GL_CLAMP_TO_EDGE: i32 = 0x812F;
 const GL_RG: u32 = 0x8227;
 const GL_RGBA8: i32 = 0x8058;
+const GL_RGBA16F: i32 = 0x881A;
 const GL_RG32F: i32 = 0x8230;
 const GL_COLOR_BUFFER_BIT: u32 = 0x0000_4000;
 const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
@@ -478,6 +497,7 @@ const GL_VENDOR: u32 = 0x1F00;
 const GL_RENDERER: u32 = 0x1F01;
 const GL_VERSION: u32 = 0x1F02;
 const GL_SCISSOR_TEST: u32 = 0x0C11;
+const GL_PACK_ALIGNMENT: u32 = 0x0D05;
 const GL_TRUE_BOOLEAN: u8 = 1;
 const PIMAX_LAYER_FLAGS: i32 = 2; // sxrLayerFlags::kLayerFlagOpaque.
 const PIMAX_BEGIN_OPTION_FLAGS: i32 = 0;
@@ -490,20 +510,29 @@ const PIMAX_USE_NATIVE_VSYNC_PUMP: bool = false;
 // Let PxrApi own the service binding and VR-mode lifecycle. Manually creating
 // a second PvrServiceClient produced duplicate "now existing 2 vr client" state
 // on Crystal OG and left cleanup vulnerable to double-unbind Java exceptions.
+// Use PxrApi to manage VR mode internally - do not create PvrServiceClient explicitly
+// to avoid native library loading issues with PvrServiceClient.OnServiceCallback
 const PIMAX_USE_EXPLICIT_PVR_SERVICE_CLIENT: bool = false;
 const PIMAX_EGL_PROTECTED_PREFERENCE: [bool; 1] = [false];
 const PIMAX_FRAME_MIN_VSYNCS: i32 = 0;
-const PIMAX_EYE_BUFFER_PAIR_COUNT: usize = 4;
-const PIMAX_EYE_RENDER_SCALE: f32 = 1.25;
+// Keep more submitted eye textures alive so the Pimax compositor has a wider
+// in-flight history before we recycle a texture ID.
+const PIMAX_EYE_BUFFER_PAIR_COUNT: usize = 8;
+pub const PIMAX_EYE_RENDER_SCALE_DEFAULT: f32 = 1.0;
 const PIMAX_HIDE_SYSTEM_UI_EVERY_N_FRAMES: i32 = 120;
 const PIMAX_UV_MAP_SAMPLES: i32 = 50;
 const PIMAX_ENABLE_UV_MAP_HACK: bool = false;
-const PIMAX_CONFIGURE_TEXTURE_METADATA: bool = false;
-const PIMAX_RENDER_DIAGNOSTIC_PATTERN: bool = true;
-const PIMAX_ANIMATE_DIAGNOSTIC_PATTERN: bool = true;
+const PIMAX_CONFIGURE_TEXTURE_METADATA: bool = true;
+const PIMAX_RENDER_DIAGNOSTIC_PATTERN: bool = false;
+const PIMAX_ANIMATE_DIAGNOSTIC_PATTERN: bool = false;
+const PIMAX_DUMP_SUBMITTED_EYE_FRAMES: bool = true;
+const PIMAX_DUMP_SUBMITTED_EYE_FRAME_LIMIT: u32 = 124;
 const PIMAX_RENDER_WINDOW_SURFACE_MIRROR: bool = false;
 const PIMAX_BOOTSTRAP_WITH_ROTATION_ONLY: bool = true;
 const PIMAX_PROMOTE_TO_POSITIONAL_TRACKING: bool = false;
+// Keep probe() focused on entering the VR frame loop. Several report-only JNI
+// queries have been observed to stall the app on its loading surface.
+const PIMAX_SKIP_BLOCKING_STARTUP_REPORT_QUERIES: bool = true;
 const TRACKING_MODE_ROTATION: i32 = 1;
 const TRACKING_MODE_POSITION: i32 = 2;
 const TRACKING_MODE_ROTATION_POSITION: i32 = TRACKING_MODE_ROTATION | TRACKING_MODE_POSITION;
@@ -3316,6 +3345,7 @@ pub(crate) struct EyeRenderTarget {
     pub framebuffer: u32,
     pub width: i32,
     pub height: i32,
+    pub is_hdr: bool,
     egl_image: Option<EGLImageKHR>,
     egl_client_buffer: Option<EGLClientBuffer>,
     hardware_buffer: Option<HardwareBufferRef>,
@@ -3897,9 +3927,74 @@ fn create_hardware_buffer_eye_render_target(width: i32, height: i32) -> Result<E
         framebuffer,
         width: width as i32,
         height: height as i32,
+        is_hdr: false,
         egl_image: Some(egl_image),
         egl_client_buffer: Some(client_buffer),
         hardware_buffer: Some(hardware_buffer),
+    })
+}
+
+fn create_gl_eye_render_target(width: i32, height: i32, is_hdr: bool) -> Result<EyeRenderTarget> {
+    let width = width.max(1);
+    let height = height.max(1);
+    let (internal_format, data_type, label) = if is_hdr {
+        (GL_RGBA16F, GL_HALF_FLOAT, "RGBA16F")
+    } else {
+        (GL_RGBA8, GL_UNSIGNED_BYTE, "RGBA8")
+    };
+
+    let mut texture = 0_u32;
+    let mut framebuffer = 0_u32;
+
+    unsafe {
+        glGenTextures(1, &mut texture as *mut u32);
+        glBindTexture(GL_TEXTURE_2D, texture);
+        // The Pimax compositor samples these submitted eye textures directly.
+        // Use linear filtering so panel upscaling does not look blocky.
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(
+            GL_TEXTURE_2D,
+            0,
+            internal_format,
+            width,
+            height,
+            0,
+            GL_RGBA,
+            data_type,
+            ptr::null(),
+        );
+
+        glGenFramebuffers(1, &mut framebuffer as *mut u32);
+        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+        glFramebufferTexture2D(
+            GL_FRAMEBUFFER,
+            GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_2D,
+            texture,
+            0,
+        );
+        let status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        if status != GL_FRAMEBUFFER_COMPLETE {
+            glDeleteFramebuffers(1, &framebuffer as *const u32);
+            glDeleteTextures(1, &texture as *const u32);
+            bail!("{label} GL framebuffer incomplete for eye target: status=0x{status:04x} tex={texture} fb={framebuffer}");
+        }
+    }
+
+    Ok(EyeRenderTarget {
+        texture,
+        framebuffer,
+        width,
+        height,
+        is_hdr,
+        egl_image: None,
+        egl_client_buffer: None,
+        hardware_buffer: None,
     })
 }
 
@@ -3910,6 +4005,7 @@ fn use_hardware_buffer_eye_targets() -> bool {
 fn create_eye_render_target(width: i32, height: i32) -> Result<EyeRenderTarget> {
     let width = width.max(1);
     let height = height.max(1);
+    let is_hdr = crate::video_receiver::hdr_stream_enabled();
     if use_hardware_buffer_eye_targets() {
         match create_hardware_buffer_eye_render_target(width, height) {
             Ok(target) => {
@@ -3927,61 +4023,19 @@ fn create_eye_render_target(width: i32, height: i32) -> Result<EyeRenderTarget> 
         }
     } else {
         info!(
-            "using plain GL eye textures because submission path is {PIMAX_SUBMITTED_TEXTURE_TYPE} via {PIMAX_SUBMITTED_HANDLE_KIND_LABEL}",
+            "using plain GL eye textures because submission path is {PIMAX_SUBMITTED_TEXTURE_TYPE} via {PIMAX_SUBMITTED_HANDLE_KIND_LABEL} hdr={is_hdr}",
         );
     }
-    let mut texture = 0_u32;
-    let mut framebuffer = 0_u32;
-
-    unsafe {
-        glGenTextures(1, &mut texture as *mut u32);
-        glBindTexture(GL_TEXTURE_2D, texture);
-        // The Pimax compositor samples these submitted eye textures directly.
-        // Use linear filtering so panel upscaling does not look blocky.
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(
-            GL_TEXTURE_2D,
-            0,
-            GL_RGBA8,
-            width,
-            height,
-            0,
-            GL_RGBA,
-            GL_UNSIGNED_BYTE,
-            ptr::null(),
-        );
-
-        glGenFramebuffers(1, &mut framebuffer as *mut u32);
-        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
-        glFramebufferTexture2D(
-            GL_FRAMEBUFFER,
-            GL_COLOR_ATTACHMENT0,
-            GL_TEXTURE_2D,
-            texture,
-            0,
-        );
-        let status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glBindTexture(GL_TEXTURE_2D, 0);
-        if status != GL_FRAMEBUFFER_COMPLETE {
-            anyhow::bail!(
-                "GL framebuffer incomplete for eye target: status=0x{status:04x} tex={texture} fb={framebuffer}"
+    match create_gl_eye_render_target(width, height, is_hdr) {
+        Ok(target) => Ok(target),
+        Err(err) if is_hdr => {
+            warn!(
+                "HDR eye target unavailable, falling back to RGBA8 eye textures: {err:#}"
             );
+            create_gl_eye_render_target(width, height, false)
         }
+        Err(err) => Err(err),
     }
-
-    Ok(EyeRenderTarget {
-        texture,
-        framebuffer,
-        width,
-        height,
-        egl_image: None,
-        egl_client_buffer: None,
-        hardware_buffer: None,
-    })
 }
 
 fn submitted_image_handle(target: &EyeRenderTarget) -> Result<i32> {
@@ -4013,11 +4067,12 @@ fn configure_texture_layer_info<'local>(
     layer: &JObject<'local>,
     width: i32,
     height: i32,
+    is_hdr: bool,
     label: &str,
 ) -> Result<()> {
     let width = width.max(1);
     let height = height.max(1);
-    let bytes_per_pixel = 4;
+    let bytes_per_pixel = if is_hdr { 8 } else { 4 };
     let mem_size = width.saturating_mul(height).saturating_mul(bytes_per_pixel);
     let vulkan_info = get_object_field(
         env,
@@ -4441,6 +4496,80 @@ fn readback_eye_luma_stats(target: &EyeRenderTarget) -> EyeLumaStats {
     }
 }
 
+fn dump_eye_frame_jpeg(
+    target: &EyeRenderTarget,
+    eye: VideoFrameEye,
+    frame_index: u32,
+) -> Result<()> {
+    if !PIMAX_DUMP_SUBMITTED_EYE_FRAMES || frame_index >= PIMAX_DUMP_SUBMITTED_EYE_FRAME_LIMIT {
+        return Ok(());
+    }
+
+    if frame_index < PIMAX_DUMP_FRAME_START {
+        return Ok(());
+    }
+
+    let dump_dir =
+        PathBuf::from("/sdcard/Android/data/com.pimax.alvr.client/files/PimaxALVR/frame-dumps");
+    fs::create_dir_all(&dump_dir)
+        .with_context(|| format!("create framebuffer dump dir {}", dump_dir.display()))?;
+
+    let eye_label = match eye {
+        VideoFrameEye::Left => "left",
+        VideoFrameEye::Right => "right",
+    };
+    let path = dump_dir.join(format!(
+        "submitted-frame-{frame_index:05}-{eye_label}-{}x{}.jpg",
+        target.width, target.height
+    ));
+
+    let width = target.width.max(0) as usize;
+    let height = target.height.max(0) as usize;
+    let mut pixels = vec![0_u8; width.saturating_mul(height).saturating_mul(4)];
+
+    unsafe {
+        let previous_framebuffer = current_framebuffer_binding().max(0) as u32;
+        glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(
+            0,
+            0,
+            target.width,
+            target.height,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            pixels.as_mut_ptr().cast(),
+        );
+        glBindFramebuffer(GL_FRAMEBUFFER, previous_framebuffer);
+    }
+
+    let file = File::create(&path).with_context(|| format!("create {}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    let mut rgb = Vec::with_capacity(width.saturating_mul(height).saturating_mul(3));
+    for pixel in pixels.chunks_exact(4) {
+        rgb.extend_from_slice(&pixel[..3]);
+    }
+    let encoder = JpegEncoder::new_with_quality(&mut writer, 90);
+    encoder
+        .write_image(
+            &rgb,
+            target.width as u32,
+            target.height as u32,
+            ColorType::Rgb8.into(),
+        )
+        .with_context(|| format!("encode {} as jpeg", path.display()))?;
+    writer
+        .flush()
+        .with_context(|| format!("flush {}", path.display()))?;
+
+    info!(
+        "dumped submitted {:?} eye framebuffer to {}",
+        eye,
+        path.display()
+    );
+    Ok(())
+}
+
 fn current_framebuffer_binding() -> i32 {
     let mut framebuffer = 0_i32;
     unsafe {
@@ -4458,7 +4587,7 @@ fn duration_ms(duration: Duration) -> f64 {
 }
 
 fn scaled_eye_dimension(dimension: i32) -> i32 {
-    let scale = PIMAX_EYE_RENDER_SCALE.max(0.01);
+    let scale = crate::tune::eye_render_scale().max(0.01);
     ((dimension.max(1) as f32 * scale).round() as i32).max(1)
 }
 
@@ -4702,14 +4831,10 @@ fn try_begin_and_submit_frame<'local>(
     info!("requested NativeActivity headset window flags");
     let display_wake_lock = match create_display_wake_lock(env, context) {
         Ok(wake_lock) => {
-            if is_headset_near() {
-                if let Err(err) = acquire_display_wake_lock(env, &wake_lock) {
-                    warn!("failed to acquire display wake lock: {err:#}");
-                } else {
-                    info!("acquired display wake lock for headset session");
-                }
+            if let Err(err) = acquire_display_wake_lock(env, &wake_lock) {
+                warn!("failed to acquire display wake lock: {err:#}");
             } else {
-                info!("created display wake lock but left it released until headset is worn");
+                info!("acquired display wake lock for headset session");
             }
             Some(wake_lock)
         }
@@ -4730,33 +4855,13 @@ fn try_begin_and_submit_frame<'local>(
         ),
     }
 
+    // VR mode has already been started in probe() before sxrInitialize(),
+    // so we only need to ensure the service interface is connected here.
     if let Some(client) = pvr_service_client {
-        match wait_for_pvr_service_interface(env, client, Duration::from_secs(3)) {
-            Ok(()) => info!("PvrServiceClient connected to com.pimax.vrservice"),
-            Err(err) => {
-                warn!("PvrServiceClient connection did not come up before XR begin: {err:#}")
-            }
-        }
-
-        // Crystal OG is sensitive to runtime ordering. For standalone launch,
-        // we need to start a fresh VR mode. When connected to Airlink, ResumeVRMode
-        // attaches to the existing session created by the PC.
-        match pvr_service_start_vr_mode(env, client) {
-            Ok(()) => info!("PvrServiceClient.StartVRMode() succeeded"),
-            Err(err) => {
-                warn!("PvrServiceClient.StartVRMode() failed (will try resume): {err:#}");
-                // Fall back to resume if start fails (e.g., when connected to Airlink)
-                match pvr_service_resume_vr_mode(env, client) {
-                    Ok(result) => info!("PvrServiceClient.ResumeVRMode() -> {result}"),
-                    Err(err) => warn!("PvrServiceClient.ResumeVRMode() also failed: {err:#}"),
-                }
-            }
-        }
-        for ui_type in ["vr_first_frame_ready", "6dofWarning_low_quality"] {
-            match pvr_service_hide_system_ui(env, client, ui_type) {
-                Ok(()) => info!("requested early PvrServiceClient.HideSystemUI({ui_type})"),
-                Err(err) => warn!("early PvrServiceClient.HideSystemUI({ui_type}) failed: {err:#}"),
-            }
+        if let Err(err) = wait_for_pvr_service_interface(env, client, Duration::from_secs(3)) {
+            warn!("PvrServiceClient connection did not come up before XR begin: {err:#}")
+        } else {
+            info!("PvrServiceClient connected to com.pimax.vrservice");
         }
     }
 
@@ -5137,11 +5242,15 @@ fn try_begin_and_submit_frame<'local>(
         info!("UV-map companion texture hack disabled for this run");
         None
     };
-    let render_eye_width = scaled_eye_dimension(eye_width);
-    let render_eye_height = scaled_eye_dimension(eye_height);
+    let mut render_eye_width = scaled_eye_dimension(eye_width);
+    let mut render_eye_height = scaled_eye_dimension(eye_height);
     info!(
         "Pimax eye render scale experiment: device_eye={}x{} render_eye={}x{} scale={}",
-        eye_width, eye_height, render_eye_width, render_eye_height, PIMAX_EYE_RENDER_SCALE
+        eye_width,
+        eye_height,
+        render_eye_width,
+        render_eye_height,
+        crate::tune::eye_render_scale()
     );
     let mut eye_buffers = Vec::new();
     for pair_index in 0..PIMAX_EYE_BUFFER_PAIR_COUNT {
@@ -5163,6 +5272,10 @@ fn try_begin_and_submit_frame<'local>(
     if let Some(first_pair) = eye_buffers.first() {
         log_submission_handle_strategy(first_pair);
     }
+    let hdr_eye_targets = eye_buffers
+        .first()
+        .map(|pair| pair.left.is_hdr)
+        .unwrap_or(false);
     let mut diagnostic_pattern_state = None;
     if PIMAX_RENDER_DIAGNOSTIC_PATTERN {
         let left_pattern = make_diagnostic_eye_pattern(render_eye_width, render_eye_height, true);
@@ -5216,6 +5329,7 @@ fn try_begin_and_submit_frame<'local>(
             &left_layer,
             render_eye_width,
             render_eye_height,
+            hdr_eye_targets,
             "left",
         )?;
     } else {
@@ -5271,6 +5385,7 @@ fn try_begin_and_submit_frame<'local>(
             &right_layer,
             render_eye_width,
             render_eye_height,
+            hdr_eye_targets,
             "right",
         )?;
     } else {
@@ -5336,6 +5451,65 @@ fn try_begin_and_submit_frame<'local>(
         if is_shutdown_requested() {
             info!("Pimax render loop exiting after shutdown request at frame {frame_index}");
             break;
+        }
+        let hdr_enabled = crate::video_receiver::hdr_stream_enabled();
+        let desired_render_eye_width = scaled_eye_dimension(eye_width);
+        let desired_render_eye_height = scaled_eye_dimension(eye_height);
+        let eye_targets_hdr = eye_buffers
+            .first()
+            .map(|pair| pair.left.is_hdr)
+            .unwrap_or(false);
+        if eye_targets_hdr != hdr_enabled
+            || render_eye_width != desired_render_eye_width
+            || render_eye_height != desired_render_eye_height
+        {
+            render_eye_width = desired_render_eye_width;
+            render_eye_height = desired_render_eye_height;
+            info!("rebuilding eye render targets for hdr={hdr_enabled} scale={}", crate::tune::eye_render_scale());
+            eye_buffers.clear();
+            for pair_index in 0..PIMAX_EYE_BUFFER_PAIR_COUNT {
+                let left = create_eye_render_target(render_eye_width, render_eye_height)
+                    .with_context(|| format!("recreate left eye render target {pair_index}"))?;
+                let right = create_eye_render_target(render_eye_width, render_eye_height)
+                    .with_context(|| format!("recreate right eye render target {pair_index}"))?;
+                info!(
+                    "recreated eye render target pair {pair_index}: left(tex={}, fb={}) right(tex={}, fb={}) size={}x{} hdr={}",
+                    left.texture,
+                    left.framebuffer,
+                    right.texture,
+                    right.framebuffer,
+                    render_eye_width,
+                    render_eye_height,
+                    hdr_enabled,
+                );
+                eye_buffers.push(EyeBufferPair { left, right });
+            }
+            if let Some(first_pair) = eye_buffers.first() {
+                log_submission_handle_strategy(first_pair);
+            }
+            if PIMAX_CONFIGURE_TEXTURE_METADATA {
+                configure_texture_layer_info(
+                    env,
+                    &left_layer,
+                    render_eye_width,
+                    render_eye_height,
+                    hdr_enabled,
+                    "left",
+                )?;
+                configure_texture_layer_info(
+                    env,
+                    &right_layer,
+                    render_eye_width,
+                    render_eye_height,
+                    hdr_enabled,
+                    "right",
+                )?;
+            }
+            last_video_timestamps_by_slot = vec![None::<u64>; eye_buffers.len()];
+            if let Some(state) = diagnostic_pattern_state.as_mut() {
+                state.last_marker_rects = vec![None; eye_buffers.len()];
+            }
+            continue;
         }
         if take_presentation_refresh_requested() {
             if is_headset_near() {
@@ -5491,94 +5665,134 @@ fn try_begin_and_submit_frame<'local>(
             [32, 180, 255, 255]
         };
         let phase_start = Instant::now();
-        if let Some(video_frame) = crate::video_receiver::get_latest_frame(video_receiver.as_ref())
+
+        // Try upstream zero-copy decoder first
+        let mut upstream_frame_rendered = false;
+        if let Some((timestamp_ns, buffer_ptr)) =
+            crate::android_video_decoder::poll_upstream_frame()
         {
-            if last_video_timestamps_by_slot[slot_index] != Some(video_frame.timestamp_ns) {
-                crate::client::report_alvr_compositor_start(Duration::from_nanos(
-                    video_frame.timestamp_ns,
-                ));
-                crate::video_receiver::copy_video_frame_to_target(
+            if last_video_timestamps_by_slot[slot_index] != Some(timestamp_ns) {
+                crate::client::report_alvr_compositor_start(Duration::from_nanos(timestamp_ns));
+                if let Err(err) = crate::video_receiver::render_ahardwarebuffer_zero_copy(
                     &current_buffers.left,
-                    &video_frame,
-                    crate::video_receiver::VideoFrameEye::Left,
-                )
-                .with_context(|| {
-                    format!("copy live video frame to left eye for frame {frame_index}")
-                })?;
-                crate::video_receiver::copy_video_frame_to_target(
                     &current_buffers.right,
-                    &video_frame,
-                    crate::video_receiver::VideoFrameEye::Right,
-                )
-                .with_context(|| {
-                    format!("copy live video frame to right eye for frame {frame_index}")
-                })?;
-                last_video_timestamps_by_slot[slot_index] = Some(video_frame.timestamp_ns);
-                submitted_video_timestamp = Some(video_frame.timestamp_ns);
-                live_video_frame_count = live_video_frame_count.wrapping_add(1);
-                if live_video_frame_count <= 5 || live_video_frame_count % 120 == 0 {
-                    info!(
-                        "uploaded live video frame {} to eye textures: source={}x{} timestamp_ns={} render_frame={frame_index} slot={slot_index}",
-                        live_video_frame_count,
-                        video_frame.width,
-                        video_frame.height,
-                        video_frame.timestamp_ns
+                    buffer_ptr,
+                    timestamp_ns,
+                ) {
+                    warn!(
+                        "zero-copy AHardwareBuffer render failed for frame {frame_index}, falling back: {err:#}"
                     );
+                } else {
+                    last_video_timestamps_by_slot[slot_index] = Some(timestamp_ns);
+                    submitted_video_timestamp = Some(timestamp_ns);
+                    live_video_frame_count = live_video_frame_count.wrapping_add(1);
+                    upstream_frame_rendered = true;
+                    if live_video_frame_count <= 5 || live_video_frame_count % 120 == 0 {
+                        info!(
+                            "rendered upstream zero-copy frame {}: timestamp_ns={} render_frame={frame_index} slot={slot_index}",
+                            live_video_frame_count, timestamp_ns
+                        );
+                    }
                 }
             }
-        } else if PIMAX_RENDER_DIAGNOSTIC_PATTERN {
-            // Force diagnostic pattern when enabled
-            if let Some(diagnostic_state) = diagnostic_pattern_state.as_mut() {
-                if PIMAX_ANIMATE_DIAGNOSTIC_PATTERN {
-                    update_diagnostic_pattern_marker(
-                        diagnostic_state,
-                        current_buffers,
-                        slot_index,
-                        frame_index,
+        }
+
+        // Fallback to legacy CPU-path decoder
+        if !upstream_frame_rendered {
+            if let Some(video_frame) =
+                crate::video_receiver::get_latest_frame(video_receiver.as_ref())
+            {
+                if last_video_timestamps_by_slot[slot_index] != Some(video_frame.timestamp_ns) {
+                    crate::client::report_alvr_compositor_start(Duration::from_nanos(
+                        video_frame.timestamp_ns,
+                    ));
+                    crate::video_receiver::copy_video_frame_to_target(
+                        &current_buffers.left,
+                        &video_frame,
+                        crate::video_receiver::VideoFrameEye::Left,
                     )
                     .with_context(|| {
-                        format!("update diagnostic pattern marker for frame {frame_index}")
+                        format!("copy live video frame to left eye for frame {frame_index}")
                     })?;
+                    crate::video_receiver::copy_video_frame_to_target(
+                        &current_buffers.right,
+                        &video_frame,
+                        crate::video_receiver::VideoFrameEye::Right,
+                    )
+                    .with_context(|| {
+                        format!("copy live video frame to right eye for frame {frame_index}")
+                    })?;
+                    last_video_timestamps_by_slot[slot_index] = Some(video_frame.timestamp_ns);
+                    submitted_video_timestamp = Some(video_frame.timestamp_ns);
+                    live_video_frame_count = live_video_frame_count.wrapping_add(1);
+                    if live_video_frame_count <= 5 || live_video_frame_count % 120 == 0 {
+                        info!(
+                            "uploaded live video frame {} to eye textures: source={}x{} timestamp_ns={} render_frame={frame_index} slot={slot_index}",
+                            live_video_frame_count,
+                            video_frame.width,
+                            video_frame.height,
+                            video_frame.timestamp_ns
+                        );
+                    }
                 }
+            } else if PIMAX_RENDER_DIAGNOSTIC_PATTERN {
+                // Force diagnostic pattern when enabled
+                if let Some(diagnostic_state) = diagnostic_pattern_state.as_mut() {
+                    if PIMAX_ANIMATE_DIAGNOSTIC_PATTERN {
+                        update_diagnostic_pattern_marker(
+                            diagnostic_state,
+                            current_buffers,
+                            slot_index,
+                            frame_index,
+                        )
+                        .with_context(|| {
+                            format!("update diagnostic pattern marker for frame {frame_index}")
+                        })?;
+                    }
+                }
+            } else if live_video_frame_count > 0 {
+                // Preserve the last submitted video in this ring-buffer slot
+                // across transient decoder/network gaps instead of flashing
+                // the startup clear colors over the live stream.
+            } else if PIMAX_USE_EXPLICIT_EYE_RENDER_CALLS {
+                call_static_void(
+                    env,
+                    "com/pimax/pxrapi/PxrApi",
+                    "sxrBeginEye",
+                    "(Lcom/pimax/pxrapi/PxrApi$sxrWhichEye;)V",
+                    &[JValue::Object(&left_eye)],
+                )
+                .with_context(|| format!("begin left eye for frame {frame_index}"))?;
+                render_target_clear(&current_buffers.left, left_color);
+                call_static_void(
+                    env,
+                    "com/pimax/pxrapi/PxrApi",
+                    "sxrEndEye",
+                    "(Lcom/pimax/pxrapi/PxrApi$sxrWhichEye;)V",
+                    &[JValue::Object(&left_eye)],
+                )
+                .with_context(|| format!("end left eye for frame {frame_index}"))?;
+                call_static_void(
+                    env,
+                    "com/pimax/pxrapi/PxrApi",
+                    "sxrBeginEye",
+                    "(Lcom/pimax/pxrapi/PxrApi$sxrWhichEye;)V",
+                    &[JValue::Object(&right_eye)],
+                )
+                .with_context(|| format!("begin right eye for frame {frame_index}"))?;
+                render_target_clear(&current_buffers.right, right_color);
+                call_static_void(
+                    env,
+                    "com/pimax/pxrapi/PxrApi",
+                    "sxrEndEye",
+                    "(Lcom/pimax/pxrapi/PxrApi$sxrWhichEye;)V",
+                    &[JValue::Object(&right_eye)],
+                )
+                .with_context(|| format!("end right eye for frame {frame_index}"))?;
+            } else {
+                render_target_clear(&current_buffers.left, left_color);
+                render_target_clear(&current_buffers.right, right_color);
             }
-        } else if PIMAX_USE_EXPLICIT_EYE_RENDER_CALLS {
-            call_static_void(
-                env,
-                "com/pimax/pxrapi/PxrApi",
-                "sxrBeginEye",
-                "(Lcom/pimax/pxrapi/PxrApi$sxrWhichEye;)V",
-                &[JValue::Object(&left_eye)],
-            )
-            .with_context(|| format!("begin left eye for frame {frame_index}"))?;
-            render_target_clear(&current_buffers.left, left_color);
-            call_static_void(
-                env,
-                "com/pimax/pxrapi/PxrApi",
-                "sxrEndEye",
-                "(Lcom/pimax/pxrapi/PxrApi$sxrWhichEye;)V",
-                &[JValue::Object(&left_eye)],
-            )
-            .with_context(|| format!("end left eye for frame {frame_index}"))?;
-            call_static_void(
-                env,
-                "com/pimax/pxrapi/PxrApi",
-                "sxrBeginEye",
-                "(Lcom/pimax/pxrapi/PxrApi$sxrWhichEye;)V",
-                &[JValue::Object(&right_eye)],
-            )
-            .with_context(|| format!("begin right eye for frame {frame_index}"))?;
-            render_target_clear(&current_buffers.right, right_color);
-            call_static_void(
-                env,
-                "com/pimax/pxrapi/PxrApi",
-                "sxrEndEye",
-                "(Lcom/pimax/pxrapi/PxrApi$sxrWhichEye;)V",
-                &[JValue::Object(&right_eye)],
-            )
-            .with_context(|| format!("end right eye for frame {frame_index}"))?;
-        } else {
-            render_target_clear(&current_buffers.left, left_color);
-            render_target_clear(&current_buffers.right, right_color);
         }
         render_ms = duration_ms(phase_start.elapsed());
 
@@ -5604,6 +5818,24 @@ fn try_begin_and_submit_frame<'local>(
             }
         }
         finish_ms = duration_ms(phase_start.elapsed());
+
+        if let Err(err) = dump_eye_frame_jpeg(
+            &current_buffers.left,
+            VideoFrameEye::Left,
+            frame_index.max(0) as u32,
+        ) {
+            warn!("failed to dump submitted left eye framebuffer for frame {frame_index}: {err:#}");
+        }
+        if let Err(err) = dump_eye_frame_jpeg(
+            &current_buffers.right,
+            VideoFrameEye::Right,
+            frame_index.max(0) as u32,
+        ) {
+            warn!(
+                "failed to dump submitted right eye framebuffer for frame {frame_index}: {err:#}"
+            );
+        }
+
         let phase_start = Instant::now();
         call_static_void(
             env,
@@ -5672,37 +5904,31 @@ fn try_begin_and_submit_frame<'local>(
         }
 
         if frame_index >= 0 && frame_index % 30 == 0 {
-            if !is_headset_near() {
-                if let Some(wake_lock) = display_wake_lock.as_ref() {
-                    if let Err(err) = release_display_wake_lock(env, wake_lock) {
-                        warn!("failed to release display wake lock while off-head: {err:#}");
-                    } else if frame_index % 720 == 0 {
-                        info!(
-                            "display wake lock remains released while headset proximity is far at frame {frame_index}"
-                        );
-                    }
-                }
-            } else {
-                match is_power_interactive(env, context) {
-                    Ok(true) => {
-                        if frame_index % 720 == 0 {
+            match is_power_interactive(env, context) {
+                Ok(true) => {
+                    if frame_index % 720 == 0 {
+                        if is_headset_near() {
                             info!("display power is still interactive at frame {frame_index}");
+                        } else {
+                            info!(
+                                "display wake lock is holding the panel interactive while headset proximity is far at frame {frame_index}"
+                            );
                         }
                     }
-                    Ok(false) => {
-                        warn!(
-                            "display power became non-interactive at frame {frame_index}; headset is near, re-acquiring wake lock"
-                        );
-                        if let Some(wake_lock) = display_wake_lock.as_ref() {
-                            if let Err(err) = acquire_display_wake_lock(env, wake_lock) {
-                                warn!("failed to reacquire display wake lock: {err:#}");
-                            }
-                        }
-                    }
-                    Err(err) => warn!(
-                        "failed to query display interactive state at frame {frame_index}: {err:#}"
-                    ),
                 }
+                Ok(false) => {
+                    warn!(
+                        "display power became non-interactive at frame {frame_index}; re-acquiring wake lock"
+                    );
+                    if let Some(wake_lock) = display_wake_lock.as_ref() {
+                        if let Err(err) = acquire_display_wake_lock(env, wake_lock) {
+                            warn!("failed to reacquire display wake lock: {err:#}");
+                        }
+                    }
+                }
+                Err(err) => warn!(
+                    "failed to query display interactive state at frame {frame_index}: {err:#}"
+                ),
             }
         }
         if frame_index > 0 && frame_index % PIMAX_HIDE_SYSTEM_UI_EVERY_N_FRAMES == 0 {
@@ -5794,6 +6020,11 @@ pub fn probe() -> PimaxProbeReport {
 
     info!("probing Pimax XR runtime via com.pimax.pxrapi.PxrApi");
 
+    // Note: We no longer explicitly load pxrapi library here because:
+    // 1. PxrApi class static initializer should load libpxrapi.so automatically
+    // 2. PvrServiceClient also depends on libpxrapi.so - the Java library should
+    //    handle its own dependencies via System.loadLibrary() in its static block
+
     let application_context = match get_application_context(&mut env, &context) {
         Ok(application_context) => {
             info!("using application context for PxrApi service lifecycle calls");
@@ -5805,6 +6036,56 @@ pub fn probe() -> PimaxProbeReport {
         }
     };
     let pxr_context = application_context.as_ref().unwrap_or(&context);
+
+    // Create PvrServiceClient and start VR mode BEFORE sxrInitialize()
+    // This ensures VR mode is active when sxrBeginXr() is called
+    let pvr_service_client = if PIMAX_USE_EXPLICIT_PVR_SERVICE_CLIENT {
+        match create_pvr_service_client(&mut env, &pxr_context) {
+            Ok(client) => {
+                if let Err(err) = connect_pvr_service_client(&mut env, &client) {
+                    warn!("PvrServiceClient.Connect failed: {err:#}");
+                } else {
+                    info!("PvrServiceClient.Connect requested");
+                }
+                Some(client)
+            }
+            Err(err) => {
+                warn!("unable to construct PvrServiceClient: {err:#}");
+                None
+            }
+        }
+    } else {
+        info!("skipping explicit PvrServiceClient.Connect; PxrApi owns VR mode lifecycle");
+        None
+    };
+
+    // Start VR mode before sxrInitialize() to avoid Activity launch issues
+    if let Some(client) = &pvr_service_client {
+        // Wait for service interface to be ready
+        if let Err(err) = wait_for_pvr_service_interface(&mut env, client, Duration::from_secs(3)) {
+            warn!("PvrServiceClient connection did not come up: {err:#}");
+        }
+
+        // Start VR mode - this is the key fix: do it before sxrInitialize()
+        match pvr_service_start_vr_mode(&mut env, client) {
+            Ok(()) => info!("PvrServiceClient.StartVRMode() succeeded before sxrInitialize"),
+            Err(err) => {
+                warn!("PvrServiceClient.StartVRMode() failed: {err:#}");
+                // Fall back to resume if start fails
+                match pvr_service_resume_vr_mode(&mut env, client) {
+                    Ok(result) => info!("PvrServiceClient.ResumeVRMode() -> {result}"),
+                    Err(err) => warn!("PvrServiceClient.ResumeVRMode() also failed: {err:#}"),
+                }
+            }
+        }
+
+        // Hide system UI elements
+        for ui_type in ["vr_first_frame_ready", "6dofWarning_low_quality"] {
+            if let Err(err) = pvr_service_hide_system_ui(&mut env, client, ui_type) {
+                warn!("PvrServiceClient.HideSystemUI({ui_type}) failed: {err:#}");
+            }
+        }
+    }
 
     match set_vr_work_mode(&mut env, 1) {
         Ok(true) => info!("PiHalUtils.setVrWorkMode(1) succeeded during probe"),
@@ -5964,64 +6245,70 @@ pub fn probe() -> PimaxProbeReport {
         None
     };
 
-    report.pxr_version = call_static_string(
-        &mut env,
-        "com/pimax/pxrapi/PxrApi",
-        "sxrGetVersion",
-        "()Ljava/lang/String;",
-        &[],
-    )
-    .ok();
-    report.pxr_client_version = call_static_string(
-        &mut env,
-        "com/pimax/pxrapi/PxrApi",
-        "sxrGetXrClientVersion",
-        "()Ljava/lang/String;",
-        &[],
-    )
-    .ok();
-    report.pxr_service_version = call_static_string(
-        &mut env,
-        "com/pimax/pxrapi/PxrApi",
-        "sxrGetXrServiceVersion",
-        "()Ljava/lang/String;",
-        &[],
-    )
-    .ok();
+    if PIMAX_SKIP_BLOCKING_STARTUP_REPORT_QUERIES {
+        info!("skipping blocking Pimax startup report queries to reach VR mode faster");
+    } else {
+        report.pxr_version = call_static_string(
+            &mut env,
+            "com/pimax/pxrapi/PxrApi",
+            "sxrGetVersion",
+            "()Ljava/lang/String;",
+            &[],
+        )
+        .ok();
+        report.pxr_client_version = call_static_string(
+            &mut env,
+            "com/pimax/pxrapi/PxrApi",
+            "sxrGetXrClientVersion",
+            "()Ljava/lang/String;",
+            &[],
+        )
+        .ok();
+        report.pxr_service_version = call_static_string(
+            &mut env,
+            "com/pimax/pxrapi/PxrApi",
+            "sxrGetXrServiceVersion",
+            "()Ljava/lang/String;",
+            &[],
+        )
+        .ok();
 
-    report.supported_tracking_modes = call_static_int(
-        &mut env,
-        "com/pimax/pxrapi/PxrApi",
-        "sxrGetSupportedTrackingModes",
-        "()I",
-        &[],
-    )
-    .ok();
-    report.current_tracking_mode = call_static_int(
-        &mut env,
-        "com/pimax/pxrapi/PxrApi",
-        "sxrGetTrackingMode",
-        "()I",
-        &[],
-    )
-    .ok();
+        report.supported_tracking_modes = call_static_int(
+            &mut env,
+            "com/pimax/pxrapi/PxrApi",
+            "sxrGetSupportedTrackingModes",
+            "()I",
+            &[],
+        )
+        .ok();
+        report.current_tracking_mode = call_static_int(
+            &mut env,
+            "com/pimax/pxrapi/PxrApi",
+            "sxrGetTrackingMode",
+            "()I",
+            &[],
+        )
+        .ok();
 
-    if let Some(bits) = report.supported_tracking_modes {
-        info!(
-            "PxrApi supported tracking modes: {}",
-            format_tracking_modes(bits)
-        );
-    }
-    if let Some(mode) = report.current_tracking_mode {
-        info!(
-            "PxrApi current tracking mode: {}",
-            format_tracking_modes(mode)
-        );
-    }
-    if let Err(err) =
-        probe_pvr_controller_client(&mut env, pxr_context, default_controller_service.as_deref())
-    {
-        warn!("PvrServiceClient controller probe failed: {err:#}");
+        if let Some(bits) = report.supported_tracking_modes {
+            info!(
+                "PxrApi supported tracking modes: {}",
+                format_tracking_modes(bits)
+            );
+        }
+        if let Some(mode) = report.current_tracking_mode {
+            info!(
+                "PxrApi current tracking mode: {}",
+                format_tracking_modes(mode)
+            );
+        }
+        if let Err(err) = probe_pvr_controller_client(
+            &mut env,
+            pxr_context,
+            default_controller_service.as_deref(),
+        ) {
+            warn!("PvrServiceClient controller probe failed: {err:#}");
+        }
     }
 
     let bootstrap_tracking_mode = select_bootstrap_tracking_mode(report.supported_tracking_modes);
@@ -6030,14 +6317,16 @@ pub fn probe() -> PimaxProbeReport {
     match set_pimax_tracking_mode(&mut env, bootstrap_tracking_mode, "probe bootstrap") {
         Ok(()) => {
             report.set_tracking_mode_result = Some(bootstrap_tracking_mode);
-            report.current_tracking_mode_after_set = call_static_int(
-                &mut env,
-                "com/pimax/pxrapi/PxrApi",
-                "sxrGetTrackingMode",
-                "()I",
-                &[],
-            )
-            .ok();
+            if !PIMAX_SKIP_BLOCKING_STARTUP_REPORT_QUERIES {
+                report.current_tracking_mode_after_set = call_static_int(
+                    &mut env,
+                    "com/pimax/pxrapi/PxrApi",
+                    "sxrGetTrackingMode",
+                    "()I",
+                    &[],
+                )
+                .ok();
+            }
         }
         Err(err) => warn!(
             "failed to set bootstrap tracking mode {} during probe: {err:#}",
@@ -6056,32 +6345,34 @@ pub fn probe() -> PimaxProbeReport {
         );
     }
 
-    info!("probing Pimax service-level VR state via com.pimax.vrservice.PxrServiceApi");
+    if !PIMAX_SKIP_BLOCKING_STARTUP_REPORT_QUERIES {
+        info!("probing Pimax service-level VR state via com.pimax.vrservice.PxrServiceApi");
 
-    report.service_current_tracking_mode = call_static_int(
-        &mut env,
-        "com/pimax/vrservice/PxrServiceApi",
-        "GetCurrentTrackingMode",
-        "()I",
-        &[],
-    )
-    .ok();
-    report.service_supported_tracking_modes = call_static_int(
-        &mut env,
-        "com/pimax/vrservice/PxrServiceApi",
-        "GetSupportTrackingModes",
-        "()I",
-        &[],
-    )
-    .ok();
-    report.vr_mode = call_static_int(
-        &mut env,
-        "com/pimax/vrservice/PxrServiceApi",
-        "GetVRMode",
-        "()I",
-        &[],
-    )
-    .ok();
+        report.service_current_tracking_mode = call_static_int(
+            &mut env,
+            "com/pimax/vrservice/PxrServiceApi",
+            "GetCurrentTrackingMode",
+            "()I",
+            &[],
+        )
+        .ok();
+        report.service_supported_tracking_modes = call_static_int(
+            &mut env,
+            "com/pimax/vrservice/PxrServiceApi",
+            "GetSupportTrackingModes",
+            "()I",
+            &[],
+        )
+        .ok();
+        report.vr_mode = call_static_int(
+            &mut env,
+            "com/pimax/vrservice/PxrServiceApi",
+            "GetVRMode",
+            "()I",
+            &[],
+        )
+        .ok();
+    }
     let pvr_service_client = if PIMAX_USE_EXPLICIT_PVR_SERVICE_CLIENT {
         match create_pvr_service_client(&mut env, pxr_context) {
             Ok(client) => {

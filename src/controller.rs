@@ -417,8 +417,9 @@ mod tests {
             path_id: hash_string("/user/hand/left/input/x/click"),
             value: ButtonValue::Binary(true),
         };
-        let bytes = bincode::serialize(&entry).unwrap();
-        let decoded: ButtonEntry = bincode::deserialize(&bytes).unwrap();
+        let bytes = bincode::serde::encode_to_vec(&entry, bincode::config::standard()).unwrap();
+        let (decoded, _): (ButtonEntry, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
         assert_eq!(decoded.path_id, entry.path_id);
         match decoded.value {
             ButtonValue::Binary(v) => assert!(v),
@@ -432,8 +433,9 @@ mod tests {
             path_id: hash_string("/user/hand/right/input/trigger/value"),
             value: ButtonValue::Scalar(0.75),
         };
-        let bytes = bincode::serialize(&entry).unwrap();
-        let decoded: ButtonEntry = bincode::deserialize(&bytes).unwrap();
+        let bytes = bincode::serde::encode_to_vec(&entry, bincode::config::standard()).unwrap();
+        let (decoded, _): (ButtonEntry, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
         assert_eq!(decoded.path_id, entry.path_id);
         match decoded.value {
             ButtonValue::Scalar(v) => assert!((v - 0.75).abs() < f32::EPSILON),

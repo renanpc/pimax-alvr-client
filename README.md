@@ -22,6 +22,8 @@ A native Rust client for the Pimax Crystal OG standalone headset, implementing t
 | **Statistics** | ✅ | Report frame timing, dropped packets |
 | **KeepAlive** | ✅ | Periodic control packet exchange |
 | **IDR Requests** | ✅ | Request keyframes on decoder reconfiguration |
+| **Game Audio** | ✅ | Stream ALVR audio to headset output |
+| **Microphone Capture** | ✅ | Capture headset mic and forward to PC |
 
 ### Video Pipeline
 
@@ -39,6 +41,8 @@ A native Rust client for the Pimax Crystal OG standalone headset, implementing t
 |-----------|-------|-------------|
 | `convergence_shift_ndc` | 0.0 - 0.5 | Pre-shift to cancel Pimax warp (~0.124 default) |
 | `ipd_scale` | 0.0 - 2.0 | ALVR stereo strength (1.0 = full physical IPD) |
+| `fov_scale` | 0.8 - 1.2 | Fine-tune headset FOV for Pimax warp alignment |
+| `eye_render_scale` | 0.5 - 2.0 | Scale eye render targets for sharper/stabler output |
 | `color_black_crush` | 0.0 - 0.3 | BT.709 black level (0.072 default) |
 | `color_gain` | 0.5 - 2.0 | BT.709 contrast gain (1.22 default) |
 
@@ -99,7 +103,7 @@ Display (Pimax Crystal lenses)
 
 - **Guardian Boot Flow**: On first headset boot, Pimax Guardian takes focus. Complete the boundary setup once, then restart the app.
 - **Diagnostic Pattern**: When not connected, shows simple test pattern without convergence shift (convergence correction requires ALVR video path)
-- **Audio**: Not yet implemented (video-only streaming)
+- **Audio Routing**: Game audio and microphone capture are implemented, but PC-side virtual cable setup is still required
 
 ## Build
 
@@ -138,7 +142,9 @@ adb logcat -v time | findstr PimaxALVR
   "convergence_shift_ndc": 0.124,
   "ipd_scale": 1.0,
   "color_black_crush": 0.072,
-  "color_gain": 1.22
+  "color_gain": 1.22,
+  "fov_scale": 0.95,
+  "eye_render_scale": 1.0
 }
 ```
 
@@ -148,6 +154,7 @@ Open `http://<headset-ip>:7878/` in a browser on the same network to access:
 - Server IP configuration
 - Server discovery scan
 - Video tuning sliders
+- Stereo/FOV tuning sliders
 - Connection status
 
 ## Ports

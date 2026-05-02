@@ -25,10 +25,12 @@
 ///
 /// These mirror the values in `tune.rs` and are loaded at startup:
 ///
-/// - `convergence_shift_ndc`: Stereo convergence correction (default: 0.248)
+/// - `convergence_shift_ndc`: Stereo convergence correction (default: 0.124)
 /// - `ipd_scale`: IPD scale factor (default: 1.0)
+/// - `fov_scale`: FOV tangent scale factor (default: 0.95)
 /// - `color_black_crush`: Black level adjustment (default: 0.072)
 /// - `color_gain`: Contrast gain (default: 1.22)
+/// - `eye_render_scale`: Multiplier for the Pimax-reported target eye size
 /// - `controller_rotation_*_deg`: Live controller grip-pose calibration
 ///
 /// # Versioning
@@ -65,13 +67,13 @@ pub const ANDROID_PACKAGE_NAME: &str = "com.pimax.alvr.client";
 /// ALVR protocol version string.
 ///
 /// This must match the version expected by the ALVR server for successful handshake.
-/// Format: "YY.MM.PATCH" (e.g., "20.14.1")
+/// Format: "YY.MM.PATCH" (e.g., "20.14.1") or "X.Y.Z-prerelease" (e.g., "21.0.0-dev12")
 ///
 /// # Version Compatibility
 ///
 /// ALVR uses a protocol ID derived from the version string. If client and server
 /// versions don't match, the handshake may fail or features may be disabled.
-pub const ALVR_PROTOCOL_VERSION: &str = "20.14.1";
+pub const ALVR_PROTOCOL_VERSION: &str = "21.0.0-dev13";
 
 /// Client configuration structure.
 ///
@@ -131,7 +133,7 @@ pub struct ClientConfig {
     /// Convergence shift for stereo alignment.
     ///
     /// Corrects the Pimax headset's built-in divergent warp.
-    /// Range: 0.0 to 0.5 (typical: ~0.248)
+    /// Range: 0.0 to 0.5 (typical: ~0.124)
     ///
     /// See `tune.rs` for detailed explanation of the convergence shift mechanism.
     pub convergence_shift_ndc: Option<f32>,
@@ -143,6 +145,12 @@ pub struct ClientConfig {
     ///
     /// See `tune.rs` for detailed explanation of IPD blending.
     pub ipd_scale: Option<f32>,
+
+    /// FOV scale factor.
+    ///
+    /// Multiplies the Pimax-reported FOV tangents before ALVR negotiation.
+    /// Range: 0.8 to 1.2 (0.95 = current default)
+    pub fov_scale: Option<f32>,
 
     /// Color black crush adjustment.
     ///
@@ -159,6 +167,13 @@ pub struct ClientConfig {
     ///
     /// See `tune.rs` for detailed explanation of color correction.
     pub color_gain: Option<f32>,
+
+    /// Pimax eye render size scale.
+    ///
+    /// Multiplies the headset-reported `targetEyeWidthPixels`/`targetEyeHeightPixels`
+    /// before ALVR negotiation and eye-target allocation.
+    /// Range: 0.5 to 1.5 (typical: 1.0)
+    pub eye_render_scale: Option<f32>,
 
     /// Controller local X-axis rotation offset in degrees.
     ///
@@ -203,8 +218,10 @@ impl Default for ClientConfig {
                 crate::video_receiver::PIMAX_BLIT_CONVERGENCE_SHIFT_NDC_DEFAULT,
             ),
             ipd_scale: Some(crate::client::ALVR_IPD_SCALE_DEFAULT),
+            fov_scale: Some(crate::tune::FOV_SCALE_DEFAULT),
             color_black_crush: Some(crate::video_receiver::COLOR_BLACK_CRUSH_DEFAULT),
             color_gain: Some(crate::video_receiver::COLOR_GAIN_DEFAULT),
+            eye_render_scale: Some(crate::tune::EYE_RENDER_SCALE_DEFAULT),
             controller_rotation_x_deg: Some(crate::tune::CONTROLLER_ROTATION_X_DEG_DEFAULT),
             controller_rotation_y_deg: Some(crate::tune::CONTROLLER_ROTATION_Y_DEG_DEFAULT),
             controller_rotation_z_deg: Some(crate::tune::CONTROLLER_ROTATION_Z_DEG_DEFAULT),
