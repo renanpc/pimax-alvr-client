@@ -149,9 +149,12 @@ fn run_inner() -> Result<()> {
     crate::tune::init(
         crate::video_receiver::PIMAX_BLIT_CONVERGENCE_SHIFT_NDC_DEFAULT,
         crate::client::ALVR_IPD_SCALE_DEFAULT,
+        crate::tune::FOV_SCALE_DEFAULT,
         crate::video_receiver::COLOR_BLACK_CRUSH_DEFAULT,
         crate::video_receiver::COLOR_GAIN_DEFAULT,
+        crate::tune::EYE_RENDER_SCALE_DEFAULT,
     );
+    crate::audio::init();
 
     let config_path = config::default_config_path();
     let mut config = ClientConfig::load_or_create(&config_path)

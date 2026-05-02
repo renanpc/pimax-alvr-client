@@ -8,9 +8,19 @@ use glam::Vec3;
 pub const CONTROLLER_ROTATION_X_DEG_DEFAULT: f32 = 45.0;
 pub const CONTROLLER_ROTATION_Y_DEG_DEFAULT: f32 = 0.0;
 pub const CONTROLLER_ROTATION_Z_DEG_DEFAULT: f32 = 0.0;
+pub const EYE_RENDER_SCALE_DEFAULT: f32 = 1.0;
+pub const FOV_SCALE_DEFAULT: f32 = 0.95;
 
 pub fn ipd_scale() -> f32 {
     crate::client::ALVR_IPD_SCALE_DEFAULT
+}
+
+pub fn eye_render_scale() -> f32 {
+    EYE_RENDER_SCALE_DEFAULT
+}
+
+pub fn fov_scale() -> f32 {
+    FOV_SCALE_DEFAULT
 }
 
 pub fn controller_rotation_deg() -> Vec3 {

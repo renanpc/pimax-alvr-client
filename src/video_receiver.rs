@@ -32,7 +32,7 @@
 //!     ▼
 //! Pimax Compositor (sxrEndXr)
 //!     │
-//!     │ Applies divergent warp (~0.248 NDC per eye)
+//!     │ Applies divergent warp (~0.124 NDC per eye)
 //!     ▼
 //! Display (lenses)
 //! ```
@@ -49,8 +49,8 @@
 //! When ALVR sends properly converged stereo images, the Pimax warp causes double vision.
 //!
 //! **Solution**: Pre-shift each eye's blit output in the *opposite* direction:
-//! - Left eye: shift right by +0.248 NDC
-//! - Right eye: shift left by -0.248 NDC
+//! - Left eye: shift right by +0.124 NDC
+//! - Right eye: shift left by -0.124 NDC
 //!
 //! The Pimax compositor's warp then cancels this pre-shift, resulting in correct stereo.
 //!
@@ -123,15 +123,18 @@
 //! - `ipd_scale`: Stereo separation strength (default: 1.0)
 
 use std::ffi::{c_void, CString};
+use std::fs::{self, File};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use image::{codecs::jpeg::JpegEncoder, ColorType, ImageEncoder};
 use log::{info, warn};
 use ndk_sys as ffi;
 use parking_lot::Mutex;
@@ -152,6 +155,7 @@ const EGL_NONE: i32 = 0x3038;
 /// GL constants
 const GL_TEXTURE_2D: u32 = 0x0DE1;
 const GL_TEXTURE0: u32 = 0x84C0;
+const GL_TEXTURE1: u32 = 0x84C1;
 const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
 const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
 const GL_TEXTURE_WRAP_S: u32 = 0x2802;
@@ -166,11 +170,24 @@ const GL_COMPILE_STATUS: u32 = 0x8B81;
 const GL_LINK_STATUS: u32 = 0x8B82;
 const GL_INFO_LOG_LENGTH: u32 = 0x8B84;
 const GL_TRIANGLES: u32 = 0x0004;
+const GL_RED: u32 = 0x1903;
+const GL_RG: u32 = 0x8227;
+const GL_R8: u32 = 0x8229;
+const GL_RG8: u32 = 0x822B;
 const GL_RGBA: u32 = 0x1908;
+const GL_RGBA16F: i32 = 0x881A;
+const GL_UNPACK_ALIGNMENT: u32 = 0x0CF5;
+const GL_HALF_FLOAT: u32 = 0x140B;
 const GL_UNSIGNED_BYTE: u32 = 0x1401;
 const GL_TEXTURE_EXTERNAL_OES: u32 = 0x8D65;
 const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
 const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
+const GL_COLOR_BUFFER_BIT: u32 = 0x00004000;
+const GL_BLEND: u32 = 0x0BE2;
+const GL_CULL_FACE: u32 = 0x0B44;
+const GL_DEPTH_TEST: u32 = 0x0B71;
+const GL_SCISSOR_TEST: u32 = 0x0C11;
+const GL_TRUE_BOOLEAN: u8 = 1;
 
 /// EGL function types
 type EglGetNativeClientBufferAndroid = unsafe extern "C" fn(*const c_void) -> *mut c_void;
@@ -194,6 +211,53 @@ fn load_egl_proc<T: Copy>(name: &str) -> Result<T> {
     Ok(unsafe { std::mem::transmute_copy(&proc) })
 }
 
+fn get_egl_native_client_buffer() -> Result<EglGetNativeClientBufferAndroid> {
+    static PROC: std::sync::OnceLock<Result<EglGetNativeClientBufferAndroid, String>> =
+        std::sync::OnceLock::new();
+    PROC.get_or_init(|| load_egl_proc("eglGetNativeClientBufferANDROID").map_err(|e| e.to_string()))
+        .clone()
+        .map_err(|e| anyhow!(e))
+}
+
+fn get_egl_create_image_khr() -> Result<EglCreateImageKhr> {
+    static PROC: std::sync::OnceLock<Result<EglCreateImageKhr, String>> =
+        std::sync::OnceLock::new();
+    PROC.get_or_init(|| load_egl_proc("eglCreateImageKHR").map_err(|e| e.to_string()))
+        .clone()
+        .map_err(|e| anyhow!(e))
+}
+
+fn get_egl_destroy_image_khr() -> Result<EglDestroyImageKhr> {
+    static PROC: std::sync::OnceLock<Result<EglDestroyImageKhr, String>> =
+        std::sync::OnceLock::new();
+    PROC.get_or_init(|| load_egl_proc("eglDestroyImageKHR").map_err(|e| e.to_string()))
+        .clone()
+        .map_err(|e| anyhow!(e))
+}
+
+fn get_gl_egl_image_target_texture_2d_oes() -> Result<GlEglImageTargetTexture2dOes> {
+    static PROC: std::sync::OnceLock<Result<GlEglImageTargetTexture2dOes, String>> =
+        std::sync::OnceLock::new();
+    PROC.get_or_init(|| load_egl_proc("glEGLImageTargetTexture2DOES").map_err(|e| e.to_string()))
+        .clone()
+        .map_err(|e| anyhow!(e))
+}
+
+static ZERO_COPY_OES_TEXTURE: AtomicU32 = AtomicU32::new(0);
+
+fn get_zero_copy_oes_texture() -> u32 {
+    let tex = ZERO_COPY_OES_TEXTURE.load(Ordering::Relaxed);
+    if tex != 0 {
+        return tex;
+    }
+    let mut new_tex = 0_u32;
+    unsafe { glGenTextures(1, &mut new_tex) };
+    if new_tex != 0 {
+        ZERO_COPY_OES_TEXTURE.store(new_tex, Ordering::Relaxed);
+    }
+    new_tex
+}
+
 // EGL extern declarations (from pimax.rs)
 extern "C" {
     fn eglGetProcAddress(procname: *const i8) -> *const c_void;
@@ -212,6 +276,7 @@ extern "C" {
     fn glDeleteProgram(program: u32);
     fn glDeleteShader(shader: u32);
     fn glDeleteTextures(n: i32, textures: *const u32);
+    fn glDisable(cap: u32);
     fn glDrawArrays(mode: u32, first: i32, count: i32);
     fn glGenTextures(n: i32, textures: *mut u32);
     fn glGetIntegerv(pname: u32, data: *mut i32);
@@ -231,6 +296,7 @@ extern "C" {
         type_: u32,
         pixels: *mut c_void,
     );
+    fn glPixelStorei(pname: u32, param: i32);
     fn glShaderSource(shader: u32, count: i32, string: *const *const i8, length: *const i32);
     fn glTexParameteri(target: u32, pname: u32, param: i32);
     fn glTexSubImage2D(
@@ -246,6 +312,7 @@ extern "C" {
     );
     fn glCheckFramebufferStatus(target: u32) -> u32;
     fn glDeleteFramebuffers(n: i32, framebuffers: *const u32);
+    fn glFinish();
     fn glFlush();
     fn glFramebufferTexture2D(
         target: u32,
@@ -268,11 +335,27 @@ extern "C" {
     );
     fn glClear(mask: u32);
     fn glClearColor(red: f32, green: f32, blue: f32, alpha: f32);
+    fn glColorMask(red: u8, green: u8, blue: u8, alpha: u8);
     fn glUniform1f(location: i32, v0: f32);
     fn glUniform1i(location: i32, v0: i32);
     fn glUniform4f(location: i32, v0: f32, v1: f32, v2: f32, v3: f32);
     fn glUseProgram(program: u32);
     fn glViewport(x: i32, y: i32, width: i32, height: i32);
+}
+
+fn prepare_video_blit_state() {
+    unsafe {
+        glDisable(GL_BLEND);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_SCISSOR_TEST);
+        glColorMask(
+            GL_TRUE_BOOLEAN,
+            GL_TRUE_BOOLEAN,
+            GL_TRUE_BOOLEAN,
+            GL_TRUE_BOOLEAN,
+        );
+    }
 }
 
 const DEBUG_RGBA_MAGIC: &[u8; 8] = b"PIMXRGBA";
@@ -281,9 +364,15 @@ const DEBUG_RGBA_MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 static DEBUG_RGBA_TCP_STARTED: AtomicBool = AtomicBool::new(false);
 static AHB_BLIT_COUNT: AtomicU64 = AtomicU64::new(0);
 static BLIT_PROGRAM: Mutex<Option<BlitProgram>> = Mutex::new(None);
+static NV12_BLIT_PROGRAM: Mutex<Option<Nv12BlitProgram>> = Mutex::new(None);
+static NV12_UPLOAD_TEXTURES: Mutex<Option<Nv12UploadTextures>> = Mutex::new(None);
+static RGBA_UPLOAD_TEXTURE: Mutex<Option<RgbaUploadTexture>> = Mutex::new(None);
+static NV12_BLIT_COUNT: AtomicU64 = AtomicU64::new(0);
+static SOURCE_FRAME_DUMP_COUNT: AtomicU32 = AtomicU32::new(0);
 static PASSTHROUGH_OES_PROGRAM: Mutex<Option<PassthroughProgram>> = Mutex::new(None);
 static INTERMEDIATE_FBO: Mutex<Option<IntermediateFbo>> = Mutex::new(None);
 static FOVEATED_ENCODING: Mutex<Option<ActiveFoveationConfig>> = Mutex::new(None);
+static HDR_STREAM_ENABLED: AtomicBool = AtomicBool::new(false);
 // Keep the stream mapping aligned with the source frame unless we have a
 // headset-side repro that proves we need a correction.
 const PIMAX_SWAP_STREAM_EYES: bool = false;
@@ -291,6 +380,9 @@ const PIMAX_FLIP_STREAM_VERTICAL: bool = false;
 // Default starting values — exposed as `pub` so `android.rs` can pass them to `tune::init`.
 // The render thread reads live values from `tune::convergence_shift_ndc()` etc. each frame.
 pub const PIMAX_BLIT_CONVERGENCE_SHIFT_NDC_DEFAULT: f32 = 0.124;
+const PIMAX_DUMP_SOURCE_VIDEO_FRAMES: bool = true;
+const PIMAX_DUMP_SOURCE_VIDEO_FRAME_LIMIT: u32 = 28;
+const PIMAX_DUMP_FRAME_START: u32 = 20;
 /// Default BT.709 limited-range black level for the passthrough OES shader.
 pub const COLOR_BLACK_CRUSH_DEFAULT: f32 = 0.072;
 /// Default BT.709 contrast gain for the passthrough OES shader.
@@ -302,6 +394,7 @@ struct PassthroughProgram {
     texture_uniform: i32,
     black_crush_uniform: i32,
     color_gain_uniform: i32,
+    hdr_mode_uniform: i32,
 }
 
 /// Cached intermediate RGBA framebuffer used between the two blit passes.
@@ -310,6 +403,7 @@ struct IntermediateFbo {
     texture: u32,
     width: i32,
     height: i32,
+    is_hdr: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -335,6 +429,38 @@ struct BlitProgram {
     foveation_left_uniform: i32,
     foveation_right_uniform: i32,
     foveation_c_right_uniform: i32,
+}
+
+struct Nv12BlitProgram {
+    program: u32,
+    y_texture_uniform: i32,
+    uv_texture_uniform: i32,
+    uv_rect_uniform: i32,
+    foveation_enabled_uniform: i32,
+    view_index_uniform: i32,
+    position_offset_x_uniform: i32,
+    foveation_view_ratio_edge_uniform: i32,
+    foveation_c1_c2_uniform: i32,
+    foveation_bounds_uniform: i32,
+    foveation_left_uniform: i32,
+    foveation_right_uniform: i32,
+    foveation_c_right_uniform: i32,
+    black_crush_uniform: i32,
+    color_gain_uniform: i32,
+    hdr_mode_uniform: i32,
+}
+
+struct Nv12UploadTextures {
+    y_texture: u32,
+    uv_texture: u32,
+    width: i32,
+    height: i32,
+}
+
+struct RgbaUploadTexture {
+    texture: u32,
+    width: i32,
+    height: i32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -445,6 +571,8 @@ pub struct VideoFrame {
     /// Optional CPU RGBA frame payload. This is a temporary debug ingress used
     /// before the Android hardware-decoder path is wired to ALVR packets.
     pub rgba: Option<Arc<Vec<u8>>>,
+    /// Optional tightly packed NV12 payload (Y plane followed by interleaved UV).
+    pub nv12: Option<Arc<Vec<u8>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -472,6 +600,19 @@ pub fn configure_foveated_encoding(config: Option<FoveatedEncodingConfig>) {
         info!("ALVR foveated blit mapping disabled");
         *FOVEATED_ENCODING.lock() = None;
     }
+}
+
+pub fn configure_hdr_stream(enable_hdr: bool) {
+    HDR_STREAM_ENABLED.store(enable_hdr, Ordering::Relaxed);
+    info!("configured ALVR HDR stream mode: enable_hdr={enable_hdr}");
+}
+
+pub fn hdr_stream_enabled() -> bool {
+    HDR_STREAM_ENABLED.load(Ordering::Relaxed)
+}
+
+fn stream_color_adjustment() -> (f32, f32) {
+    (crate::tune::color_black_crush(), crate::tune::color_gain())
 }
 
 fn compute_foveation_config(config: FoveatedEncodingConfig) -> Result<ActiveFoveationConfig> {
@@ -707,6 +848,7 @@ pub fn push_video_frame(
         row_pitch,
         hardware_buffer_lease,
         rgba: None,
+        nv12: None,
     });
     *receiver.state.lock() = ReceiverState::Streaming;
 }
@@ -719,6 +861,9 @@ pub fn push_rgba_frame(
     height: u32,
     rgba: Vec<u8>,
 ) {
+    if let Err(err) = dump_rgba_frame_jpeg("rgba", width as usize, height as usize, &rgba) {
+        warn!("failed to dump source RGBA frame: {err:#}");
+    }
     let mut latest = receiver.latest_frame.lock();
     *latest = Some(VideoFrame {
         timestamp_ns,
@@ -728,6 +873,32 @@ pub fn push_rgba_frame(
         row_pitch: width.saturating_mul(4),
         hardware_buffer_lease: None,
         rgba: Some(Arc::new(rgba)),
+        nv12: None,
+    });
+    *receiver.state.lock() = ReceiverState::Streaming;
+}
+
+/// Push a tightly packed NV12 video frame to the receiver.
+pub fn push_nv12_frame(
+    receiver: &AlvrVideoReceiver,
+    timestamp_ns: u64,
+    width: u32,
+    height: u32,
+    nv12: Vec<u8>,
+) {
+    if let Err(err) = dump_nv12_frame_jpeg("nv12", width as usize, height as usize, &nv12) {
+        warn!("failed to dump source NV12 frame: {err:#}");
+    }
+    let mut latest = receiver.latest_frame.lock();
+    *latest = Some(VideoFrame {
+        timestamp_ns,
+        buffer_ptr: 0,
+        width,
+        height,
+        row_pitch: width,
+        hardware_buffer_lease: None,
+        rgba: None,
+        nv12: Some(Arc::new(nv12)),
     });
     *receiver.state.lock() = ReceiverState::Streaming;
 }
@@ -884,6 +1055,201 @@ fn pixel_luma(pixel: [u8; 4]) -> f32 {
     (0.2126 * pixel[0] as f32) + (0.7152 * pixel[1] as f32) + (0.0722 * pixel[2] as f32)
 }
 
+fn dump_rgb_jpeg(path: &PathBuf, width: usize, height: usize, rgb: &[u8]) -> Result<()> {
+    let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let mut writer = std::io::BufWriter::new(file);
+    let encoder = JpegEncoder::new_with_quality(&mut writer, 90);
+    encoder
+        .write_image(rgb, width as u32, height as u32, ColorType::Rgb8.into())
+        .with_context(|| format!("encode {} as jpeg", path.display()))?;
+    writer
+        .flush()
+        .with_context(|| format!("flush {}", path.display()))?;
+    Ok(())
+}
+
+fn dump_source_frame_jpeg_with_index(
+    label: &str,
+    dump_index: u32,
+    width: usize,
+    height: usize,
+    rgb: &[u8],
+) -> Result<()> {
+    let dump_dir =
+        PathBuf::from("/sdcard/Android/data/com.pimax.alvr.client/files/PimaxALVR/frame-dumps");
+    fs::create_dir_all(&dump_dir)
+        .with_context(|| format!("create source dump dir {}", dump_dir.display()))?;
+    let path = dump_dir.join(format!(
+        "source-frame-{dump_index:05}-{label}-{}x{}.jpg",
+        width, height
+    ));
+    dump_rgb_jpeg(&path, width, height, rgb)?;
+    info!("dumped source video frame to {}", path.display());
+    Ok(())
+}
+
+fn dump_source_frame_jpeg(label: &str, width: usize, height: usize, rgb: &[u8]) -> Result<()> {
+    if !PIMAX_DUMP_SOURCE_VIDEO_FRAMES {
+        return Ok(());
+    }
+
+    let dump_index = SOURCE_FRAME_DUMP_COUNT.fetch_add(1, Ordering::Relaxed);
+    if dump_index < PIMAX_DUMP_FRAME_START || dump_index >= PIMAX_DUMP_SOURCE_VIDEO_FRAME_LIMIT {
+        return Ok(());
+    }
+
+    dump_source_frame_jpeg_with_index(label, dump_index, width, height, rgb)
+}
+
+fn dump_source_luma_frame_jpeg(
+    label: &str,
+    dump_index: u32,
+    width: usize,
+    height: usize,
+    y_plane: &[u8],
+) -> Result<()> {
+    if !PIMAX_DUMP_SOURCE_VIDEO_FRAMES {
+        return Ok(());
+    }
+
+    if dump_index < PIMAX_DUMP_FRAME_START {
+        return Ok(());
+    }
+
+    let dump_dir =
+        PathBuf::from("/sdcard/Android/data/com.pimax.alvr.client/files/PimaxALVR/frame-dumps");
+    fs::create_dir_all(&dump_dir)
+        .with_context(|| format!("create source dump dir {}", dump_dir.display()))?;
+    let path = dump_dir.join(format!(
+        "source-frame-{dump_index:05}-{label}-{}x{}-y.jpg",
+        width, height
+    ));
+    let file = File::create(&path).with_context(|| format!("create {}", path.display()))?;
+    let mut writer = std::io::BufWriter::new(file);
+    let encoder = JpegEncoder::new_with_quality(&mut writer, 90);
+    encoder
+        .write_image(y_plane, width as u32, height as u32, ColorType::L8.into())
+        .with_context(|| format!("encode {} as jpeg", path.display()))?;
+    writer
+        .flush()
+        .with_context(|| format!("flush {}", path.display()))?;
+    info!("dumped source video luma frame to {}", path.display());
+    Ok(())
+}
+
+fn dump_source_chroma_plane_jpeg(
+    label: &str,
+    dump_index: u32,
+    plane_name: &str,
+    width: usize,
+    height: usize,
+    plane: &[u8],
+) -> Result<()> {
+    if !PIMAX_DUMP_SOURCE_VIDEO_FRAMES {
+        return Ok(());
+    }
+
+    if dump_index < PIMAX_DUMP_FRAME_START {
+        return Ok(());
+    }
+
+    let dump_dir =
+        PathBuf::from("/sdcard/Android/data/com.pimax.alvr.client/files/PimaxALVR/frame-dumps");
+    fs::create_dir_all(&dump_dir)
+        .with_context(|| format!("create source dump dir {}", dump_dir.display()))?;
+    let path = dump_dir.join(format!(
+        "source-frame-{dump_index:05}-{label}-{}x{}-{plane_name}.jpg",
+        width, height
+    ));
+    let file = File::create(&path).with_context(|| format!("create {}", path.display()))?;
+    let mut writer = std::io::BufWriter::new(file);
+    let encoder = JpegEncoder::new_with_quality(&mut writer, 90);
+    encoder
+        .write_image(plane, width as u32, height as u32, ColorType::L8.into())
+        .with_context(|| format!("encode {} as jpeg", path.display()))?;
+    writer
+        .flush()
+        .with_context(|| format!("flush {}", path.display()))?;
+    info!(
+        "dumped source video {plane_name} plane to {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn dump_rgba_frame_jpeg(label: &str, width: usize, height: usize, rgba: &[u8]) -> Result<()> {
+    let mut rgb = vec![0_u8; width.saturating_mul(height).saturating_mul(3)];
+    for (src, dst) in rgba.chunks_exact(4).zip(rgb.chunks_exact_mut(3)) {
+        dst.copy_from_slice(&src[..3]);
+    }
+    dump_source_frame_jpeg(label, width, height, &rgb)
+}
+
+fn dump_nv12_frame_jpeg(label: &str, width: usize, height: usize, nv12: &[u8]) -> Result<()> {
+    let y_plane_len = width
+        .checked_mul(height)
+        .context("source NV12 Y plane overflow")?;
+    let uv_width = (width + 1) / 2;
+    let uv_height = (height + 1) / 2;
+    let uv_plane_len = uv_width
+        .checked_mul(uv_height)
+        .and_then(|samples| samples.checked_mul(2))
+        .context("source NV12 UV plane overflow")?;
+    if nv12.len() < y_plane_len + uv_plane_len {
+        bail!(
+            "source NV12 payload too small: got {} bytes, expected at least {}",
+            nv12.len(),
+            y_plane_len + uv_plane_len
+        );
+    }
+
+    let dump_index = SOURCE_FRAME_DUMP_COUNT.fetch_add(1, Ordering::Relaxed);
+    if dump_index >= PIMAX_DUMP_SOURCE_VIDEO_FRAME_LIMIT {
+        return Ok(());
+    }
+
+    let _ = dump_source_luma_frame_jpeg(label, dump_index, width, height, &nv12[..y_plane_len]);
+    let _ = dump_source_chroma_plane_jpeg(
+        label,
+        dump_index,
+        "u",
+        uv_width,
+        uv_height,
+        &nv12[y_plane_len..y_plane_len + uv_plane_len]
+            .iter()
+            .step_by(2)
+            .copied()
+            .collect::<Vec<_>>(),
+    );
+    let _ = dump_source_chroma_plane_jpeg(
+        label,
+        dump_index,
+        "v",
+        uv_width,
+        uv_height,
+        &nv12[y_plane_len + 1..y_plane_len + uv_plane_len]
+            .iter()
+            .step_by(2)
+            .copied()
+            .collect::<Vec<_>>(),
+    );
+
+    let mut rgb = vec![0_u8; width.saturating_mul(height).saturating_mul(3)];
+    for row in 0..height {
+        for col in 0..width {
+            let y = nv12[row * width + col];
+            let uv_index = y_plane_len + (row / 2) * uv_width * 2 + (col / 2) * 2;
+            let u = nv12[uv_index];
+            let v = nv12[uv_index + 1];
+            let pixel = bt709_limited_rgb(y, u, v);
+            let dst = (row * width + col) * 3;
+            rgb[dst..dst + 3].copy_from_slice(&pixel);
+        }
+    }
+
+    dump_source_frame_jpeg_with_index(label, dump_index, width, height, &rgb)
+}
+
 fn readback_framebuffer_luma_stats(
     framebuffer: u32,
     width: i32,
@@ -963,6 +1329,7 @@ fn get_passthrough_oes_program() -> Result<PassthroughProgram> {
             texture_uniform: existing.texture_uniform,
             black_crush_uniform: existing.black_crush_uniform,
             color_gain_uniform: existing.color_gain_uniform,
+            hdr_mode_uniform: existing.hdr_mode_uniform,
         });
     }
 
@@ -994,12 +1361,16 @@ precision highp float;
 uniform samplerExternalOES u_texture;
 uniform float u_black_crush;
 uniform float u_color_gain;
+uniform int u_hdr_mode;
 in vec2 v_uv;
 out vec4 out_color;
 void main() {
     vec4 color = texture(u_texture, v_uv);
     // Expand BT.709 limited range (16-235) to full range (0-255).
-    color.rgb = clamp((color.rgb - u_black_crush) * u_color_gain, 0.0, 1.0);
+    color.rgb = (color.rgb - u_black_crush) * u_color_gain;
+    if (u_hdr_mode == 0) {
+        color.rgb = clamp(color.rgb, 0.0, 1.0);
+    }
     out_color = color;
 }
 "#,
@@ -1022,18 +1393,21 @@ void main() {
     }
     let black_crush_uniform = uniform_location(linked, "u_black_crush")?;
     let color_gain_uniform = uniform_location(linked, "u_color_gain")?;
+    let hdr_mode_uniform = uniform_location(linked, "u_hdr_mode")?;
 
     let created = PassthroughProgram {
         program: linked,
         texture_uniform,
         black_crush_uniform,
         color_gain_uniform,
+        hdr_mode_uniform,
     };
     *prog = Some(PassthroughProgram {
         program: linked,
         texture_uniform,
         black_crush_uniform,
         color_gain_uniform,
+        hdr_mode_uniform,
     });
     info!("created passthrough OES shader program for two-pass blit");
     Ok(created)
@@ -1043,13 +1417,14 @@ void main() {
 /// Re-creates when dimensions change.
 fn get_intermediate_fbo(width: i32, height: i32) -> Result<IntermediateFbo> {
     let mut fbo = INTERMEDIATE_FBO.lock();
-    if let Some(existing) = fbo.as_ref() {
-        if existing.width == width && existing.height == height {
+        if let Some(existing) = fbo.as_ref() {
+        if existing.width == width && existing.height == height && existing.is_hdr == hdr_stream_enabled() {
             return Ok(IntermediateFbo {
                 framebuffer: existing.framebuffer,
                 texture: existing.texture,
                 width: existing.width,
                 height: existing.height,
+                is_hdr: existing.is_hdr,
             });
         }
         // Dimensions changed, delete old resources
@@ -1062,6 +1437,7 @@ fn get_intermediate_fbo(width: i32, height: i32) -> Result<IntermediateFbo> {
 
     unsafe {
         let mut texture = 0_u32;
+        let is_hdr = hdr_stream_enabled();
         glGenTextures(1, &mut texture);
         if texture == 0 {
             bail!("glGenTextures returned 0 for intermediate RGBA texture");
@@ -1071,15 +1447,20 @@ fn get_intermediate_fbo(width: i32, height: i32) -> Result<IntermediateFbo> {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        let (internal_format, data_type, label) = if is_hdr {
+            (GL_RGBA16F, GL_HALF_FLOAT, "RGBA16F")
+        } else {
+            (GL_RGBA as i32, GL_UNSIGNED_BYTE, "RGBA8")
+        };
         glTexImage2D(
             GL_TEXTURE_2D,
             0,
-            GL_RGBA as i32,
+            internal_format,
             width,
             height,
             0,
             GL_RGBA,
-            GL_UNSIGNED_BYTE,
+            data_type,
             ptr::null(),
         );
         glBindTexture(GL_TEXTURE_2D, 0);
@@ -1111,16 +1492,18 @@ fn get_intermediate_fbo(width: i32, height: i32) -> Result<IntermediateFbo> {
             texture,
             width,
             height,
+            is_hdr,
         };
         info!(
-            "created intermediate RGBA FBO {}x{} for two-pass blit (fbo={}, tex={})",
-            width, height, framebuffer, texture
+            "created intermediate {} FBO {}x{} for two-pass blit (fbo={}, tex={})",
+            label, width, height, framebuffer, texture
         );
         *fbo = Some(IntermediateFbo {
             framebuffer,
             texture,
             width,
             height,
+            is_hdr,
         });
         Ok(created)
     }
@@ -1169,6 +1552,298 @@ fn get_blit_program() -> Result<BlitProgram> {
     Ok(created)
 }
 
+fn get_nv12_blit_program() -> Result<Nv12BlitProgram> {
+    let mut program = NV12_BLIT_PROGRAM.lock();
+    if let Some(existing) = program.as_ref() {
+        return Ok(Nv12BlitProgram {
+            program: existing.program,
+            y_texture_uniform: existing.y_texture_uniform,
+            uv_texture_uniform: existing.uv_texture_uniform,
+            uv_rect_uniform: existing.uv_rect_uniform,
+            foveation_enabled_uniform: existing.foveation_enabled_uniform,
+            view_index_uniform: existing.view_index_uniform,
+            position_offset_x_uniform: existing.position_offset_x_uniform,
+            foveation_view_ratio_edge_uniform: existing.foveation_view_ratio_edge_uniform,
+            foveation_c1_c2_uniform: existing.foveation_c1_c2_uniform,
+            foveation_bounds_uniform: existing.foveation_bounds_uniform,
+            foveation_left_uniform: existing.foveation_left_uniform,
+            foveation_right_uniform: existing.foveation_right_uniform,
+            foveation_c_right_uniform: existing.foveation_c_right_uniform,
+            black_crush_uniform: existing.black_crush_uniform,
+            color_gain_uniform: existing.color_gain_uniform,
+            hdr_mode_uniform: existing.hdr_mode_uniform,
+        });
+    }
+
+    info!("NV12 blit shader build marker: grayscale-luma-test-2026-04-27");
+
+    let vertex_shader = compile_shader(
+        GL_VERTEX_SHADER,
+        r#"#version 300 es
+precision highp float;
+uniform float u_position_offset_x;
+out vec2 v_uv;
+void main() {
+    vec2 pos;
+    if (gl_VertexID == 0) {
+        pos = vec2(-1.0, -1.0);
+    } else if (gl_VertexID == 1) {
+        pos = vec2(3.0, -1.0);
+    } else {
+        pos = vec2(-1.0, 3.0);
+    }
+    v_uv = (pos + vec2(1.0)) * 0.5;
+    pos.x += u_position_offset_x;
+    gl_Position = vec4(pos, 0.0, 1.0);
+}
+"#,
+    )
+    .context("compile NV12 blit vertex shader")?;
+    let fragment_shader = compile_shader(
+        GL_FRAGMENT_SHADER,
+        r#"#version 300 es
+precision highp float;
+uniform sampler2D u_y_texture;
+uniform sampler2D u_uv_texture;
+uniform vec4 u_uv_rect;
+uniform int u_enable_foveation;
+uniform int u_view_index;
+uniform vec4 u_foveation_view_ratio_edge;
+uniform vec4 u_foveation_c1_c2;
+uniform vec4 u_foveation_bounds;
+uniform vec4 u_foveation_left;
+uniform vec4 u_foveation_right;
+uniform vec4 u_foveation_c_right;
+uniform float u_black_crush;
+uniform float u_color_gain;
+uniform int u_hdr_mode;
+in vec2 v_uv;
+out vec4 out_color;
+
+vec2 apply_foveation(vec2 uv) {
+    vec2 corrected_uv = uv;
+    if (u_enable_foveation == 0) {
+        return corrected_uv;
+    }
+
+    vec2 view_size_ratio = u_foveation_view_ratio_edge.xy;
+    vec2 edge_ratio = u_foveation_view_ratio_edge.zw;
+    vec2 c1 = u_foveation_c1_c2.xy;
+    vec2 c2 = u_foveation_c1_c2.zw;
+    vec2 lo_bound = u_foveation_bounds.xy;
+    vec2 hi_bound = u_foveation_bounds.zw;
+    vec2 a_left = u_foveation_left.xy;
+    vec2 b_left = u_foveation_left.zw;
+    vec2 a_right = u_foveation_right.xy;
+    vec2 b_right = u_foveation_right.zw;
+    vec2 c_right = u_foveation_c_right.xy;
+
+    if (u_view_index == 1) {
+        corrected_uv.x = 1.0 - corrected_uv.x;
+    }
+
+    vec2 center = (corrected_uv - c1) * edge_ratio / c2;
+    vec2 left_discriminant = max(b_left * b_left + 4.0 * a_left * corrected_uv, vec2(0.0));
+    vec2 right_discriminant =
+        max(b_right * b_right - 4.0 * (c_right - a_right * corrected_uv), vec2(0.0));
+    vec2 left_edge = (-b_left + sqrt(left_discriminant)) / (2.0 * a_left);
+    vec2 right_edge = (-b_right + sqrt(right_discriminant)) / (2.0 * a_right);
+
+    if (corrected_uv.x < lo_bound.x) {
+        corrected_uv.x = left_edge.x;
+    } else if (corrected_uv.x > hi_bound.x) {
+        corrected_uv.x = right_edge.x;
+    } else {
+        corrected_uv.x = center.x;
+    }
+
+    if (corrected_uv.y < lo_bound.y) {
+        corrected_uv.y = left_edge.y;
+    } else if (corrected_uv.y > hi_bound.y) {
+        corrected_uv.y = right_edge.y;
+    } else {
+        corrected_uv.y = center.y;
+    }
+
+    corrected_uv *= view_size_ratio;
+
+    if (u_view_index == 1) {
+        corrected_uv.x = 1.0 - corrected_uv.x;
+    }
+
+    return corrected_uv;
+}
+
+void main() {
+    vec2 corrected_uv = clamp(apply_foveation(v_uv), vec2(0.0), vec2(1.0));
+    vec2 sample_uv = mix(u_uv_rect.xy, u_uv_rect.zw, corrected_uv);
+    float y = texture(u_y_texture, sample_uv).r;
+    float grayscale = (max(1.16438356 * (y - 0.0627451), 0.0) - u_black_crush) * u_color_gain;
+    if (u_hdr_mode == 0) {
+        grayscale = clamp(grayscale, 0.0, 1.0);
+    }
+    out_color = vec4(vec3(grayscale), 1.0);
+}
+"#,
+    )
+    .context("compile NV12 blit fragment shader")?;
+
+    let linked =
+        link_program(vertex_shader, fragment_shader).context("link NV12 blit shader program")?;
+    unsafe {
+        glDeleteShader(vertex_shader);
+        glDeleteShader(fragment_shader);
+    }
+
+    let created = Nv12BlitProgram {
+        program: linked,
+        y_texture_uniform: uniform_location(linked, "u_y_texture")?,
+        uv_texture_uniform: uniform_location(linked, "u_uv_texture")?,
+        uv_rect_uniform: uniform_location(linked, "u_uv_rect")?,
+        foveation_enabled_uniform: uniform_location(linked, "u_enable_foveation")?,
+        view_index_uniform: uniform_location(linked, "u_view_index")?,
+        position_offset_x_uniform: uniform_location(linked, "u_position_offset_x")?,
+        foveation_view_ratio_edge_uniform: uniform_location(linked, "u_foveation_view_ratio_edge")?,
+        foveation_c1_c2_uniform: uniform_location(linked, "u_foveation_c1_c2")?,
+        foveation_bounds_uniform: uniform_location(linked, "u_foveation_bounds")?,
+        foveation_left_uniform: uniform_location(linked, "u_foveation_left")?,
+        foveation_right_uniform: uniform_location(linked, "u_foveation_right")?,
+        foveation_c_right_uniform: uniform_location(linked, "u_foveation_c_right")?,
+        black_crush_uniform: uniform_location(linked, "u_black_crush")?,
+        color_gain_uniform: uniform_location(linked, "u_color_gain")?,
+        hdr_mode_uniform: uniform_location(linked, "u_hdr_mode")?,
+    };
+    *program = Some(Nv12BlitProgram {
+        program: created.program,
+        y_texture_uniform: created.y_texture_uniform,
+        uv_texture_uniform: created.uv_texture_uniform,
+        uv_rect_uniform: created.uv_rect_uniform,
+        foveation_enabled_uniform: created.foveation_enabled_uniform,
+        view_index_uniform: created.view_index_uniform,
+        position_offset_x_uniform: created.position_offset_x_uniform,
+        foveation_view_ratio_edge_uniform: created.foveation_view_ratio_edge_uniform,
+        foveation_c1_c2_uniform: created.foveation_c1_c2_uniform,
+        foveation_bounds_uniform: created.foveation_bounds_uniform,
+        foveation_left_uniform: created.foveation_left_uniform,
+        foveation_right_uniform: created.foveation_right_uniform,
+        foveation_c_right_uniform: created.foveation_c_right_uniform,
+        black_crush_uniform: created.black_crush_uniform,
+        color_gain_uniform: created.color_gain_uniform,
+        hdr_mode_uniform: created.hdr_mode_uniform,
+    });
+    info!("created NV12 blit shader program for buffer-mode decode");
+    Ok(created)
+}
+
+fn get_nv12_upload_textures(width: i32, height: i32) -> Result<Nv12UploadTextures> {
+    let mut textures = NV12_UPLOAD_TEXTURES.lock();
+    if let Some(existing) = textures.as_ref() {
+        if existing.width == width && existing.height == height {
+            return Ok(Nv12UploadTextures {
+                y_texture: existing.y_texture,
+                uv_texture: existing.uv_texture,
+                width: existing.width,
+                height: existing.height,
+            });
+        }
+
+        unsafe {
+            glDeleteTextures(1, &existing.y_texture);
+            glDeleteTextures(1, &existing.uv_texture);
+        }
+        *textures = None;
+    }
+
+    let uv_width = (width + 1) / 2;
+    let uv_height = (height + 1) / 2;
+    let y_texture = create_plane_texture(GL_R8 as i32, width, height, GL_RED)
+        .context("create NV12 Y texture")?;
+    let uv_texture = create_plane_texture(GL_RG8 as i32, uv_width, uv_height, GL_RG)
+        .context("create NV12 UV texture")?;
+    let created = Nv12UploadTextures {
+        y_texture,
+        uv_texture,
+        width,
+        height,
+    };
+    *textures = Some(Nv12UploadTextures {
+        y_texture,
+        uv_texture,
+        width,
+        height,
+    });
+    info!(
+        "created NV12 upload textures {}x{} (y_tex={}, uv_tex={})",
+        width, height, y_texture, uv_texture
+    );
+    Ok(created)
+}
+
+fn get_rgba_upload_texture(width: i32, height: i32) -> Result<RgbaUploadTexture> {
+    let mut texture = RGBA_UPLOAD_TEXTURE.lock();
+    if let Some(existing) = texture.as_ref() {
+        if existing.width == width && existing.height == height {
+            return Ok(RgbaUploadTexture {
+                texture: existing.texture,
+                width: existing.width,
+                height: existing.height,
+            });
+        }
+
+        unsafe {
+            glDeleteTextures(1, &existing.texture);
+        }
+        *texture = None;
+    }
+
+    let created_texture = create_plane_texture(GL_RGBA as i32, width, height, GL_RGBA)
+        .context("create RGBA upload texture")?;
+    let created = RgbaUploadTexture {
+        texture: created_texture,
+        width,
+        height,
+    };
+    *texture = Some(RgbaUploadTexture {
+        texture: created_texture,
+        width,
+        height,
+    });
+    info!(
+        "created RGBA upload texture {}x{} (tex={})",
+        width, height, created_texture
+    );
+    Ok(created)
+}
+
+fn create_plane_texture(internal_format: i32, width: i32, height: i32, format: u32) -> Result<u32> {
+    let mut texture = 0_u32;
+    unsafe {
+        glGenTextures(1, &mut texture);
+        if texture == 0 {
+            bail!("glGenTextures returned 0 for plane texture");
+        }
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexImage2D(
+            GL_TEXTURE_2D,
+            0,
+            internal_format,
+            width,
+            height,
+            0,
+            format,
+            GL_UNSIGNED_BYTE,
+            ptr::null(),
+        );
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+    Ok(texture)
+}
+
 fn create_blit_program(use_external_texture: bool) -> Result<BlitProgram> {
     let texture_target = if use_external_texture {
         GL_TEXTURE_EXTERNAL_OES
@@ -1204,7 +1879,7 @@ void main() {
     // Compute UVs from the unshifted position so content is sampled correctly,
     // then apply a convergence shift to gl_Position only. This pans the rendered
     // content within the eye buffer to pre-cancel the Pimax compositor's built-in
-    // divergent warp (~0.248 NDC per eye).
+    // divergent warp (~0.124 NDC per eye).
     v_uv = (pos + vec2(1.0)) * 0.5;
     pos.x += u_position_offset_x;
     gl_Position = vec4(pos, 0.0, 1.0);
@@ -1245,7 +1920,9 @@ vec2 apply_foveation(vec2 uv) {{
     vec2 b_right = u_foveation_right.zw;
     vec2 c_right = u_foveation_c_right.xy;
 
-    // Removed UV flip for right eye - let the UV range swap handle it
+    if (u_view_index == 1) {{
+        corrected_uv.x = 1.0 - corrected_uv.x;
+    }}
 
     vec2 center = (corrected_uv - c1) * edge_ratio / c2;
     vec2 left_discriminant = max(b_left * b_left + 4.0 * a_left * corrected_uv, vec2(0.0));
@@ -1271,6 +1948,10 @@ vec2 apply_foveation(vec2 uv) {{
     }}
 
     corrected_uv *= view_size_ratio;
+
+    if (u_view_index == 1) {{
+        corrected_uv.x = 1.0 - corrected_uv.x;
+    }}
 
     return corrected_uv;
 }}
@@ -1443,15 +2124,20 @@ fn source_eye_for_target(eye: VideoFrameEye) -> VideoFrameEye {
     }
 }
 
-/// Render an AHardwareBuffer to an EyeRenderTarget texture using a two-pass blit.
+fn convergence_position_offset_for_eye(eye: VideoFrameEye) -> f32 {
+    let _configured_shift = crate::tune::convergence_shift_ndc();
+    let shift = _configured_shift;
+    match eye {
+        VideoFrameEye::Left => shift,
+        VideoFrameEye::Right => -shift,
+    }
+}
+
+/// Render an AHardwareBuffer to an EyeRenderTarget texture.
 ///
-/// **Pass 1**: AHardwareBuffer → intermediate RGBA texture via `GL_TEXTURE_EXTERNAL_OES`.
-///   The driver's OES sampler performs YUV-to-RGB conversion and applies whatever
-///   internal texture transform the vendor requires — producing a clean RGBA image.
-///
-/// **Pass 2**: intermediate RGBA texture → eye render target via `GL_TEXTURE_2D` with
-///   the foveation + stereo-split shader.  Since the intermediate is standard RGBA,
-///   UV mapping works correctly without driver interference.
+/// For RGBA_8888 format, we lock the AHardwareBuffer directly to access pixel data
+/// and upload it to a GL_TEXTURE_2D via glTexImage2D. This avoids OES sampler
+/// issues with PRIVATE format on Adreno drivers.
 pub(crate) fn render_ahardwarebuffer_to_target(
     target: &EyeRenderTarget,
     frame: &VideoFrame,
@@ -1462,105 +2148,114 @@ pub(crate) fn render_ahardwarebuffer_to_target(
         return Ok(());
     }
 
-    // Load EGL extension functions
-    let get_native_client_buffer =
-        load_egl_proc::<EglGetNativeClientBufferAndroid>("eglGetNativeClientBufferANDROID")
-            .context("load eglGetNativeClientBufferANDROID")?;
-    let create_image = load_egl_proc::<EglCreateImageKhr>("eglCreateImageKHR")
-        .context("load eglCreateImageKHR")?;
-    let destroy_image = load_egl_proc::<EglDestroyImageKhr>("eglDestroyImageKHR")
-        .context("load eglDestroyImageKHR")?;
-    let image_target_fn =
-        load_egl_proc::<GlEglImageTargetTexture2dOes>("glEGLImageTargetTexture2DOES")
-            .context("load glEGLImageTargetTexture2DOES")?;
+    // Lock the AHardwareBuffer to get CPU access to pixel data
+    let width = frame.width as i32;
+    let height = frame.height as i32;
 
-    let passthrough =
-        get_passthrough_oes_program().context("get passthrough OES shader for pass 1")?;
-    let blit_program = get_blit_program().context("get blit shader for pass 2")?;
-
-    let display = unsafe { eglGetCurrentDisplay() };
-    if display.is_null() {
-        bail!("eglGetCurrentDisplay returned null");
-    }
-
-    // Create EGLImage from AHardwareBuffer
-    let client_buffer = unsafe { get_native_client_buffer(hardware_buffer_ptr as *const c_void) };
-    if client_buffer.is_null() {
-        bail!("eglGetNativeClientBufferANDROID returned null");
-    }
-
-    let image_attribs = [EGL_IMAGE_PRESERVED_KHR, 1, EGL_NONE];
-    let egl_image = unsafe {
-        create_image(
-            display,
-            ptr::null_mut(),
-            EGL_NATIVE_BUFFER_ANDROID,
-            client_buffer,
-            image_attribs.as_ptr(),
-        )
-    };
-    if egl_image.is_null() {
-        bail!("eglCreateImageKHR returned null");
-    }
-
-    // Get intermediate FBO sized to the source frame
-    let intermediate = get_intermediate_fbo(frame.width as i32, frame.height as i32)
-        .context("get intermediate FBO for two-pass blit")?;
-
-    let source_eye = source_eye_for_target(eye);
-    let side_by_side_stereo = frame.width >= frame.height.saturating_mul(2) && frame.width >= 2;
-    let (u0, u1) = if side_by_side_stereo {
-        match source_eye {
-            VideoFrameEye::Left => (0.0_f32, 0.5_f32),
-            VideoFrameEye::Right => (0.5_f32, 1.0_f32),
-        }
-    } else {
-        (0.0_f32, 1.0_f32)
-    };
-    let (v0, v1) = if PIMAX_FLIP_STREAM_VERTICAL {
-        (1.0_f32, 0.0_f32)
-    } else {
-        (0.0_f32, 1.0_f32)
-    };
-    let foveation = active_foveation_for_frame(frame);
-    let view_index = match eye {
-        VideoFrameEye::Left => 0,
-        VideoFrameEye::Right => 1,
-    };
-    let count = AHB_BLIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    let should_log_stats = count <= 5 || count % 120 == 0;
-
+    // Use AHardwareBuffer_lockPlanes to get the plane data pointer and stride
     unsafe {
+        let mut planes: ffi::AHardwareBuffer_Planes = std::mem::zeroed();
+        let lock_status = ffi::AHardwareBuffer_lockPlanes(
+            hardware_buffer_ptr as *mut ffi::AHardwareBuffer,
+            ffi::AHardwareBuffer_UsageFlags::AHARDWAREBUFFER_USAGE_CPU_READ_RARELY.0,
+            -1,              // fence: -1 means "no fence, return immediately"
+            ptr::null_mut(), // rect: NULL means "entire buffer"
+            &mut planes as *mut ffi::AHardwareBuffer_Planes,
+        );
+        if lock_status != 0 {
+            bail!("AHardwareBuffer_lockPlanes failed: status={}", lock_status);
+        }
+
+        // Check we have at least one plane
+        if planes.planeCount < 1 {
+            ffi::AHardwareBuffer_unlock(
+                hardware_buffer_ptr as *mut ffi::AHardwareBuffer,
+                ptr::null_mut(),
+            );
+            bail!("AHardwareBuffer has no planes");
+        }
+
+        // Get the pixel data pointer and row stride from the first plane
+        let pixel_ptr = planes.planes[0].data;
+        let _row_stride = planes.planes[0].rowStride as usize; // Row stride available for glPixelStorei if needed
+
+        // Get or create an intermediate FBO sized to the frame.
+        let intermediate = get_intermediate_fbo(width, height).context("get intermediate FBO")?;
+
+        let source_eye = source_eye_for_target(eye);
+        let side_by_side_stereo = frame.width >= frame.height.saturating_mul(2) && frame.width >= 2;
+        let (u0, u1) = if side_by_side_stereo {
+            match source_eye {
+                VideoFrameEye::Left => (0.0_f32, 0.5_f32),
+                VideoFrameEye::Right => (0.5_f32, 1.0_f32),
+            }
+        } else {
+            (0.0_f32, 1.0_f32)
+        };
+        let (v0, v1) = if PIMAX_FLIP_STREAM_VERTICAL {
+            (1.0_f32, 0.0_f32)
+        } else {
+            (0.0_f32, 1.0_f32)
+        };
+        let foveation = active_foveation_for_frame(frame);
+        let view_index = match eye {
+            VideoFrameEye::Left => 0,
+            VideoFrameEye::Right => 1,
+        };
+        let count = AHB_BLIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        let should_log_stats = count <= 5 || count % 120 == 0;
+
         let previous_framebuffer = current_framebuffer_binding();
 
-        // --- Pass 1: AHardwareBuffer → intermediate RGBA via OES ---
-        let mut source_texture = 0_u32;
-        glGenTextures(1, &mut source_texture);
-        if source_texture == 0 {
-            destroy_image(display, egl_image);
-            bail!("glGenTextures returned 0 for decoded AHardwareBuffer source");
+        // Create a regular 2D texture and upload the RGBA data from the locked buffer
+        let mut upload_texture = 0_u32;
+        glGenTextures(1, &mut upload_texture);
+        if upload_texture == 0 {
+            ffi::AHardwareBuffer_unlock(
+                hardware_buffer_ptr as *mut ffi::AHardwareBuffer,
+                ptr::null_mut(),
+            );
+            bail!("glGenTextures returned 0 for upload texture");
         }
 
-        glBindTexture(GL_TEXTURE_EXTERNAL_OES, source_texture);
-        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        image_target_fn(GL_TEXTURE_EXTERNAL_OES, egl_image);
+        glBindTexture(GL_TEXTURE_2D, upload_texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+        // Upload pixel data - row_stride may be larger than width*4 due to padding
+        glTexImage2D(
+            GL_TEXTURE_2D,
+            0,
+            GL_RGBA as i32,
+            width,
+            height,
+            0,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            pixel_ptr.cast(),
+        );
+
+        glBindTexture(GL_TEXTURE_2D, 0);
+
+        // --- Pass 1: Upload texture → intermediate RGBA via simple copy ---
+        let passthrough = get_passthrough_oes_program().context("get passthrough shader")?;
 
         glBindFramebuffer(GL_FRAMEBUFFER, intermediate.framebuffer);
         glViewport(0, 0, intermediate.width, intermediate.height);
         glUseProgram(passthrough.program);
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_EXTERNAL_OES, source_texture);
+        glBindTexture(GL_TEXTURE_2D, upload_texture); // Use GL_TEXTURE_2D
         glUniform1i(passthrough.texture_uniform, 0);
-        // Live-tunable color expansion (adjustable via HTTP at :7878)
-        glUniform1f(
-            passthrough.black_crush_uniform,
-            crate::tune::color_black_crush(),
-        );
-        glUniform1f(passthrough.color_gain_uniform, crate::tune::color_gain());
+        let (black_crush, color_gain) = stream_color_adjustment();
+        glUniform1f(passthrough.black_crush_uniform, black_crush);
+        glUniform1f(passthrough.color_gain_uniform, color_gain);
+        glUniform1i(passthrough.hdr_mode_uniform, if hdr_stream_enabled() { 1 } else { 0 });
         glDrawArrays(GL_TRIANGLES, 0, 3);
+
+        glFlush();
+
         if should_log_stats {
             let pass1_error = glGetError();
             let pass1_stats = readback_framebuffer_luma_stats(
@@ -1569,31 +2264,32 @@ pub(crate) fn render_ahardwarebuffer_to_target(
                 intermediate.height,
             );
             info!(
-                "AHB pass1 stats: eye={:?} source={}x{} intermediate={}x{} center_pixel={:?} luma_avg={:.1} dark_pct={:.1} bright_pct={:.1} gl_error=0x{pass1_error:04x}",
+                "AHB pass1 stats: eye={:?} source={}x{} intermediate={}x{} luma_avg={:.1} dark_pct={:.1} bright_pct={:.1} gl_error=0x{pass1_error:04x}",
                 eye,
                 frame.width,
                 frame.height,
                 intermediate.width,
                 intermediate.height,
-                pass1_stats.center_pixel,
                 pass1_stats.average_luma,
                 pass1_stats.dark_percent,
                 pass1_stats.bright_percent,
             );
         }
 
-        // Clean up pass 1
-        glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
-        glDeleteTextures(1, &source_texture);
-        if destroy_image(display, egl_image) == 0 {
-            warn!("eglDestroyImageKHR failed for decoded AHardwareBuffer image");
-        }
+        // Clean up upload texture
+        glDeleteTextures(1, &upload_texture);
+
+        // Unlock the AHardwareBuffer
+        ffi::AHardwareBuffer_unlock(
+            hardware_buffer_ptr as *mut ffi::AHardwareBuffer,
+            ptr::null_mut(),
+        );
 
         // --- Pass 2: intermediate RGBA → eye render target via GL_TEXTURE_2D + foveation ---
+        let blit_program = get_blit_program().context("get blit shader")?;
+
         glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
         glViewport(0, 0, target.width, target.height);
-        // Clear to black so the strip left uncovered by the convergence pre-shift shows black
-        // rather than the Pimax background panel bleeding through.
         glClearColor(0.0, 0.0, 0.0, 1.0);
         glClear(0x4000); // GL_COLOR_BUFFER_BIT = 0x00004000
         glUseProgram(blit_program.program);
@@ -1606,14 +2302,10 @@ pub(crate) fn render_ahardwarebuffer_to_target(
             if foveation.is_some() { 1 } else { 0 },
         );
         glUniform1i(blit_program.view_index_uniform, view_index);
-        // Pre-shift each eye's rendered output convergently to cancel the Pimax
-        // compositor's built-in divergent warp. Tunable live via HTTP at :7878.
-        let shift = crate::tune::convergence_shift_ndc();
-        let convergence_shift = match eye {
-            VideoFrameEye::Left => shift,
-            VideoFrameEye::Right => -shift,
-        };
-        glUniform1f(blit_program.position_offset_x_uniform, convergence_shift);
+        glUniform1f(
+            blit_program.position_offset_x_uniform,
+            convergence_position_offset_for_eye(eye),
+        );
         if let Some(constants) = foveation {
             glUniform4f(
                 blit_program.foveation_view_ratio_edge_uniform,
@@ -1680,23 +2372,23 @@ pub(crate) fn render_ahardwarebuffer_to_target(
         glUseProgram(0);
         glBindFramebuffer(GL_FRAMEBUFFER, previous_framebuffer);
         glFlush();
-    }
 
-    if count <= 5 || count % 120 == 0 {
-        info!(
-            "two-pass blit to {:?} eye: source={}x{} intermediate={}x{} target={}x{} uv=({:.3},{:.3}) foveated={} blits={}",
-            eye,
-            frame.width,
-            frame.height,
-            intermediate.width,
-            intermediate.height,
-            target.width,
-            target.height,
-            u0,
-            u1,
-            foveation.is_some(),
-            count
-        );
+        if count <= 5 || count % 120 == 0 {
+            info!(
+                "two-pass blit to {:?} eye: source={}x{} intermediate={}x{} target={}x{} uv=({:.3},{:.3}) foveated={} blits={}",
+                eye,
+                frame.width,
+                frame.height,
+                intermediate.width,
+                intermediate.height,
+                target.width,
+                target.height,
+                u0,
+                u1,
+                foveation.is_some(),
+                count
+            );
+        }
     }
 
     Ok(())
@@ -1711,6 +2403,10 @@ pub(crate) fn copy_video_frame_to_target(
     frame: &VideoFrame,
     eye: VideoFrameEye,
 ) -> Result<()> {
+    if let Some(nv12) = frame.nv12.as_deref() {
+        return copy_nv12_frame_to_target(target, frame, nv12, eye);
+    }
+
     if let Some(rgba) = frame.rgba.as_deref() {
         return copy_rgba_frame_to_target(target, frame, rgba, eye);
     }
@@ -1736,13 +2432,460 @@ pub(crate) fn copy_video_frame_to_target(
     Ok(())
 }
 
+/// Zero-copy render of an upstream AHardwareBuffer to both eye targets.
+///
+/// Creates an EGLImage from the AHardwareBuffer, binds it to
+/// GL_TEXTURE_EXTERNAL_OES, and runs the two-pass blit pipeline.
+pub(crate) fn render_ahardwarebuffer_zero_copy(
+    left_target: &EyeRenderTarget,
+    right_target: &EyeRenderTarget,
+    buffer_ptr: *mut c_void,
+    _timestamp_ns: u64,
+) -> Result<()> {
+    if buffer_ptr.is_null() {
+        bail!("render_ahardwarebuffer_zero_copy called with null buffer_ptr");
+    }
+
+    let (frame_width, frame_height) = crate::android_video_decoder::upstream_decoder_dimensions()
+        .unwrap_or_else(|| {
+            // Fallback to target dimensions if decoder dimensions are unknown.
+            // For side-by-side stereo, source width is roughly 2x eye width.
+            (left_target.width * 2, left_target.height)
+        });
+
+    // Load cached EGL extension procs.
+    let get_native_client_buffer =
+        get_egl_native_client_buffer().context("load eglGetNativeClientBufferANDROID")?;
+    let create_image = get_egl_create_image_khr().context("load eglCreateImageKHR")?;
+    let destroy_image = get_egl_destroy_image_khr().context("load eglDestroyImageKHR")?;
+    let image_target =
+        get_gl_egl_image_target_texture_2d_oes().context("load glEGLImageTargetTexture2DOES")?;
+
+    // Lazy-destroy EGLImage cache: only create a new one when the buffer
+    // pointer changes. This avoids the ~2-5ms create/destroy overhead on
+    // Adreno drivers when the same buffer is reused across consecutive frames.
+    static CACHED_EGL_IMAGE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+    static CACHED_BUFFER_PTR: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+
+    let cached_buffer_ptr = CACHED_BUFFER_PTR.load(Ordering::Relaxed);
+    let egl_image = if cached_buffer_ptr == buffer_ptr {
+        CACHED_EGL_IMAGE.load(Ordering::Relaxed)
+    } else {
+        // Buffer changed: destroy old EGLImage if present.
+        let old_image = CACHED_EGL_IMAGE.swap(ptr::null_mut(), Ordering::Relaxed);
+        if !old_image.is_null() {
+            unsafe { destroy_image(eglGetCurrentDisplay(), old_image) };
+        }
+        // Convert AHardwareBuffer pointer to EGLClientBuffer.
+        let client_buffer = unsafe { get_native_client_buffer(buffer_ptr) };
+        if client_buffer.is_null() {
+            bail!("eglGetNativeClientBufferANDROID returned null");
+        }
+        let new_image = unsafe {
+            create_image(
+                eglGetCurrentDisplay(),
+                ptr::null_mut(), // EGL_NO_CONTEXT
+                EGL_NATIVE_BUFFER_ANDROID,
+                client_buffer,
+                ptr::null(), // no attribs
+            )
+        };
+        if new_image.is_null() {
+            bail!("eglCreateImageKHR returned null");
+        }
+        CACHED_BUFFER_PTR.store(buffer_ptr, Ordering::Relaxed);
+        CACHED_EGL_IMAGE.store(new_image, Ordering::Relaxed);
+        new_image
+    };
+
+    unsafe {
+        // Reuse a persistent GL_TEXTURE_EXTERNAL_OES texture.
+        let oes_texture = get_zero_copy_oes_texture();
+        if oes_texture == 0 {
+            bail!("glGenTextures returned 0 for OES texture");
+        }
+
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, oes_texture);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+        // Bind the EGLImage to the OES texture.
+        image_target(GL_TEXTURE_EXTERNAL_OES, egl_image);
+
+        // --- Pass 1: OES → intermediate RGBA FBO ---
+        let intermediate =
+            get_intermediate_fbo(frame_width, frame_height).context("get intermediate FBO")?;
+        let passthrough = get_passthrough_oes_program().context("get passthrough OES shader")?;
+
+        let previous_framebuffer = current_framebuffer_binding();
+
+        glBindFramebuffer(GL_FRAMEBUFFER, intermediate.framebuffer);
+        glViewport(0, 0, intermediate.width, intermediate.height);
+        glUseProgram(passthrough.program);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, oes_texture);
+        glUniform1i(passthrough.texture_uniform, 0);
+        let (black_crush, color_gain) = stream_color_adjustment();
+        glUniform1f(passthrough.black_crush_uniform, black_crush);
+        glUniform1f(passthrough.color_gain_uniform, color_gain);
+        glUniform1i(passthrough.hdr_mode_uniform, if hdr_stream_enabled() { 1 } else { 0 });
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+
+        // --- Pass 2: intermediate RGBA → left eye ---
+        blit_intermediate_to_eye(
+            &intermediate,
+            left_target,
+            VideoFrameEye::Left,
+            frame_width as u32,
+            frame_height as u32,
+        )?;
+
+        // --- Pass 2: intermediate RGBA → right eye ---
+        blit_intermediate_to_eye(
+            &intermediate,
+            right_target,
+            VideoFrameEye::Right,
+            frame_width as u32,
+            frame_height as u32,
+        )?;
+
+        // Cleanup
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+        glUseProgram(0);
+        // Keep the source buffer alive until the GPU has finished sampling it.
+        // This avoids buffer reuse races on drivers that recycle decoder output
+        // aggressively once the Image handle is dropped on the next frame.
+        glFinish();
+        glBindFramebuffer(GL_FRAMEBUFFER, previous_framebuffer);
+    }
+
+    Ok(())
+}
+
+fn blit_intermediate_to_eye(
+    intermediate: &IntermediateFbo,
+    target: &EyeRenderTarget,
+    eye: VideoFrameEye,
+    frame_width: u32,
+    frame_height: u32,
+) -> Result<()> {
+    let source_eye = source_eye_for_target(eye);
+    let side_by_side_stereo = frame_width >= frame_height.saturating_mul(2) && frame_width >= 2;
+    let (u0, u1) = if side_by_side_stereo {
+        match source_eye {
+            VideoFrameEye::Left => (0.0_f32, 0.5_f32),
+            VideoFrameEye::Right => (0.5_f32, 1.0_f32),
+        }
+    } else {
+        (0.0_f32, 1.0_f32)
+    };
+    let (v0, v1) = if PIMAX_FLIP_STREAM_VERTICAL {
+        (1.0_f32, 0.0_f32)
+    } else {
+        (0.0_f32, 1.0_f32)
+    };
+
+    let view_index = match eye {
+        VideoFrameEye::Left => 0,
+        VideoFrameEye::Right => 1,
+    };
+
+    let blit_program = get_blit_program().context("get blit shader")?;
+
+    unsafe {
+        glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
+        glViewport(0, 0, target.width, target.height);
+        prepare_video_blit_state();
+        glClearColor(0.0, 0.0, 0.0, 1.0);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glUseProgram(blit_program.program);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, intermediate.texture);
+        glUniform1i(blit_program.texture_uniform, 0);
+        glUniform4f(blit_program.uv_rect_uniform, u0, v0, u1, v1);
+        glUniform1i(blit_program.foveation_enabled_uniform, 0); // TODO: foveation for zero-copy
+        glUniform1i(blit_program.view_index_uniform, view_index);
+        glUniform1f(
+            blit_program.position_offset_x_uniform,
+            convergence_position_offset_for_eye(eye),
+        );
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+
+    Ok(())
+}
+
+fn copy_nv12_frame_to_target(
+    target: &EyeRenderTarget,
+    frame: &VideoFrame,
+    nv12: &[u8],
+    eye: VideoFrameEye,
+) -> Result<()> {
+    let width = frame.width as usize;
+    let height = frame.height as usize;
+    let uv_width = (width + 1) / 2;
+    let uv_height = (height + 1) / 2;
+    let y_plane_len = width
+        .checked_mul(height)
+        .context("NV12 frame Y plane size overflow")?;
+    let uv_plane_len = uv_width
+        .checked_mul(uv_height)
+        .and_then(|samples| samples.checked_mul(2))
+        .context("NV12 frame UV plane size overflow")?;
+    let expected_len = y_plane_len
+        .checked_add(uv_plane_len)
+        .context("NV12 frame payload size overflow")?;
+    if nv12.len() < expected_len {
+        bail!(
+            "NV12 frame payload too small: got {} bytes, expected at least {expected_len}",
+            nv12.len()
+        );
+    }
+
+    let source_eye = source_eye_for_target(eye);
+    let side_by_side_stereo = frame.width >= frame.height.saturating_mul(2) && frame.width >= 2;
+    let (u0, u1) = if side_by_side_stereo {
+        match source_eye {
+            VideoFrameEye::Left => (0.0_f32, 0.5_f32),
+            VideoFrameEye::Right => (0.5_f32, 1.0_f32),
+        }
+    } else {
+        (0.0_f32, 1.0_f32)
+    };
+    let (v0, v1) = if PIMAX_FLIP_STREAM_VERTICAL {
+        (1.0_f32, 0.0_f32)
+    } else {
+        (0.0_f32, 1.0_f32)
+    };
+    let foveation = active_foveation_for_frame(frame);
+    let view_index = match eye {
+        VideoFrameEye::Left => 0,
+        VideoFrameEye::Right => 1,
+    };
+    let previous_framebuffer = current_framebuffer_binding();
+    let program = get_nv12_blit_program().context("get NV12 blit shader")?;
+    let textures = get_nv12_upload_textures(frame.width as i32, frame.height as i32)
+        .context("get NV12 upload textures")?;
+    let count = NV12_BLIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let should_log_stats = count <= 5 || count % 120 == 0;
+    let center_debug = if should_log_stats {
+        let sample_x = width / 2;
+        let sample_y = height / 2;
+        Some(sample_nv12_center_debug(
+            nv12,
+            width,
+            height,
+            y_plane_len,
+            uv_width,
+            sample_x,
+            sample_y,
+        )?)
+    } else {
+        None
+    };
+
+    unsafe {
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, textures.y_texture);
+        glTexSubImage2D(
+            GL_TEXTURE_2D,
+            0,
+            0,
+            0,
+            frame.width as i32,
+            frame.height as i32,
+            GL_RED,
+            GL_UNSIGNED_BYTE,
+            nv12.as_ptr().cast(),
+        );
+
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, textures.uv_texture);
+        glTexSubImage2D(
+            GL_TEXTURE_2D,
+            0,
+            0,
+            0,
+            uv_width as i32,
+            uv_height as i32,
+            GL_RG,
+            GL_UNSIGNED_BYTE,
+            nv12[y_plane_len..].as_ptr().cast(),
+        );
+
+        glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
+        glViewport(0, 0, target.width, target.height);
+        prepare_video_blit_state();
+        glClearColor(0.0, 0.0, 0.0, 1.0);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glUseProgram(program.program);
+        glUniform1i(program.y_texture_uniform, 0);
+        glUniform1i(program.uv_texture_uniform, 1);
+        glUniform4f(program.uv_rect_uniform, u0, v0, u1, v1);
+        glUniform1i(
+            program.foveation_enabled_uniform,
+            if foveation.is_some() { 1 } else { 0 },
+        );
+        glUniform1i(program.view_index_uniform, view_index);
+        glUniform1f(
+            program.position_offset_x_uniform,
+            convergence_position_offset_for_eye(eye),
+        );
+        if let Some(constants) = foveation {
+            glUniform4f(
+                program.foveation_view_ratio_edge_uniform,
+                constants.view_width_ratio,
+                constants.view_height_ratio,
+                constants.edge_ratio_x,
+                constants.edge_ratio_y,
+            );
+            glUniform4f(
+                program.foveation_c1_c2_uniform,
+                constants.c1_x,
+                constants.c1_y,
+                constants.c2_x,
+                constants.c2_y,
+            );
+            glUniform4f(
+                program.foveation_bounds_uniform,
+                constants.lo_bound_x,
+                constants.lo_bound_y,
+                constants.hi_bound_x,
+                constants.hi_bound_y,
+            );
+            glUniform4f(
+                program.foveation_left_uniform,
+                constants.a_left_x,
+                constants.a_left_y,
+                constants.b_left_x,
+                constants.b_left_y,
+            );
+            glUniform4f(
+                program.foveation_right_uniform,
+                constants.a_right_x,
+                constants.a_right_y,
+                constants.b_right_x,
+                constants.b_right_y,
+            );
+            glUniform4f(
+                program.foveation_c_right_uniform,
+                constants.c_right_x,
+                constants.c_right_y,
+                0.0,
+                0.0,
+            );
+        }
+        let (black_crush, color_gain) = stream_color_adjustment();
+        glUniform1f(program.black_crush_uniform, black_crush);
+        glUniform1f(program.color_gain_uniform, color_gain);
+        glUniform1i(program.hdr_mode_uniform, if hdr_stream_enabled() { 1 } else { 0 });
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        if should_log_stats {
+            let gl_error = glGetError();
+            let stats =
+                readback_framebuffer_luma_stats(target.framebuffer, target.width, target.height);
+            info!(
+                "NV12 blit stats: eye={:?} source={}x{} target={}x{} center_pixel={:?} raw_center={:?} nv12_rgb={:?} nv21_rgb={:?} luma_avg={:.1} dark_pct={:.1} bright_pct={:.1} gl_error=0x{gl_error:04x} blits={count}",
+                eye,
+                frame.width,
+                frame.height,
+                target.width,
+                target.height,
+                stats.center_pixel,
+                center_debug.as_ref().map(|debug| debug.raw_yuv),
+                center_debug.as_ref().map(|debug| debug.nv12_rgb),
+                center_debug.as_ref().map(|debug| debug.nv21_rgb),
+                stats.average_luma,
+                stats.dark_percent,
+                stats.bright_percent,
+            );
+        }
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glUseProgram(0);
+        glBindFramebuffer(GL_FRAMEBUFFER, previous_framebuffer);
+        glFlush();
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Nv12CenterDebug {
+    raw_yuv: [u8; 3],
+    nv12_rgb: [u8; 3],
+    nv21_rgb: [u8; 3],
+}
+
+fn sample_nv12_center_debug(
+    nv12: &[u8],
+    width: usize,
+    height: usize,
+    y_plane_len: usize,
+    uv_width: usize,
+    sample_x: usize,
+    sample_y: usize,
+) -> Result<Nv12CenterDebug> {
+    let clamped_x = sample_x.min(width.saturating_sub(1));
+    let clamped_y = sample_y.min(height.saturating_sub(1));
+    let y_index = clamped_y
+        .checked_mul(width)
+        .and_then(|offset| offset.checked_add(clamped_x))
+        .context("NV12 center Y index overflow")?;
+    let uv_row = clamped_y / 2;
+    let uv_col = clamped_x / 2;
+    let uv_index = y_plane_len
+        .checked_add(
+            uv_row
+                .checked_mul(uv_width)
+                .and_then(|offset| offset.checked_mul(2))
+                .context("NV12 center UV row offset overflow")?,
+        )
+        .and_then(|offset| offset.checked_add(uv_col.checked_mul(2)?))
+        .context("NV12 center UV index overflow")?;
+    let y = *nv12
+        .get(y_index)
+        .context("NV12 center Y sample out of range")?;
+    let u = *nv12
+        .get(uv_index)
+        .context("NV12 center U sample out of range")?;
+    let v = *nv12
+        .get(uv_index + 1)
+        .context("NV12 center V sample out of range")?;
+
+    Ok(Nv12CenterDebug {
+        raw_yuv: [y, u, v],
+        nv12_rgb: bt709_limited_rgb(y, u, v),
+        nv21_rgb: bt709_limited_rgb(y, v, u),
+    })
+}
+
+pub(crate) fn bt709_limited_rgb(y: u8, u: u8, v: u8) -> [u8; 3] {
+    let c = (y as i32 - 16).max(0);
+    let d = u as i32 - 128;
+    let e = v as i32 - 128;
+
+    let r = ((298 * c + 459 * e + 128) >> 8).clamp(0, 255) as u8;
+    let g = ((298 * c - 55 * d - 136 * e + 128) >> 8).clamp(0, 255) as u8;
+    let b = ((298 * c + 541 * d + 128) >> 8).clamp(0, 255) as u8;
+    [r, g, b]
+}
+
 fn copy_rgba_frame_to_target(
     target: &EyeRenderTarget,
     frame: &VideoFrame,
     rgba: &[u8],
     eye: VideoFrameEye,
 ) -> Result<()> {
-    let expected_len = (frame.width as usize)
+    let width = frame.width as usize;
+    let height = frame.height as usize;
+    let expected_len = width
         .checked_mul(frame.height as usize)
         .and_then(|pixels| pixels.checked_mul(4))
         .context("RGBA frame dimensions overflow")?;
@@ -1755,68 +2898,137 @@ fn copy_rgba_frame_to_target(
 
     let source_eye = source_eye_for_target(eye);
     let side_by_side_stereo = frame.width >= frame.height.saturating_mul(2) && frame.width >= 2;
-    let (source_x, source_width) = if side_by_side_stereo {
-        let half = (frame.width / 2) as i32;
+    let (u0, u1) = if side_by_side_stereo {
         match source_eye {
-            VideoFrameEye::Left => (0_i32, half),
-            VideoFrameEye::Right => (half, half),
+            VideoFrameEye::Left => (0.0_f32, 0.5_f32),
+            VideoFrameEye::Right => (0.5_f32, 1.0_f32),
         }
     } else {
-        (0_i32, frame.width as i32)
+        (0.0_f32, 1.0_f32)
     };
-
-    let upload_width = (source_width as i32).min(target.width).max(1);
-    let upload_height = (frame.height as i32).min(target.height).max(1);
-    let x_offset = ((target.width - upload_width) / 2).max(0);
-    let y_offset = ((target.height - upload_height) / 2).max(0);
-    let upload_bytes = (upload_width as usize) * (upload_height as usize) * 4;
-
-    let clipped;
-    let upload_data = if !PIMAX_FLIP_STREAM_VERTICAL
-        && upload_width as u32 == frame.width
-        && upload_height as u32 == frame.height
-    {
-        &rgba[..upload_bytes]
+    let (v0, v1) = if PIMAX_FLIP_STREAM_VERTICAL {
+        (1.0_f32, 0.0_f32)
     } else {
-        clipped = {
-            let mut clipped = vec![0_u8; upload_bytes];
-            let source_stride = frame.row_pitch.max(frame.width.saturating_mul(4)) as usize;
-            let dest_stride = upload_width as usize * 4;
-            let source_x_bytes = source_x as usize * 4;
-            for row in 0..upload_height as usize {
-                let source_row = if PIMAX_FLIP_STREAM_VERTICAL {
-                    upload_height as usize - 1 - row
-                } else {
-                    row
-                };
-                let source_start = source_row
+        (0.0_f32, 1.0_f32)
+    };
+    let foveation = active_foveation_for_frame(frame);
+    let view_index = match eye {
+        VideoFrameEye::Left => 0,
+        VideoFrameEye::Right => 1,
+    };
+    let upload_texture = get_rgba_upload_texture(frame.width as i32, frame.height as i32)
+        .context("get RGBA upload texture")?;
+    let previous_framebuffer = current_framebuffer_binding();
+    let program = get_blit_program().context("get RGBA blit program")?;
+    let source_stride = frame.row_pitch.max(frame.width.saturating_mul(4)) as usize;
+    let packed_stride = width
+        .checked_mul(4)
+        .context("RGBA packed row stride overflow")?;
+    let packed;
+    let upload_data = if source_stride == packed_stride {
+        &rgba[..expected_len]
+    } else {
+        packed = {
+            let mut packed = vec![0_u8; expected_len];
+            for row in 0..height {
+                let source_start = row
                     .checked_mul(source_stride)
-                    .and_then(|offset| offset.checked_add(source_x_bytes))
                     .context("RGBA source row offset overflow")?;
-                let source_end = source_start + dest_stride;
-                let dest_start = row * dest_stride;
-                clipped[dest_start..dest_start + dest_stride]
+                let source_end = source_start
+                    .checked_add(packed_stride)
+                    .context("RGBA source row end overflow")?;
+                let dest_start = row
+                    .checked_mul(packed_stride)
+                    .context("RGBA destination row offset overflow")?;
+                packed[dest_start..dest_start + packed_stride]
                     .copy_from_slice(&rgba[source_start..source_end]);
             }
-            clipped
+            packed
         };
-        &clipped
+        &packed
     };
 
     unsafe {
-        glBindTexture(GL_TEXTURE_2D, target.texture);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, upload_texture.texture);
         glTexSubImage2D(
             GL_TEXTURE_2D,
             0,
-            x_offset,
-            y_offset,
-            upload_width,
-            upload_height,
+            0,
+            0,
+            frame.width as i32,
+            frame.height as i32,
             GL_RGBA,
             GL_UNSIGNED_BYTE,
             upload_data.as_ptr().cast(),
         );
+
+        glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
+        glViewport(0, 0, target.width, target.height);
+        prepare_video_blit_state();
+        glClearColor(0.0, 0.0, 0.0, 1.0);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glUseProgram(program.program);
+        glUniform1i(program.texture_uniform, 0);
+        glUniform4f(program.uv_rect_uniform, u0, v0, u1, v1);
+        glUniform1i(
+            program.foveation_enabled_uniform,
+            if foveation.is_some() { 1 } else { 0 },
+        );
+        glUniform1i(program.view_index_uniform, view_index);
+        glUniform1f(
+            program.position_offset_x_uniform,
+            convergence_position_offset_for_eye(eye),
+        );
+        if let Some(constants) = foveation {
+            glUniform4f(
+                program.foveation_view_ratio_edge_uniform,
+                constants.view_width_ratio,
+                constants.view_height_ratio,
+                constants.edge_ratio_x,
+                constants.edge_ratio_y,
+            );
+            glUniform4f(
+                program.foveation_c1_c2_uniform,
+                constants.c1_x,
+                constants.c1_y,
+                constants.c2_x,
+                constants.c2_y,
+            );
+            glUniform4f(
+                program.foveation_bounds_uniform,
+                constants.lo_bound_x,
+                constants.lo_bound_y,
+                constants.hi_bound_x,
+                constants.hi_bound_y,
+            );
+            glUniform4f(
+                program.foveation_left_uniform,
+                constants.a_left_x,
+                constants.a_left_y,
+                constants.b_left_x,
+                constants.b_left_y,
+            );
+            glUniform4f(
+                program.foveation_right_uniform,
+                constants.a_right_x,
+                constants.a_right_y,
+                constants.b_right_x,
+                constants.b_right_y,
+            );
+            glUniform4f(
+                program.foveation_c_right_uniform,
+                constants.c_right_x,
+                constants.c_right_y,
+                0.0,
+                0.0,
+            );
+        }
+        glDrawArrays(GL_TRIANGLES, 0, 3);
         glBindTexture(GL_TEXTURE_2D, 0);
+        glUseProgram(0);
+        glBindFramebuffer(GL_FRAMEBUFFER, previous_framebuffer);
         glFlush();
     }
 

@@ -1,10 +1,12 @@
 param(
     [string]$Serial,
     [string]$ArtifactRoot = ".tmp",
-    [int[]]$SnapshotSeconds = @(5, 20, 45, 120),
+    [int[]]$SnapshotSeconds = @(5, 20, 45),
     [int]$Brightness = 135,
     [int]$NetworkWaitTimeoutSeconds = 90,
     [int]$SteamVRRestartWaitSeconds = 25,
+    [int]$AdbCommandTimeoutSeconds = 45,
+    [int]$AdbWaitForDeviceTimeoutSeconds = 120,
     [switch]$RebootBeforeRun,
     [switch]$RecoverAfterRun,
     [switch]$SkipSteamVRRestart,
@@ -22,6 +24,9 @@ $competingPackageNames = @(
 $screenOffTimeoutMs = 20000
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $guardianHelper = Join-Path $PSScriptRoot "pimax-ensure-guardian-stationary.ps1"
+if ($ArtifactRoot -match '^[0-9]+$') {
+    throw "ArtifactRoot was parsed as a bare number ('$ArtifactRoot'). Pass -SnapshotSeconds as an array, for example '-SnapshotSeconds @(5,20,45)' or '-SnapshotSeconds 5,20,45'."
+}
 $artifactRootPath = if ([System.IO.Path]::IsPathRooted($ArtifactRoot)) {
     $ArtifactRoot
 } else {
@@ -49,15 +54,64 @@ function Invoke-AdbCommand {
     param(
         [string]$Description,
         [string[]]$AdbCommandArgs,
+        [int]$TimeoutSeconds = $AdbCommandTimeoutSeconds,
         [switch]$AllowFailure
     )
+
+    if ($TimeoutSeconds -le 0) {
+        throw "Invalid timeout for $Description`: $TimeoutSeconds seconds"
+    }
 
     $previousErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        $baseAdbArgs = $script:AdbArgs
-        $output = & adb @baseAdbArgs @AdbCommandArgs 2>&1
-        $exitCode = $LASTEXITCODE
+        $adbPath = (Get-Command adb -ErrorAction Stop).Source
+
+        function Quote-CommandLineArgument {
+            param([string]$Argument)
+
+            if ($Argument -match '[\s"`]') {
+                return '"' + ($Argument -replace '"', '\"') + '"'
+            }
+
+            return $Argument
+        }
+
+        $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $processInfo.FileName = $adbPath
+        $processInfo.Arguments = (($script:AdbArgs + $AdbCommandArgs) | ForEach-Object { Quote-CommandLineArgument $_ }) -join ' '
+        $processInfo.UseShellExecute = $false
+        $processInfo.RedirectStandardOutput = $true
+        $processInfo.RedirectStandardError = $true
+        $processInfo.CreateNoWindow = $true
+
+        $process = [System.Diagnostics.Process]::Start($processInfo)
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            try { $process.Kill($true) } catch { try { $process.Kill() } catch {} }
+            $process.Dispose()
+            $message = "$Description timed out after $TimeoutSeconds seconds: adb $($script:AdbArgs + $AdbCommandArgs -join ' ')"
+            if ($AllowFailure) {
+                Write-Warning $message
+                return [pscustomobject]@{
+                    ExitCode = 124
+                    Output = @($message)
+                }
+            }
+
+            throw $message
+        }
+
+        $process.WaitForExit() | Out-Null
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        $exitCode = $process.ExitCode
+        $process.Dispose()
+        $output = @()
+        if (-not [string]::IsNullOrWhiteSpace($stdout)) { $output += $stdout -split "`r?`n" }
+        if (-not [string]::IsNullOrWhiteSpace($stderr)) { $output += $stderr -split "`r?`n" }
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference
     }
@@ -92,7 +146,7 @@ function Wait-For-BootCompleted {
         [int]$TimeoutSeconds = 240
     )
 
-    Invoke-AdbCommand -Description "wait for adb device" -AdbCommandArgs @("wait-for-device") | Out-Null
+    Invoke-AdbCommand -Description "wait for adb device" -AdbCommandArgs @("wait-for-device") -TimeoutSeconds $AdbWaitForDeviceTimeoutSeconds | Out-Null
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {
         Start-Sleep -Seconds 3
@@ -372,13 +426,15 @@ function Set-PimaxBootProperties {
         -Description "disable Pimax station power-management property" `
         -AdbCommandArgs @("shell", "setprop persist.sys.pmx.sta.pm.enable false") `
         -AllowFailure | Out-Null
+    # For automated testing without a face on the headset, keep the display on
+    # by disabling proximity-sensor sleep.
     Invoke-AdbCommand `
-        -Description "restore Pimax proximity/gyro sleep policy" `
-        -AdbCommandArgs @("shell", "setprop persist.sys.pmx.psensor.gotosleep true") `
+        -Description "disable Pimax proximity-sensor sleep for testing" `
+        -AdbCommandArgs @("shell", "setprop persist.sys.pmx.psensor.gotosleep false") `
         -AllowFailure | Out-Null
     Invoke-AdbCommand `
-        -Description "restore normal Pimax proximity state-machine" `
-        -AdbCommandArgs @("shell", "setprop persist.sys.pmx.dbg.disable.psensor false") `
+        -Description "disable Pimax proximity state-machine for testing" `
+        -AdbCommandArgs @("shell", "setprop persist.sys.pmx.dbg.disable.psensor true") `
         -AllowFailure | Out-Null
     Invoke-AdbCommand `
         -Description "disable Android dim-screen setting" `
@@ -693,10 +749,7 @@ try {
         $label = "after-${second}s"
         Save-DisplaySnapshot -Label $label
         Write-DisplaySummary -Label $label
-        if (Test-DisplayOff -Label $label) {
-            $displayOff = $true
-            break
-        }
+        $displayOff = Test-DisplayOff -Label $label
     }
 
     if ($displayOff -and $LeaveRunningWhenDisplayOff) {

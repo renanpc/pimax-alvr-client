@@ -113,6 +113,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(target_os = "android")]
+use std::os::fd::AsRawFd;
+
 use anyhow::{anyhow, bail, Context, Result};
 use log::{info, warn};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -178,23 +181,30 @@ impl VideoDecoderBridge {
         _mime_type: &'static str,
         _codec_label: &str,
         _config_buffer: Vec<u8>,
+        _frame_width: i32,
+        _frame_height: i32,
     ) -> Result<()> {
         Ok(())
     }
 
-    fn push_nal(&self, _timestamp_ns: u64, _is_idr: bool, _data: Vec<u8>) {}
+    fn push_nal(&self, _timestamp_ns: u64, _is_idr: bool, _data: Vec<u8>) -> bool {
+        true
+    }
 }
 
 const HANDSHAKE_ACTION_TIMEOUT: Duration = Duration::from_secs(5);
 const ALVR_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(500);
-const ALVR_IDR_REQUEST_INTERVAL: Duration = Duration::from_secs(2);
+const ALVR_RUNTIME_IDR_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(500);
 const ALVR_STREAM_RECV_TIMEOUT: Duration = Duration::from_millis(500);
-const ALVR_STREAM_SHARD_PREFIX_SIZE: usize = 18;
+const ALVR_STREAM_SHARD_PREFIX_SIZE: usize = 14;
+#[cfg(target_os = "android")]
+const ALVR_UDP_RECEIVE_BUFFER_BYTES: i32 = 4 * 1024 * 1024;
 const ALVR_TRACKING_STREAM_ID: u16 = 0;
+const ALVR_AUDIO_STREAM_ID: u16 = 2;
 const ALVR_VIDEO_STREAM_ID: u16 = 3;
 const ALVR_STATISTICS_STREAM_ID: u16 = 4;
 const ALVR_STREAM_LOG_EVERY: u64 = 3_600;
-const ALVR_INITIAL_IDR_REQUESTS: u32 = 5;
+const ALVR_BUFFER_MODE_VIEW_RESOLUTION: u32 = 2880;
 const ALVR_TRACKING_SEND_INTERVAL: Duration = Duration::from_micros(13_889);
 // 30 Hz button send rate. Higher than typical OpenXR sample rate but well
 // below the 90 Hz tracking rate to avoid flooding the control TCP socket.
@@ -218,6 +228,7 @@ static LATEST_HEAD_TRACKING_POSE: Mutex<Option<AlvrHeadTrackingPose>> = Mutex::n
 static ALVR_STATISTICS_STATE: Mutex<Option<AlvrClientStatisticsState>> = Mutex::new(None);
 static ALVR_STATISTICS_SENDER: Mutex<Option<AlvrStreamHeaderSender>> = Mutex::new(None);
 static ALVR_VIEW_CONFIG_STATE: Mutex<Option<VersionedViewsConfig>> = Mutex::new(None);
+static PIMAX_VIEW_INFO: Mutex<Option<PimaxViewInfo>> = Mutex::new(None);
 /// Raw physical IPD in metres, last reported by the Pimax hardware sensor.
 /// Stored separately so the tune IPD scale can be applied live without waiting
 /// for the next hardware IPD event.
@@ -228,6 +239,14 @@ struct AlvrHeadTrackingPose {
     orientation: glam::Quat,
     position: glam::Vec3,
     timestamp: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PimaxViewInfo {
+    fov_x_rad: f32,
+    fov_y_rad: f32,
+    eye_width: i32,
+    eye_height: i32,
 }
 
 pub(crate) fn update_head_tracking_pose(
@@ -279,6 +298,43 @@ pub(crate) fn update_alvr_views_config_from_pimax(
     eye_width: i32,
     eye_height: i32,
 ) {
+    if let Ok(mut info) = PIMAX_VIEW_INFO.lock() {
+        *info = Some(PimaxViewInfo {
+            fov_x_rad,
+            fov_y_rad,
+            eye_width,
+            eye_height,
+        });
+    }
+    update_alvr_views_config_from_pimax_scaled(
+        fov_x_rad,
+        fov_y_rad,
+        eye_width,
+        eye_height,
+        crate::tune::eye_render_scale(),
+    );
+}
+
+pub(crate) fn notify_fov_scale_changed() {
+    let Some(info) = PIMAX_VIEW_INFO.lock().ok().and_then(|info| *info) else {
+        return;
+    };
+    update_alvr_views_config_from_pimax_scaled(
+        info.fov_x_rad,
+        info.fov_y_rad,
+        info.eye_width,
+        info.eye_height,
+        crate::tune::eye_render_scale(),
+    );
+}
+
+fn update_alvr_views_config_from_pimax_scaled(
+    fov_x_rad: f32,
+    fov_y_rad: f32,
+    eye_width: i32,
+    eye_height: i32,
+    eye_render_scale: f32,
+) {
     if !fov_x_rad.is_finite() || !fov_y_rad.is_finite() || fov_x_rad <= 0.0 || fov_y_rad <= 0.0 {
         warn!(
             "ignoring invalid Pimax ALVR view config input: fov_x_rad={} fov_y_rad={} eye={}x{}",
@@ -287,8 +343,13 @@ pub(crate) fn update_alvr_views_config_from_pimax(
         return;
     }
 
-    let horizontal_tan = (fov_x_rad * 0.5).tan().clamp(0.01, 8.0);
-    let vertical_tan = (fov_y_rad * 0.5).tan().clamp(0.01, 8.0);
+    let eye_scale = eye_render_scale.max(0.5);
+    let fov_scale = crate::tune::fov_scale().clamp(0.8, 1.2);
+    let eye_width = ((eye_width.max(1) as f32) * eye_scale).round().max(1.0) as i32;
+    let eye_height = ((eye_height.max(1) as f32) * eye_scale).round().max(1.0) as i32;
+
+    let horizontal_tan = ((fov_x_rad * 0.5).tan() * fov_scale).clamp(0.01, 8.0);
+    let vertical_tan = ((fov_y_rad * 0.5).tan() * fov_scale).clamp(0.01, 8.0);
     let fov = Fov {
         left: -horizontal_tan,
         right: horizontal_tan,
@@ -317,10 +378,12 @@ pub(crate) fn update_alvr_views_config_from_pimax(
         config: config.clone(),
     });
     info!(
-        "updated ALVR ViewsConfig from Pimax device info: version={} eye={}x{} ipd_m={:.3} fov_rad=({:.6},{:.6}) fov_tan=left:{:.3} right:{:.3} up:{:.3} down:{:.3}",
+        "updated ALVR ViewsConfig from Pimax device info: version={} eye={}x{} scale={:.3} fov_scale={:.3} ipd_m={:.3} fov_rad=({:.6},{:.6}) fov_tan=left:{:.3} right:{:.3} up:{:.3} down:{:.3}",
         version,
         eye_width,
         eye_height,
+        eye_scale,
+        fov_scale,
         config.ipd_m,
         fov_x_rad,
         fov_y_rad,
@@ -328,6 +391,19 @@ pub(crate) fn update_alvr_views_config_from_pimax(
         fov.right,
         fov.up,
         fov.down
+    );
+}
+
+pub(crate) fn notify_eye_render_scale_changed() {
+    let Some(info) = PIMAX_VIEW_INFO.lock().ok().and_then(|info| *info) else {
+        return;
+    };
+    update_alvr_views_config_from_pimax_scaled(
+        info.fov_x_rad,
+        info.fov_y_rad,
+        info.eye_width,
+        info.eye_height,
+        crate::tune::eye_render_scale(),
     );
 }
 
@@ -896,30 +972,30 @@ fn handle_alvr_server_control(mut stream: StdTcpStream, config: &ClientConfig) -
 
     info!("ALVR server connected to client control listener from {peer}");
     let capabilities = VideoStreamingCapabilities {
-        default_view_resolution: glam::UVec2::new(2880, 2880),
-        supported_refresh_rates: vec![72.0, 90.0],
+        // Match the Crystal panel resolution so ALVR negotiates the real per-eye size.
+        default_view_resolution: glam::UVec2::splat(ALVR_BUFFER_MODE_VIEW_RESOLUTION),
+        max_view_resolution: glam::UVec2::splat(ALVR_BUFFER_MODE_VIEW_RESOLUTION),
+        refresh_rates: vec![72.0, 90.0],
         microphone_sample_rate: 48_000,
-        supports_foveated_encoding: true,
+        foveated_encoding: true,
         encoder_high_profile: true,
-        encoder_10_bits: false,
+        // Match the upstream Android client so the server can negotiate HDR-capable encoding.
+        encoder_10_bits: true,
         encoder_av1: false,
-        multimodal_protocol: false,
         prefer_10bit: false,
-        prefer_full_range: true,
         preferred_encoding_gamma: 1.0,
-        prefer_hdr: false,
+        prefer_hdr: true,
+        ext_str: String::new(),
     };
-    let legacy_caps = encode_video_streaming_capabilities(&capabilities)
-        .context("encode ALVR capabilities to legacy format")?;
 
     send_framed(
         &mut stream,
-        &ClientConnectionResult::ConnectionAccepted {
+        &ClientConnectionResult::ConnectionAccepted(Box::new(ConnectionAcceptedInfo {
             client_protocol_id: config.protocol_id().as_u64(),
-            display_name: "Pimax Crystal OG ALVR Dev".to_string(),
+            platform_string: "Pimax Crystal OG ALVR Dev".to_string(),
             server_ip: peer.ip(),
-            streaming_capabilities: Some(legacy_caps),
-        },
+            streaming_capabilities: Some(capabilities),
+        })),
     )
     .context("send ALVR ConnectionAccepted")?;
     info!(
@@ -931,10 +1007,16 @@ fn handle_alvr_server_control(mut stream: StdTcpStream, config: &ClientConfig) -
     let stream_config: StreamConfigPacket =
         recv_framed(&mut stream).context("receive ALVR stream config packet")?;
     info!(
-        "received ALVR stream config: session_json={} bytes negotiated_json={} bytes",
+        "received ALVR stream config: session_json={} bytes negotiated={{view={}x{} refresh={} foveated={} wired={} hdr={}}}",
         stream_config.session.len(),
-        stream_config.negotiated.len()
+        stream_config.negotiated.view_resolution.x,
+        stream_config.negotiated.view_resolution.y,
+        stream_config.negotiated.refresh_rate_hint,
+        stream_config.negotiated.enable_foveated_encoding,
+        stream_config.negotiated.wired,
+        stream_config.negotiated.enable_hdr,
     );
+    crate::video_receiver::configure_hdr_stream(stream_config.negotiated.enable_hdr);
 
     let server_control: ServerControlPacket =
         recv_framed(&mut stream).context("receive ALVR server control packet")?;
@@ -961,7 +1043,12 @@ fn run_minimal_alvr_stream(
     stream_config: &StreamConfigPacket,
 ) -> Result<()> {
     let settings = StreamSocketSettings::from_stream_config(stream_config)?;
+    let audio_settings = AudioStreamSettings::from_stream_config(stream_config);
     crate::video_receiver::configure_foveated_encoding(settings.foveated_encoding);
+    #[cfg(target_os = "android")]
+    crate::audio::set_negotiated_game_audio_sample_rate(
+        stream_config.negotiated.game_audio_sample_rate,
+    );
     if settings.protocol != StreamProtocol::Udp {
         bail!(
             "minimal stream socket only supports UDP for now; negotiated {:?}",
@@ -971,6 +1058,7 @@ fn run_minimal_alvr_stream(
 
     let udp = StdUdpSocket::bind((Ipv4Addr::UNSPECIFIED, settings.port))
         .with_context(|| format!("bind ALVR UDP stream socket on 0.0.0.0:{}", settings.port))?;
+    configure_udp_receive_buffer(&udp);
     udp.set_read_timeout(Some(ALVR_STREAM_RECV_TIMEOUT))
         .context("set ALVR UDP stream read timeout")?;
     udp.connect(SocketAddr::new(peer.ip(), settings.port))
@@ -981,6 +1069,57 @@ fn run_minimal_alvr_stream(
                 settings.port
             )
         })?;
+
+    let game_audio_output = if audio_settings.game_audio_enabled
+        && stream_config.negotiated.game_audio_sample_rate != 0
+    {
+        match crate::audio::start_game_audio_output(
+            stream_config.negotiated.game_audio_sample_rate,
+            audio_settings.game_audio_buffering,
+        ) {
+            Ok(output) => {
+                info!(
+                    "started ALVR game audio output: sample_rate={} buffering={{avg_ms={}, batch_ms={}}}",
+                    stream_config.negotiated.game_audio_sample_rate,
+                    audio_settings.game_audio_buffering.average_buffering_ms,
+                    audio_settings.game_audio_buffering.batch_ms,
+                );
+                Some(output)
+            }
+            Err(err) => {
+                warn!("failed to start ALVR game audio output: {err:#}");
+                None
+            }
+        }
+    } else {
+        info!("ALVR game audio output disabled by session settings or negotiation");
+        None
+    };
+
+    let microphone_capture = if audio_settings.microphone_enabled {
+        match crate::audio::start_microphone_capture(
+            48_000,
+            settings.packet_size,
+            udp.try_clone()
+                .context("clone ALVR UDP stream socket for microphone capture")?,
+        ) {
+            Ok(capture) => {
+                info!(
+                    "started ALVR microphone capture: sample_rate=48000 buffering={{avg_ms={}, batch_ms={}}}",
+                    audio_settings.microphone_buffering.average_buffering_ms,
+                    audio_settings.microphone_buffering.batch_ms,
+                );
+                Some(capture)
+            }
+            Err(err) => {
+                warn!("failed to start ALVR microphone capture: {err:#}");
+                None
+            }
+        }
+    } else {
+        info!("ALVR microphone capture disabled by session settings");
+        None
+    };
 
     info!(
         "ALVR UDP stream socket ready: local=0.0.0.0:{} peer={}:{} packet_size={}",
@@ -1001,14 +1140,21 @@ fn run_minimal_alvr_stream(
     let initial_views_config = current_alvr_views_config();
     send_framed_locked(
         &control_writer,
-        &ClientControlPacket::ViewsConfig(initial_views_config),
+        &ClientControlPacket::LocalViewParams(views_config_to_local_view_params(
+            &initial_views_config,
+        )),
     )
-    .context("send initial ALVR ViewsConfig")?;
+    .context("send initial ALVR LocalViewParams")?;
+    request_alvr_idr_best_effort(
+        &control_writer,
+        "stream startup so the server sends DecoderConfig and a fresh keyframe",
+    );
     info!(
-        "sent ALVR StreamReady and initial ViewsConfig; waiting for UDP stream shards and control keepalives"
+        "sent ALVR StreamReady and initial LocalViewParams; waiting for UDP stream shards and control keepalives"
     );
 
     let video_decoder = Arc::new(VideoDecoderBridge::new());
+    let decoder_config_ready = Arc::new(AtomicBool::new(false));
     thread::Builder::new()
         .name("alvr-control-maintenance".to_string())
         .spawn({
@@ -1017,7 +1163,7 @@ fn run_minimal_alvr_stream(
         })
         .context("spawn ALVR control maintenance thread")?;
 
-    let receive_packet_size = settings.packet_size + 4;
+    let receive_packet_size = settings.packet_size;
     reset_alvr_statistics_state();
     let _statistics_sender_guard = install_alvr_statistics_sender(
         udp.try_clone()
@@ -1037,12 +1183,23 @@ fn run_minimal_alvr_stream(
         .name("alvr-udp-stream-recv".to_string())
         .spawn({
             let video_decoder = Arc::clone(&video_decoder);
-            move || receive_alvr_udp_stream(udp, receive_packet_size, video_decoder)
+            let control_writer = Arc::clone(&control_writer);
+            let decoder_config_ready = Arc::clone(&decoder_config_ready);
+            let game_audio_output = game_audio_output.clone();
+            move || {
+                receive_alvr_udp_stream(
+                    udp,
+                    receive_packet_size,
+                    video_decoder,
+                    control_writer,
+                    decoder_config_ready,
+                    game_audio_output,
+                )
+            }
         })
         .context("spawn ALVR UDP stream receiver thread")?;
 
     let mut decoder_configured = false;
-    let mut ignored_decoder_configs = 0_u64;
     loop {
         match recv_framed::<ServerControlPacket>(stream) {
             Ok(ServerControlPacket::KeepAlive) => {}
@@ -1053,28 +1210,27 @@ fn run_minimal_alvr_stream(
                     config.config_buffer.len()
                 );
                 if decoder_configured {
-                    ignored_decoder_configs = ignored_decoder_configs.wrapping_add(1);
-                    if ignored_decoder_configs <= 5
-                        || ignored_decoder_configs % ALVR_STREAM_LOG_EVERY == 0
-                    {
-                        info!(
-                            "ignored duplicate ALVR decoder config after initial decoder setup: duplicates={ignored_decoder_configs}"
-                        );
-                    }
+                    info!("ignoring duplicate ALVR decoder config");
                     continue;
                 }
 
+                let frame_width = (stream_config.negotiated.view_resolution.x * 2) as i32;
+                let frame_height = stream_config.negotiated.view_resolution.y as i32;
                 video_decoder
                     .configure(
                         config.codec.mime_type(),
                         config.codec.label(),
                         config.config_buffer,
+                        frame_width,
+                        frame_height,
                     )
                     .with_context(|| format!("configure decoder for {:?}", config.codec))?;
                 decoder_configured = true;
-                send_framed_locked(&control_writer, &ClientControlPacket::RequestIdr)
-                    .context("request IDR after decoder config")?;
-                info!("requested ALVR IDR after decoder configuration");
+                decoder_config_ready.store(true, Ordering::Release);
+                request_alvr_idr_best_effort(
+                    &control_writer,
+                    "decoder configuration completed",
+                );
             }
             Ok(ServerControlPacket::ReservedBuffer(buffer)) => {
                 info!(
@@ -1082,8 +1238,24 @@ fn run_minimal_alvr_stream(
                     buffer.len()
                 );
             }
+            Ok(ServerControlPacket::RealTimeConfig(rtc)) => {
+                info!(
+                    "received ALVR RealTimeConfig (not applied): passthrough={} post_processing={} cpu_level={} gpu_level={} ext_str_len={}",
+                    rtc.passthrough.is_some(),
+                    rtc.clientside_post_processing.is_some(),
+                    rtc.cpu_performance_level.is_some(),
+                    rtc.gpu_performance_level.is_some(),
+                    rtc.ext_str.len(),
+                );
+            }
             Ok(ServerControlPacket::Restarting) => {
                 info!("ALVR server requested SteamVR restart during stream");
+                if let Some(capture) = microphone_capture.as_ref() {
+                    capture.shutdown();
+                }
+                if let Some(output) = game_audio_output.as_ref() {
+                    output.shutdown();
+                }
                 return Ok(());
             }
             Ok(other) => {
@@ -1091,35 +1263,98 @@ fn run_minimal_alvr_stream(
             }
             Err(err) => {
                 warn!("ALVR control receive loop ended: {err:#}");
+                if let Some(capture) = microphone_capture.as_ref() {
+                    capture.shutdown();
+                }
+                if let Some(output) = game_audio_output.as_ref() {
+                    output.shutdown();
+                }
                 return Ok(());
             }
         }
     }
 }
 
+#[cfg(target_os = "android")]
+fn configure_udp_receive_buffer(socket: &StdUdpSocket) {
+    let size = ALVR_UDP_RECEIVE_BUFFER_BYTES;
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&size as *const i32).cast(),
+            std::mem::size_of_val(&size) as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        info!("configured ALVR UDP SO_RCVBUF request: {size} bytes");
+    } else {
+        warn!(
+            "failed to configure ALVR UDP SO_RCVBUF: os_error={:?}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn configure_udp_receive_buffer(_socket: &StdUdpSocket) {}
+
+fn request_alvr_idr_best_effort(control_writer: &SharedControlWriter, reason: &str) {
+    if let Err(err) = send_framed_locked(control_writer, &ClientControlPacket::RequestIdr) {
+        warn!("failed to request ALVR IDR after {reason}: {err:#}");
+    } else {
+        info!("requested ALVR IDR after {reason}");
+    }
+}
+
+fn request_alvr_idr_if_due(
+    control_writer: &SharedControlWriter,
+    reason: &str,
+    last_request_at: &mut Option<Instant>,
+) {
+    let now = Instant::now();
+    if let Some(previous) = *last_request_at {
+        if now.duration_since(previous) < ALVR_RUNTIME_IDR_REQUEST_MIN_INTERVAL {
+            return;
+        }
+    }
+
+    request_alvr_idr_best_effort(control_writer, reason);
+    *last_request_at = Some(now);
+}
+
 fn receive_alvr_udp_stream(
     socket: StdUdpSocket,
     packet_size: usize,
     video_decoder: Arc<VideoDecoderBridge>,
+    control_writer: SharedControlWriter,
+    decoder_config_ready: Arc<AtomicBool>,
+    game_audio_output: Option<crate::audio::GameAudioOutput>,
 ) {
     let mut buffer = vec![0_u8; packet_size.max(ALVR_STREAM_SHARD_PREFIX_SIZE)];
     let mut video_assembler =
         VideoPacketAssembler::new(packet_size - ALVR_STREAM_SHARD_PREFIX_SIZE);
+    let mut audio_assembler = RawPacketAssembler::new(packet_size - ALVR_STREAM_SHARD_PREFIX_SIZE);
     let mut shards = 0_u64;
     let mut video_shards = 0_u64;
+    let mut audio_shards = 0_u64;
     let start = Instant::now();
+    let mut waiting_for_idr = true;
+    let mut last_completed_video_packet_index = None::<u32>;
+    let mut last_idr_request_at = None::<Instant>;
+    let mut decoder_backpressure_drops = 0_u64;
+    let game_audio_output = game_audio_output;
 
     loop {
         match socket.recv(&mut buffer) {
             Ok(len) if len >= ALVR_STREAM_SHARD_PREFIX_SIZE => {
                 shards += 1;
 
-                let announced_len =
-                    u32::from_be_bytes(buffer[0..4].try_into().unwrap()) as usize + 4;
-                let stream_id = u16::from_be_bytes(buffer[4..6].try_into().unwrap());
-                let packet_index = u32::from_be_bytes(buffer[6..10].try_into().unwrap());
-                let shard_count = u32::from_be_bytes(buffer[10..14].try_into().unwrap());
-                let shard_index = u32::from_be_bytes(buffer[14..18].try_into().unwrap());
+                let stream_id = u16::from_le_bytes(buffer[0..2].try_into().unwrap());
+                let packet_index = u32::from_le_bytes(buffer[2..6].try_into().unwrap());
+                let shard_count = u32::from_le_bytes(buffer[6..10].try_into().unwrap());
+                let shard_index = u32::from_le_bytes(buffer[10..14].try_into().unwrap());
                 let video_details = if stream_id == ALVR_VIDEO_STREAM_ID {
                     decode_video_packet_details(&buffer[ALVR_STREAM_SHARD_PREFIX_SIZE..len])
                 } else {
@@ -1134,6 +1369,35 @@ fn receive_alvr_udp_stream(
                         shard_index,
                         &buffer[ALVR_STREAM_SHARD_PREFIX_SIZE..len],
                     ) {
+                        if !waiting_for_idr {
+                            if let Some(previous) = last_completed_video_packet_index {
+                                let expected = previous.wrapping_add(1);
+                                if packet_index != expected {
+                                    if packet.header.is_idr {
+                                        info!(
+                                            "resynchronized ALVR video stream on IDR after packet gap: expected_packet_index={} got={}",
+                                            expected,
+                                            packet_index
+                                        );
+                                    } else {
+                                        waiting_for_idr = true;
+                                        video_assembler.clear();
+                                        warn!(
+                                            "detected ALVR video packet gap: expected_packet_index={} got={} - waiting for next IDR",
+                                            expected,
+                                            packet_index
+                                        );
+                                        request_alvr_idr_if_due(
+                                            &control_writer,
+                                            "video packet gap",
+                                            &mut last_idr_request_at,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        last_completed_video_packet_index = Some(packet_index);
+
                         if packet.completed_count <= 10
                             || packet.header.is_idr
                             || packet.completed_count % ALVR_STREAM_LOG_EVERY == 0
@@ -1150,11 +1414,112 @@ fn receive_alvr_udp_stream(
                             );
                         }
                         report_alvr_video_packet_received(packet.header.timestamp);
-                        video_decoder.push_nal(
+                        if packet.header.is_idr && decoder_config_ready.load(Ordering::Acquire) {
+                            waiting_for_idr = false;
+                            decoder_backpressure_drops = 0;
+                        }
+
+                        if waiting_for_idr {
+                            request_alvr_idr_if_due(
+                                &control_writer,
+                                "corrupted video stream while waiting for IDR",
+                                &mut last_idr_request_at,
+                            );
+                            if packet.completed_count <= 10
+                                || packet.completed_count % ALVR_STREAM_LOG_EVERY == 0
+                            {
+                                warn!(
+                                    "dropping ALVR video packet while waiting for IDR: packet_index={} bytes={} completed_packets={}",
+                                    packet_index,
+                                    packet.payload_len,
+                                    packet.completed_count
+                                );
+                            }
+                            continue;
+                        }
+
+                        if !decoder_config_ready.load(Ordering::Acquire) {
+                            request_alvr_idr_if_due(
+                                &control_writer,
+                                "decoder configuration not yet received",
+                                &mut last_idr_request_at,
+                            );
+                            if packet.completed_count <= 10
+                                || packet.completed_count % ALVR_STREAM_LOG_EVERY == 0
+                            {
+                                warn!(
+                                    "dropping ALVR video packet before decoder config: packet_index={} bytes={} completed_packets={} is_idr={}",
+                                    packet_index,
+                                    packet.payload_len,
+                                    packet.completed_count,
+                                    packet.header.is_idr
+                                );
+                            }
+                            continue;
+                        }
+
+                        if packet.completed_count <= 5 {
+                            let probe: Vec<u8> = packet.payload.iter().take(8).copied().collect();
+                            info!(
+                                "ALVR video payload probe: packet_index={} len={} first_bytes={:02x?}",
+                                packet_index,
+                                packet.payload_len,
+                                probe
+                            );
+                        }
+                        let submitted = video_decoder.push_nal(
                             packet.header.timestamp.as_nanos().min(u128::from(u64::MAX)) as u64,
                             packet.header.is_idr,
                             packet.payload,
                         );
+                        if submitted {
+                            decoder_backpressure_drops = 0;
+                        } else {
+                            waiting_for_idr = true;
+                            request_alvr_idr_if_due(
+                                &control_writer,
+                                if packet.header.is_idr {
+                                    "decoder unavailable for IDR packet"
+                                } else {
+                                    "decoder saturation"
+                                },
+                                &mut last_idr_request_at,
+                            );
+                            decoder_backpressure_drops = decoder_backpressure_drops.wrapping_add(1);
+                            if decoder_backpressure_drops <= 5
+                                || decoder_backpressure_drops % ALVR_STREAM_LOG_EVERY == 0
+                            {
+                                warn!(
+                                    "dropping ALVR video packet after decoder backpressure: packet_index={} bytes={} consecutive_drops={} is_idr={}",
+                                    packet_index,
+                                    packet.payload_len,
+                                    decoder_backpressure_drops,
+                                    packet.header.is_idr
+                                );
+                            }
+                        }
+                    }
+                } else if stream_id == ALVR_AUDIO_STREAM_ID {
+                    audio_shards += 1;
+                    if let Some(payload) = audio_assembler.push(
+                        packet_index,
+                        shard_count,
+                        shard_index,
+                        &buffer[ALVR_STREAM_SHARD_PREFIX_SIZE..len],
+                    ) {
+                        if let Some(output) = game_audio_output.as_ref() {
+                            output.push_payload(&payload);
+                        }
+                        if audio_shards <= 10 || audio_shards % ALVR_STREAM_LOG_EVERY == 0 {
+                            info!(
+                                "completed ALVR audio packet: packet_index={} shards={} payload_bytes={} completed_packets={} elapsed_ms={}",
+                                packet_index,
+                                shard_count,
+                                payload.len(),
+                                audio_assembler.completed_count(),
+                                start.elapsed().as_millis()
+                            );
+                        }
                     }
                 }
 
@@ -1164,13 +1529,12 @@ fn receive_alvr_udp_stream(
                     || shards % (ALVR_STREAM_LOG_EVERY * 4) == 0
                 {
                     info!(
-                        "received ALVR stream shard: stream_id={} packet_index={} shard={}/{} udp_len={} announced_len={} video_details={} total_shards={} video_shards={} elapsed_ms={}",
+                        "received ALVR stream shard: stream_id={} packet_index={} shard={}/{} udp_len={} video_details={} total_shards={} video_shards={} elapsed_ms={}",
                         stream_id,
                         packet_index,
                         shard_index + 1,
                         shard_count,
                         len,
-                        announced_len,
                         video_details.as_deref().unwrap_or("n/a"),
                         shards,
                         video_shards,
@@ -1246,11 +1610,13 @@ fn send_minimal_tracking_stream(socket: StdUdpSocket, max_packet_size: usize) {
             &controller_snapshot,
         ));
 
-        let tracking = Tracking {
-            target_timestamp: timestamp,
+        let tracking = TrackingData {
+            poll_timestamp: timestamp,
             device_motions,
             hand_skeletons: [None, None],
-            face_data: FaceData::default(),
+            face: FaceData::default(),
+            body: None,
+            markers: Vec::new(),
         };
 
         match send_alvr_stream_header_packet(
@@ -1303,7 +1669,8 @@ fn send_alvr_stream_header_packet<H: Serialize>(
     header: &H,
     max_packet_size: usize,
 ) -> Result<usize> {
-    let payload = bincode::serialize(header).context("serialize ALVR stream header")?;
+    let payload = bincode::serde::encode_to_vec(header, bincode::config::standard())
+        .context("serialize ALVR stream header")?;
     let datagram_len = ALVR_STREAM_SHARD_PREFIX_SIZE
         .checked_add(payload.len())
         .context("ALVR stream packet length overflow")?;
@@ -1314,15 +1681,10 @@ fn send_alvr_stream_header_packet<H: Serialize>(
     }
 
     let mut datagram = vec![0_u8; datagram_len];
-    datagram[0..4].copy_from_slice(
-        &u32::try_from(datagram_len - std::mem::size_of::<u32>())
-            .context("ALVR stream datagram length exceeds u32")?
-            .to_be_bytes(),
-    );
-    datagram[4..6].copy_from_slice(&stream_id.to_be_bytes());
-    datagram[6..10].copy_from_slice(&packet_index.to_be_bytes());
-    datagram[10..14].copy_from_slice(&1_u32.to_be_bytes());
-    datagram[14..18].copy_from_slice(&0_u32.to_be_bytes());
+    datagram[0..2].copy_from_slice(&stream_id.to_le_bytes());
+    datagram[2..6].copy_from_slice(&packet_index.to_le_bytes());
+    datagram[6..10].copy_from_slice(&1_u32.to_le_bytes());
+    datagram[10..14].copy_from_slice(&0_u32.to_le_bytes());
     datagram[ALVR_STREAM_SHARD_PREFIX_SIZE..].copy_from_slice(&payload);
 
     let bytes_sent = socket
@@ -1337,9 +1699,7 @@ fn send_alvr_stream_header_packet<H: Serialize>(
 
 fn maintain_alvr_control_socket(writer: SharedControlWriter) {
     let mut next_keepalive = Instant::now();
-    let mut next_idr_request = Instant::now();
     let mut next_buttons_send = Instant::now();
-    let mut idr_requests_sent = 0_u32;
     let mut last_views_config_version = latest_alvr_views_config().map(|state| state.version);
     let mut keepalives_sent = 0_u64;
     let mut buttons_sent = 0_u64;
@@ -1363,33 +1723,21 @@ fn maintain_alvr_control_socket(writer: SharedControlWriter) {
             if Some(views_config.version) != last_views_config_version {
                 if let Err(err) = send_framed_locked(
                     &writer,
-                    &ClientControlPacket::ViewsConfig(views_config.config.clone()),
+                    &ClientControlPacket::LocalViewParams(views_config_to_local_view_params(
+                        &views_config.config,
+                    )),
                 ) {
                     warn!(
-                        "ALVR control maintenance thread exiting after ViewsConfig update failure: {err:#}"
+                        "ALVR control maintenance thread exiting after LocalViewParams update failure: {err:#}"
                     );
                     break;
                 }
                 info!(
-                    "sent updated ALVR ViewsConfig from Pimax device info: version={}",
+                    "sent updated ALVR LocalViewParams from Pimax device info: version={}",
                     views_config.version
                 );
                 last_views_config_version = Some(views_config.version);
             }
-        }
-
-        if idr_requests_sent < ALVR_INITIAL_IDR_REQUESTS && now >= next_idr_request {
-            if let Err(err) = send_framed_locked(&writer, &ClientControlPacket::RequestIdr) {
-                warn!("ALVR control maintenance thread exiting after IDR request failure: {err:#}");
-                break;
-            }
-
-            idr_requests_sent += 1;
-            info!(
-                "sent ALVR RequestIdr during stream startup ({}/{})",
-                idr_requests_sent, ALVR_INITIAL_IDR_REQUESTS
-            );
-            next_idr_request = now + ALVR_IDR_REQUEST_INTERVAL;
         }
 
         if now >= next_buttons_send {
@@ -1416,13 +1764,16 @@ fn maintain_alvr_control_socket(writer: SharedControlWriter) {
 }
 
 fn decode_video_packet_details(data: &[u8]) -> Option<String> {
-    let mut cursor = data;
-    let header = bincode::deserialize_from::<_, VideoPacketHeader>(&mut cursor).ok()?;
+    let (header, consumed) = bincode::serde::decode_from_slice::<VideoPacketHeader, _>(
+        data,
+        bincode::config::standard(),
+    )
+    .ok()?;
     Some(format!(
         "timestamp_ns={} is_idr={} payload_bytes={}",
         header.timestamp.as_nanos(),
         header.is_idr,
-        cursor.len()
+        data.len().saturating_sub(consumed)
     ))
 }
 
@@ -1454,6 +1805,10 @@ impl VideoPacketAssembler {
             max_shard_data_size,
             completed_count: 0,
         }
+    }
+
+    fn clear(&mut self) {
+        self.packets.clear();
     }
 
     fn push(
@@ -1516,9 +1871,12 @@ impl VideoPacketAssembler {
         }
 
         let partial = self.packets.remove(&packet_index)?;
-        let mut data = partial.data.as_slice();
-        let header = match bincode::deserialize_from::<_, VideoPacketHeader>(&mut data) {
-            Ok(header) => header,
+        let data = partial.data.as_slice();
+        let (header, consumed) = match bincode::serde::decode_from_slice::<VideoPacketHeader, _>(
+            data,
+            bincode::config::standard(),
+        ) {
+            Ok(result) => result,
             Err(err) => {
                 warn!(
                     "failed to decode completed ALVR video packet header for packet_index={packet_index}: {err:#}"
@@ -1527,7 +1885,7 @@ impl VideoPacketAssembler {
             }
         };
 
-        let payload = data.to_vec();
+        let payload = data[consumed..].to_vec();
         self.completed_count += 1;
         Some(CompletedVideoPacket {
             header,
@@ -1535,6 +1893,102 @@ impl VideoPacketAssembler {
             payload,
             completed_count: self.completed_count,
         })
+    }
+
+    fn completed_count(&self) -> u64 {
+        self.completed_count
+    }
+}
+
+struct PartialRawPacket {
+    shards_count: u32,
+    received: Vec<bool>,
+    received_count: u32,
+    data: Vec<u8>,
+    first_seen: Instant,
+}
+
+struct RawPacketAssembler {
+    packets: HashMap<u32, PartialRawPacket>,
+    max_shard_data_size: usize,
+    completed_count: u64,
+}
+
+impl RawPacketAssembler {
+    fn new(max_shard_data_size: usize) -> Self {
+        Self {
+            packets: HashMap::new(),
+            max_shard_data_size,
+            completed_count: 0,
+        }
+    }
+
+    fn push(
+        &mut self,
+        packet_index: u32,
+        shards_count: u32,
+        shard_index: u32,
+        shard_payload: &[u8],
+    ) -> Option<Vec<u8>> {
+        if shards_count == 0 || shard_index >= shards_count {
+            warn!(
+                "dropping invalid ALVR audio shard: packet_index={packet_index} shard={}/{}",
+                shard_index + 1,
+                shards_count
+            );
+            return None;
+        }
+
+        if self.packets.len() > 64 {
+            let stale_before = Instant::now() - Duration::from_secs(2);
+            self.packets
+                .retain(|_, packet| packet.first_seen >= stale_before);
+        }
+
+        let partial = self
+            .packets
+            .entry(packet_index)
+            .or_insert_with(|| PartialRawPacket {
+                shards_count,
+                received: vec![false; shards_count as usize],
+                received_count: 0,
+                data: Vec::new(),
+                first_seen: Instant::now(),
+            });
+
+        if partial.shards_count != shards_count {
+            warn!(
+                "dropping ALVR audio shard with inconsistent shard count: packet_index={packet_index} got={shards_count} expected={}",
+                partial.shards_count
+            );
+            return None;
+        }
+
+        let shard_index_usize = shard_index as usize;
+        if partial.received[shard_index_usize] {
+            return None;
+        }
+
+        let offset = shard_index_usize.checked_mul(self.max_shard_data_size)?;
+        let end = offset.checked_add(shard_payload.len())?;
+        if partial.data.len() < end {
+            partial.data.resize(end, 0);
+        }
+        partial.data[offset..end].copy_from_slice(shard_payload);
+        partial.received[shard_index_usize] = true;
+        partial.received_count += 1;
+
+        if partial.received_count != partial.shards_count {
+            return None;
+        }
+
+        let partial = self.packets.remove(&packet_index)?;
+        self.completed_count += 1;
+        Some(partial.data)
+    }
+
+    fn completed_count(&self) -> u64 {
+        self.completed_count
     }
 }
 
@@ -1552,12 +2006,18 @@ struct StreamSocketSettings {
     foveated_encoding: Option<crate::video_receiver::FoveatedEncodingConfig>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct AudioStreamSettings {
+    game_audio_enabled: bool,
+    game_audio_buffering: crate::audio::AudioBufferingConfig,
+    microphone_enabled: bool,
+    microphone_buffering: crate::audio::AudioBufferingConfig,
+}
+
 impl StreamSocketSettings {
     fn from_stream_config(packet: &StreamConfigPacket) -> Result<Self> {
         let session: serde_json::Value =
             serde_json::from_str(&packet.session).context("parse ALVR session JSON")?;
-        let negotiated: serde_json::Value =
-            serde_json::from_str(&packet.negotiated).context("parse ALVR negotiated JSON")?;
 
         let connection = session
             .pointer("/session_settings/connection")
@@ -1574,11 +2034,7 @@ impl StreamSocketSettings {
             .and_then(|value| usize::try_from(value).ok())
             .unwrap_or(1400);
 
-        let wired = negotiated
-            .get("wired")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-        let protocol = if wired {
+        let protocol = if packet.negotiated.wired {
             StreamProtocol::Tcp
         } else {
             match connection
@@ -1591,7 +2047,13 @@ impl StreamSocketSettings {
                 _ => StreamProtocol::Udp,
             }
         };
-        let foveated_encoding = parse_foveated_encoding(&session);
+        // Skip the more expensive openvr_config parse if the negotiated config
+        // already tells us foveation is off.
+        let foveated_encoding = if packet.negotiated.enable_foveated_encoding {
+            parse_foveated_encoding(&session)
+        } else {
+            None
+        };
 
         Ok(Self {
             protocol,
@@ -1599,6 +2061,49 @@ impl StreamSocketSettings {
             packet_size,
             foveated_encoding,
         })
+    }
+}
+
+impl AudioStreamSettings {
+    fn from_stream_config(packet: &StreamConfigPacket) -> Self {
+        let session: serde_json::Value = serde_json::from_str(&packet.session).unwrap_or_default();
+        let audio = session
+            .pointer("/session_settings/audio")
+            .or_else(|| session.pointer("/audio"));
+
+        fn buffering_from(
+            parent: Option<&serde_json::Value>,
+            default_average_buffering_ms: u64,
+            default_batch_ms: u64,
+        ) -> crate::audio::AudioBufferingConfig {
+            let buffering = parent.and_then(|value| value.get("buffering"));
+            crate::audio::AudioBufferingConfig {
+                average_buffering_ms: buffering
+                    .and_then(|value| value.get("average_buffering_ms"))
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(default_average_buffering_ms),
+                batch_ms: buffering
+                    .and_then(|value| value.get("batch_ms"))
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(default_batch_ms),
+            }
+        }
+
+        let game_audio = audio.and_then(|value| value.get("game_audio"));
+        let microphone = audio.and_then(|value| value.get("microphone"));
+
+        Self {
+            game_audio_enabled: game_audio
+                .and_then(|value| value.get("enabled"))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true),
+            game_audio_buffering: buffering_from(game_audio, 50, 5),
+            microphone_enabled: microphone
+                .and_then(|value| value.get("enabled"))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true),
+            microphone_buffering: buffering_from(microphone, 50, 5),
+        }
     }
 }
 
@@ -1628,15 +2133,20 @@ fn parse_foveated_encoding(
             .and_then(|value| u32::try_from(value).ok())
     };
 
-    let Some(expanded_view_width) = get_u32("target_eye_resolution_width", "eye_resolution_width")
+    // ALVR session JSON exposes both the transcoded eye resolution and the
+    // emulated headset target resolution. The foveated stream layout is based
+    // on the encoded/transcoded eye resolution, not the headset target size.
+    // Prefer eye_resolution_* and fall back to target_eye_resolution_* only for
+    // older sessions.
+    let Some(expanded_view_width) = get_u32("eye_resolution_width", "target_eye_resolution_width")
     else {
-        warn!("ALVR foveated encoding is enabled but stream config has no target eye width");
+        warn!("ALVR foveated encoding is enabled but stream config has no encoded eye width");
         return None;
     };
     let Some(expanded_view_height) =
-        get_u32("target_eye_resolution_height", "eye_resolution_height")
+        get_u32("eye_resolution_height", "target_eye_resolution_height")
     else {
-        warn!("ALVR foveated encoding is enabled but stream config has no target eye height");
+        warn!("ALVR foveated encoding is enabled but stream config has no encoded eye height");
         return None;
     };
 
@@ -1655,10 +2165,11 @@ fn parse_foveated_encoding(
 }
 
 fn send_framed<S: Serialize>(stream: &mut StdTcpStream, packet: &S) -> Result<()> {
-    let payload = bincode::serialize(packet).context("serialize ALVR framed packet")?;
+    let payload = bincode::serde::encode_to_vec(packet, bincode::config::standard())
+        .context("serialize ALVR framed packet")?;
     let len = u32::try_from(payload.len()).context("ALVR framed packet too large")?;
     stream
-        .write_all(&len.to_be_bytes())
+        .write_all(&len.to_le_bytes())
         .context("write ALVR frame length")?;
     stream
         .write_all(&payload)
@@ -1678,7 +2189,7 @@ fn recv_framed<R: DeserializeOwned>(stream: &mut StdTcpStream) -> Result<R> {
     stream
         .read_exact(&mut len_bytes)
         .context("read ALVR frame length")?;
-    let len = u32::from_be_bytes(len_bytes) as usize;
+    let len = u32::from_le_bytes(len_bytes) as usize;
     if len > 64 * 1024 * 1024 {
         bail!("ALVR frame too large: {len} bytes");
     }
@@ -1687,84 +2198,178 @@ fn recv_framed<R: DeserializeOwned>(stream: &mut StdTcpStream) -> Result<R> {
     stream
         .read_exact(&mut payload)
         .context("read ALVR frame payload")?;
-    bincode::deserialize(&payload).context("deserialize ALVR framed packet")
+    let (value, _consumed) =
+        bincode::serde::decode_from_slice(&payload, bincode::config::standard())
+            .context("deserialize ALVR framed packet")?;
+    Ok(value)
 }
 
 #[derive(Serialize, Deserialize)]
 enum ClientConnectionResult {
-    ConnectionAccepted {
-        client_protocol_id: u64,
-        display_name: String,
-        server_ip: IpAddr,
-        streaming_capabilities: Option<VideoStreamingCapabilitiesLegacy>,
-    },
+    ConnectionAccepted(Box<ConnectionAcceptedInfo>),
     ClientStandby,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-struct VideoStreamingCapabilitiesLegacy {
-    default_view_resolution: glam::UVec2,
-    supported_refresh_rates_plus_extra_data: Vec<f32>,
-    microphone_sample_rate: u32,
+#[derive(Serialize, Deserialize)]
+struct ConnectionAcceptedInfo {
+    client_protocol_id: u64,
+    platform_string: String,
+    server_ip: IpAddr,
+    streaming_capabilities: Option<VideoStreamingCapabilities>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 struct VideoStreamingCapabilities {
     default_view_resolution: glam::UVec2,
-    supported_refresh_rates: Vec<f32>,
+    max_view_resolution: glam::UVec2,
+    refresh_rates: Vec<f32>,
     microphone_sample_rate: u32,
-    supports_foveated_encoding: bool,
+    foveated_encoding: bool,
     encoder_high_profile: bool,
     encoder_10_bits: bool,
     encoder_av1: bool,
-    multimodal_protocol: bool,
     prefer_10bit: bool,
-    prefer_full_range: bool,
     preferred_encoding_gamma: f32,
     prefer_hdr: bool,
+    ext_str: String,
 }
 
-fn encode_video_streaming_capabilities(
-    caps: &VideoStreamingCapabilities,
-) -> Result<VideoStreamingCapabilitiesLegacy> {
-    let mut packed = caps.supported_refresh_rates.clone();
-    let json = serde_json::to_string(caps).context("encode capabilities JSON")?;
-    for byte in json.as_bytes() {
-        packed.push(-(*byte as f32));
-    }
-    Ok(VideoStreamingCapabilitiesLegacy {
-        default_view_resolution: caps.default_view_resolution,
-        supported_refresh_rates_plus_extra_data: packed,
-        microphone_sample_rate: caps.microphone_sample_rate,
-    })
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct NegotiatedStreamingConfig {
+    view_resolution: glam::UVec2,
+    refresh_rate_hint: f32,
+    game_audio_sample_rate: u32,
+    enable_foveated_encoding: bool,
+    encoding_gamma: f32,
+    enable_hdr: bool,
+    wired: bool,
+    ext_str: String,
 }
 
 #[derive(Serialize, Deserialize)]
 struct StreamConfigPacket {
     session: String,
-    negotiated: String,
+    negotiated: NegotiatedStreamingConfig,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+// ServerControlPacket is only received on the wire, never sent — so we only
+// need `Deserialize` and no Serialize for the RealTimeConfig subtree.
+#[derive(Deserialize, Debug)]
 enum ServerControlPacket {
     StartStream,
     DecoderConfig(DecoderInitializationConfig),
     Restarting,
     KeepAlive,
-    ServerPredictionAverage(Duration),
+    RealTimeConfig(RealTimeConfig),
     Reserved(String),
     ReservedBuffer(Vec<u8>),
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Deserialize, Debug)]
 struct DecoderInitializationConfig {
     codec: CodecType,
     config_buffer: Vec<u8>,
+    #[allow(dead_code)]
+    ext_str: String,
 }
 
-#[derive(Deserialize)]
+// RealTimeConfig and nested types exist only so bincode can deserialize a
+// `ServerControlPacket::RealTimeConfig(...)` without failing. The pimax client
+// does not apply any of these values yet — field order must match
+// `D:/Code/ALVR/alvr/session/src/settings.rs` verbatim or the server packet
+// will fail to decode mid-stream.
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+struct RealTimeConfig {
+    passthrough: Option<PassthroughMode>,
+    clientside_post_processing: Option<ClientsidePostProcessingConfig>,
+    cpu_performance_level: Option<PerformanceLevel>,
+    gpu_performance_level: Option<PerformanceLevel>,
+    ext_str: String,
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+enum PassthroughMode {
+    Blend {
+        premultiplied_alpha: bool,
+        threshold: f32,
+    },
+    RgbChromaKey(RgbChromaKeyConfig),
+    HsvChromaKey(HsvChromaKeyConfig),
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+struct RgbChromaKeyConfig {
+    red: u8,
+    green: u8,
+    blue: u8,
+    distance_threshold: u8,
+    feathering: f32,
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+struct HsvChromaKeyConfig {
+    hue_start_max_deg: f32,
+    hue_start_min_deg: f32,
+    hue_end_min_deg: f32,
+    hue_end_max_deg: f32,
+    saturation_start_max: f32,
+    saturation_start_min: f32,
+    saturation_end_min: f32,
+    saturation_end_max: f32,
+    value_start_max: f32,
+    value_start_min: f32,
+    value_end_min: f32,
+    value_end_max: f32,
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+struct ClientsidePostProcessingConfig {
+    super_sampling: ClientsidePostProcessingSuperSamplingMode,
+    sharpening: ClientsidePostProcessingSharpeningMode,
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+enum ClientsidePostProcessingSuperSamplingMode {
+    Disabled,
+    Normal,
+    Quality,
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+enum ClientsidePostProcessingSharpeningMode {
+    Disabled,
+    Normal,
+    Quality,
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+enum PerformanceLevel {
+    PowerSavings,
+    SustainedLow,
+    SustainedHigh,
+    Boost,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[allow(dead_code)]
+struct DynamicFoveationParams {
+    center_shift_x: f32,
+    center_shift_y: f32,
+    frame_sequence: u64,
+}
+
+#[derive(Serialize, Deserialize)]
 struct VideoPacketHeader {
     timestamp: Duration,
+    global_view_params: [ViewParams; 2],
     is_idr: bool,
 }
 
@@ -1826,20 +2431,56 @@ pub(crate) struct DeviceMotion {
     pub angular_velocity: glam::Vec3,
 }
 
-#[derive(Serialize, Deserialize, Clone, Default)]
-struct FaceData {
-    eye_gazes: [Option<Pose>; 2],
-    fb_face_expression: Option<Vec<f32>>,
-    htc_eye_expression: Option<Vec<f32>>,
-    htc_lip_expression: Option<Vec<f32>>,
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+struct ViewParams {
+    pose: Pose,
+    fov: Fov,
 }
 
-#[derive(Serialize, Deserialize, Default)]
-struct Tracking {
-    target_timestamp: Duration,
+impl ViewParams {
+    const DUMMY: Self = Self {
+        pose: Pose {
+            orientation: glam::Quat::IDENTITY,
+            position: glam::Vec3::ZERO,
+        },
+        fov: Fov {
+            left: -1.0,
+            right: 1.0,
+            up: 1.0,
+            down: -1.0,
+        },
+    };
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[allow(dead_code)]
+enum FaceExpressions {
+    Fb(Vec<f32>),
+    Bd(Vec<f32>),
+    Htc {
+        eye: Option<Vec<f32>>,
+        lip: Option<Vec<f32>>,
+    },
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct FaceData {
+    eyes_combined: Option<glam::Quat>,
+    eyes_social: [Option<glam::Quat>; 2],
+    face_expressions: Option<FaceExpressions>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TrackingData {
+    poll_timestamp: Duration,
     device_motions: Vec<(u64, DeviceMotion)>,
     hand_skeletons: [Option<[Pose; 26]>; 2],
-    face_data: FaceData,
+    face: FaceData,
+    // ALVR master wire format carries `Option<BodySkeleton>` here. This client
+    // never sends body tracking, so `Option<()>::None` (one 0 tag byte) is
+    // wire-identical to `Option<BodySkeleton>::None`.
+    body: Option<()>,
+    markers: Vec<(String, Pose)>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -1866,6 +2507,29 @@ fn default_views_config() -> ViewsConfig {
     }
 }
 
+/// Convert the Pimax-side `ViewsConfig { ipd_m, fov }` into the master ALVR
+/// `[ViewParams; 2]` shape expected by `ClientControlPacket::LocalViewParams`.
+/// The poses are head-local: each eye is offset by ±(ipd/2) along X.
+fn views_config_to_local_view_params(config: &ViewsConfig) -> [ViewParams; 2] {
+    let half_ipd = config.ipd_m * 0.5;
+    [
+        ViewParams {
+            pose: Pose {
+                orientation: glam::Quat::IDENTITY,
+                position: glam::Vec3::new(-half_ipd, 0.0, 0.0),
+            },
+            fov: config.fov[0],
+        },
+        ViewParams {
+            pose: Pose {
+                orientation: glam::Quat::IDENTITY,
+                position: glam::Vec3::new(half_ipd, 0.0, 0.0),
+            },
+            fov: config.fov[1],
+        },
+    ]
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct BatteryInfo {
     device_id: u64,
@@ -1873,16 +2537,39 @@ struct BatteryInfo {
     is_plugged: bool,
 }
 
+// Matches `alvr_common::logging::LogSeverity`. We never emit `Log` today but
+// need a concrete type for the variant so the enum tag indices stay correct.
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+enum LogSeverity {
+    Error,
+    Warning,
+    Info,
+    Debug,
+}
+
 #[derive(Serialize, Deserialize)]
+#[allow(dead_code)]
 enum ClientControlPacket {
     PlayspaceSync(Option<glam::Vec2>),
     RequestIdr,
     KeepAlive,
     StreamReady,
-    ViewsConfig(ViewsConfig),
+    LocalViewParams([ViewParams; 2]),
     Battery(BatteryInfo),
-    VideoErrorReport,
     Buttons(Vec<crate::controller::ButtonEntry>),
+    ActiveInteractionProfile {
+        device_id: u64,
+        profile_id: u64,
+        input_ids: std::collections::HashSet<u64>,
+    },
+    Log {
+        level: LogSeverity,
+        message: String,
+    },
+    ProximityState(bool),
+    Reserved(String),
+    ReservedBuffer(Vec<u8>),
 }
 
 #[cfg(test)]
@@ -1921,77 +2608,17 @@ mod tests {
         assert_eq!(alvr_protocol_string("not-a-version"), "not-a-version");
     }
 
-    fn sample_capabilities() -> VideoStreamingCapabilities {
-        VideoStreamingCapabilities {
-            default_view_resolution: glam::UVec2::new(2880, 2880),
-            supported_refresh_rates: vec![72.0, 90.0],
-            microphone_sample_rate: 48_000,
-            supports_foveated_encoding: true,
-            encoder_high_profile: true,
-            encoder_10_bits: false,
-            encoder_av1: false,
-            multimodal_protocol: false,
-            prefer_10bit: false,
-            prefer_full_range: true,
-            preferred_encoding_gamma: 1.0,
-            prefer_hdr: false,
-        }
-    }
-
-    // Regression: ALVR v20.14.1 server expects the legacy capabilities wire
-    // format — refresh rates followed by JSON bytes packed as negative floats.
-    // Without this trick the server hangs up after ConnectionAccepted with
-    // "read ALVR frame length: failed to fill whole buffer".
+    // Regression: bincode 2 with `config::standard()` encodes enum variant
+    // indices as varints. The ALVR master server matches by ordinal — reorder
+    // the variants and the server mis-decodes every control packet. Variant
+    // indices must match `alvr_packets::ClientControlPacket` in D:/Code/ALVR.
     #[test]
-    fn encode_capabilities_packs_json_as_negative_floats_after_refresh_rates() {
-        let caps = sample_capabilities();
-        let legacy = encode_video_streaming_capabilities(&caps).unwrap();
-
-        let refresh_rate_count = caps.supported_refresh_rates.len();
-        assert_eq!(
-            &legacy.supported_refresh_rates_plus_extra_data[..refresh_rate_count],
-            &caps.supported_refresh_rates[..],
-            "refresh rates must be at the head of the packed vector",
-        );
-
-        let json_bytes: Vec<u8> = legacy.supported_refresh_rates_plus_extra_data
-            [refresh_rate_count..]
-            .iter()
-            .map(|f| {
-                assert!(*f <= 0.0, "JSON byte floats must be non-positive");
-                (-*f) as u8
-            })
-            .collect();
-        let json_str = std::str::from_utf8(&json_bytes).expect("packed JSON is valid UTF-8");
-        let decoded: serde_json::Value =
-            serde_json::from_str(json_str).expect("packed JSON parses");
-
-        // Must use v20.14.1 field names (not the older "foveated_encoding").
-        assert!(decoded.get("supports_foveated_encoding").is_some());
-        assert!(decoded.get("multimodal_protocol").is_some());
-        assert!(decoded.get("prefer_10bit").is_some());
-        assert!(decoded.get("prefer_hdr").is_some());
-        assert_eq!(decoded["supports_foveated_encoding"], true);
-        assert_eq!(decoded["microphone_sample_rate"], 48_000);
-    }
-
-    #[test]
-    fn encode_capabilities_preserves_resolution_and_sample_rate() {
-        let caps = sample_capabilities();
-        let legacy = encode_video_streaming_capabilities(&caps).unwrap();
-        assert_eq!(legacy.default_view_resolution, caps.default_view_resolution);
-        assert_eq!(legacy.microphone_sample_rate, caps.microphone_sample_rate);
-    }
-
-    // Regression: bincode encodes enum variant index as u32 LE. ALVR v20
-    // server matches by ordinal — reorder the variants and the server
-    // mis-decodes every control packet.
-    #[test]
-    fn client_control_packet_variant_indices_match_alvr_v20() {
-        fn variant_index(packet: ClientControlPacket) -> u32 {
-            let bytes = bincode::serialize(&packet).expect("serialize control packet");
-            assert!(bytes.len() >= 4);
-            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    fn client_control_packet_variant_indices_match_alvr_master() {
+        fn variant_index(packet: ClientControlPacket) -> u8 {
+            let bytes = bincode::serde::encode_to_vec(&packet, bincode::config::standard())
+                .expect("serialize control packet");
+            assert!(!bytes.is_empty());
+            bytes[0]
         }
 
         assert_eq!(variant_index(ClientControlPacket::PlayspaceSync(None)), 0);
@@ -1999,8 +2626,31 @@ mod tests {
         assert_eq!(variant_index(ClientControlPacket::KeepAlive), 2);
         assert_eq!(variant_index(ClientControlPacket::StreamReady), 3);
         assert_eq!(
-            variant_index(ClientControlPacket::ViewsConfig(default_views_config())),
+            variant_index(ClientControlPacket::LocalViewParams([ViewParams::DUMMY; 2])),
             4,
+        );
+        assert_eq!(variant_index(ClientControlPacket::Buttons(vec![])), 6);
+    }
+
+    // Guard the VideoPacketHeader wire format so refactors don't silently
+    // desync the inline protocol from upstream ALVR packets.
+    #[test]
+    fn video_packet_header_roundtrip_preserves_fields() {
+        let header = VideoPacketHeader {
+            timestamp: Duration::from_nanos(1_234_567_890),
+            global_view_params: [ViewParams::DUMMY; 2],
+            is_idr: true,
+        };
+        let bytes = bincode::serde::encode_to_vec(&header, bincode::config::standard())
+            .expect("serialize video packet header");
+        let (decoded, _): (VideoPacketHeader, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                .expect("deserialize video packet header");
+        assert_eq!(decoded.timestamp, header.timestamp);
+        assert_eq!(decoded.is_idr, header.is_idr);
+        assert_eq!(
+            decoded.global_view_params[0].pose.position,
+            header.global_view_params[0].pose.position
         );
     }
 }

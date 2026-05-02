@@ -60,13 +60,13 @@ use log::{info, warn};
 /// Convergence shift in NDC (Normalized Device Coordinates) units.
 ///
 /// This corrects for the Pimax headset's built-in divergent warp in the compositor.
-/// The Pimax hardware applies approximately 0.248 NDC of divergent warp per eye,
+/// The Pimax hardware applies approximately 0.124 NDC of divergent warp per eye,
 /// which causes double vision when receiving stereo content from ALVR.
 ///
 /// By pre-shifting the blit output convergently (left eye +shift, right eye -shift),
 /// we cancel out the compositor's warp, resulting in properly aligned stereo.
 ///
-/// Range: 0.0 to 0.5 (typical value: ~0.248)
+/// Range: 0.0 to 0.5 (typical value: ~0.124)
 static CONVERGENCE_SHIFT_NDC: AtomicU32 = AtomicU32::new(0);
 
 /// IPD (Interpupillary Distance) scale factor for ALVR stereo rendering.
@@ -84,6 +84,15 @@ static CONVERGENCE_SHIFT_NDC: AtomicU32 = AtomicU32::new(0);
 ///
 /// Range: 0.0 to 2.0 (typical value: 1.0)
 static IPD_SCALE: AtomicU32 = AtomicU32::new(0);
+
+/// FOV scale factor for ALVR view configuration.
+///
+/// Multiplies the Pimax-reported FOV tangents before they are sent to ALVR.
+/// Values below 1.0 narrow the view and can reduce corner stretching.
+///
+/// Range: 0.8 to 1.2 (typical value: 1.0)
+pub const FOV_SCALE_DEFAULT: f32 = 0.95;
+static FOV_SCALE: AtomicU32 = AtomicU32::new(0);
 
 /// Color black crush adjustment for BT.709 color space.
 ///
@@ -108,6 +117,15 @@ static COLOR_BLACK_CRUSH: AtomicU32 = AtomicU32::new(0);
 ///
 /// Range: 0.5 to 2.0 (typical value: 1.22)
 static COLOR_GAIN: AtomicU32 = AtomicU32::new(0);
+
+/// Pimax eye render size scale.
+///
+/// Multiplies the headset-reported target eye size before ALVR negotiation and
+/// eye target allocation.
+///
+/// Range: 0.5 to 1.5 (typical value: 1.0)
+pub const EYE_RENDER_SCALE_DEFAULT: f32 = 1.0;
+static EYE_RENDER_SCALE: AtomicU32 = AtomicU32::new(0);
 
 /// Default local controller X-axis calibration in degrees.
 ///
@@ -192,15 +210,23 @@ fn store(atom: &AtomicU32, v: f32) {
 ///
 /// # Arguments
 ///
-/// * `convergence_shift_ndc` - Default convergence shift (typically 0.248)
+/// * `convergence_shift_ndc` - Default convergence shift (typically 0.124)
 /// * `ipd_scale` - Default IPD scale (typically 1.0)
+/// * `fov_scale` - Default FOV scale (typically 1.0)
 /// * `color_black_crush` - Default black crush (typically 0.072)
 /// * `color_gain` - Default gain (typically 1.22)
-///
+/// * `eye_render_scale` - Default eye render scale (typically 1.0)
 /// # Called From
 ///
 /// `android::run_inner()` during application startup
-pub fn init(convergence_shift_ndc: f32, ipd_scale: f32, color_black_crush: f32, color_gain: f32) {
+pub fn init(
+    convergence_shift_ndc: f32,
+    ipd_scale: f32,
+    fov_scale: f32,
+    color_black_crush: f32,
+    color_gain: f32,
+    eye_render_scale: f32,
+) {
     // Load tuning settings from config, or use defaults if not available
     let config_path = crate::config::default_config_path();
     let config = crate::config::ClientConfig::load_or_create(&config_path).ok();
@@ -215,6 +241,10 @@ pub fn init(convergence_shift_ndc: f32, ipd_scale: f32, color_black_crush: f32, 
         .as_ref()
         .and_then(|c| c.ipd_scale)
         .unwrap_or(ipd_scale);
+    let fs = config
+        .as_ref()
+        .and_then(|c| c.fov_scale)
+        .unwrap_or(fov_scale);
     let bc = config
         .as_ref()
         .and_then(|c| c.color_black_crush)
@@ -223,6 +253,10 @@ pub fn init(convergence_shift_ndc: f32, ipd_scale: f32, color_black_crush: f32, 
         .as_ref()
         .and_then(|c| c.color_gain)
         .unwrap_or(color_gain);
+    let ers = config
+        .as_ref()
+        .and_then(|c| c.eye_render_scale)
+        .unwrap_or(eye_render_scale);
     let crx = config
         .as_ref()
         .and_then(|c| c.controller_rotation_x_deg)
@@ -239,13 +273,15 @@ pub fn init(convergence_shift_ndc: f32, ipd_scale: f32, color_black_crush: f32, 
     // Store in atomics for render thread access
     store(&CONVERGENCE_SHIFT_NDC, cs);
     store(&IPD_SCALE, is);
+    store(&FOV_SCALE, fs);
     store(&COLOR_BLACK_CRUSH, bc);
     store(&COLOR_GAIN, cg);
+    store(&EYE_RENDER_SCALE, ers);
     store(&CONTROLLER_ROTATION_X_DEG, crx);
     store(&CONTROLLER_ROTATION_Y_DEG, cry);
     store(&CONTROLLER_ROTATION_Z_DEG, crz);
 
-    info!("tune: loaded settings from config: convergence_shift_ndc={:.4}, ipd_scale={:.4}, color_black_crush={:.4}, color_gain={:.4}, controller_rotation_deg=({:.1},{:.1},{:.1})", cs, is, bc, cg, crx, cry, crz);
+    info!("tune: loaded settings from config: convergence_shift_ndc={:.4}, ipd_scale={:.4}, fov_scale={:.3}, color_black_crush={:.4}, color_gain={:.4}, eye_render_scale={:.3}, controller_rotation_deg=({:.1},{:.1},{:.1})", cs, is, fs, bc, cg, ers, crx, cry, crz);
 
     // Load server IP from config
     let initial_server_ip = config
@@ -289,6 +325,12 @@ pub fn ipd_scale() -> f32 {
     load(&IPD_SCALE)
 }
 
+/// Get the current FOV scale factor.
+#[inline]
+pub fn fov_scale() -> f32 {
+    load(&FOV_SCALE)
+}
+
 /// Get the current color black crush value.
 ///
 /// # Called From
@@ -307,6 +349,12 @@ pub fn color_black_crush() -> f32 {
 #[inline]
 pub fn color_gain() -> f32 {
     load(&COLOR_GAIN)
+}
+
+/// Get the current eye render scale.
+#[inline]
+pub fn eye_render_scale() -> f32 {
+    load(&EYE_RENDER_SCALE)
 }
 
 /// Get the current local controller rotation offsets in degrees.
@@ -576,11 +624,13 @@ fn run_http_server() {
             // Return current tuning values as JSON
             let controller_rotation = controller_rotation_deg();
             let body = format!(
-                r#"{{"convergence_shift_ndc":{:.4},"ipd_scale":{:.4},"color_black_crush":{:.4},"color_gain":{:.4},"controller_rotation_x_deg":{:.2},"controller_rotation_y_deg":{:.2},"controller_rotation_z_deg":{:.2},"server_ip":"{}","server_status":"{}"}}"#,
+                r#"{{"convergence_shift_ndc":{:.4},"ipd_scale":{:.4},"fov_scale":{:.3},"color_black_crush":{:.4},"color_gain":{:.4},"eye_render_scale":{:.3},"controller_rotation_x_deg":{:.2},"controller_rotation_y_deg":{:.2},"controller_rotation_z_deg":{:.2},"server_ip":"{}","server_status":"{}"}}"#,
                 convergence_shift_ndc(),
                 ipd_scale(),
+                fov_scale(),
                 color_black_crush(),
                 color_gain(),
+                eye_render_scale(),
                 controller_rotation.x,
                 controller_rotation.y,
                 controller_rotation.z,
@@ -623,12 +673,12 @@ fn run_http_server() {
 /// # Query String Format
 ///
 /// Multiple parameters can be set in one request:
-/// `convergence_shift_ndc=0.248&ipd_scale=1.0&color_gain=1.22`
+/// `convergence_shift_ndc=0.124&ipd_scale=1.0&fov_scale=1.0&color_gain=1.22&eye_render_scale=1.0`
 ///
 /// # Parameter Types
 ///
-/// - Float values: convergence_shift_ndc, ipd_scale, color_black_crush,
-///   color_gain, controller_rotation_*_deg
+/// - Float values: convergence_shift_ndc, ipd_scale, fov_scale, color_black_crush,
+///   color_gain, eye_render_scale, controller_rotation_*_deg
 /// - String values: server_ip
 /// - Commands: discover_servers (triggers action, no value)
 ///
@@ -662,6 +712,13 @@ fn handle_set(query: &str) {
                         crate::client::notify_ipd_scale_changed();
                         save_tuning_settings();
                     }
+                    "fov_scale" => {
+                        let clamped = val.clamp(0.8, 1.2);
+                        store(&FOV_SCALE, clamped);
+                        info!("tune: fov_scale = {clamped:.3}");
+                        crate::client::notify_fov_scale_changed();
+                        save_tuning_settings();
+                    }
                     "color_black_crush" => {
                         let clamped = val.clamp(0.0, 0.3);
                         store(&COLOR_BLACK_CRUSH, clamped);
@@ -672,6 +729,13 @@ fn handle_set(query: &str) {
                         let clamped = val.clamp(0.5, 2.0);
                         store(&COLOR_GAIN, clamped);
                         info!("tune: color_gain = {clamped:.4}");
+                        save_tuning_settings();
+                    }
+                    "eye_render_scale" => {
+                        let clamped = val.clamp(0.5, 1.5);
+                        store(&EYE_RENDER_SCALE, clamped);
+                        info!("tune: eye_render_scale = {clamped:.3}");
+                        crate::client::notify_eye_render_scale_changed();
                         save_tuning_settings();
                     }
                     "controller_rotation_x_deg" => {
@@ -727,8 +791,10 @@ fn save_tuning_settings() {
     if let Ok(mut config) = crate::config::ClientConfig::load_or_create(&config_path) {
         config.convergence_shift_ndc = Some(convergence_shift_ndc());
         config.ipd_scale = Some(ipd_scale());
+        config.fov_scale = Some(fov_scale());
         config.color_black_crush = Some(color_black_crush());
         config.color_gain = Some(color_gain());
+        config.eye_render_scale = Some(eye_render_scale());
         let controller_rotation = controller_rotation_deg();
         config.controller_rotation_x_deg = Some(controller_rotation.x);
         config.controller_rotation_y_deg = Some(controller_rotation.y);
@@ -911,13 +977,19 @@ fn build_html() -> String {
 <div class="param">
   <label>Convergence shift (NDC) <span id="v_cs">{cs:.4}</span></label>
   <input type="range" id="convergence_shift_ndc" min="0" max="0.5" step="0.004" value="{cs:.4}">
-  <div class="desc">Pre-shift to cancel Pimax compositor divergent warp. Default 0.248.</div>
+  <div class="desc">Pre-shift to cancel Pimax compositor divergent warp. Default 0.124.</div>
 </div>
 
 <div class="param">
   <label>IPD scale <span id="v_is">{is:.4}</span></label>
   <input type="range" id="ipd_scale" min="0" max="1.5" step="0.01" value="{is:.4}">
   <div class="desc">ALVR stereo strength. 0 = monoscopic, 1.0 = full physical IPD.</div>
+</div>
+
+<div class="param">
+  <label>FOV scale <span id="v_fs">{fs:.3}</span></label>
+  <input type="range" id="fov_scale" min="0.8" max="1.2" step="0.005" value="{fs:.3}">
+  <div class="desc">Scales the Pimax-reported FOV tangents before ALVR negotiation. Lower can reduce corner stretching.</div>
 </div>
 
 <div class="param">
@@ -930,6 +1002,12 @@ fn build_html() -> String {
   <label>Color gain <span id="v_cg">{cg:.4}</span></label>
   <input type="range" id="color_gain" min="0.5" max="2.0" step="0.01" value="{cg:.4}">
   <div class="desc">BT.709 contrast gain. Default 1.22. Higher = more contrast.</div>
+</div>
+
+<div class="param">
+  <label>Eye render scale <span id="v_ers">{ers:.3}</span></label>
+  <input type="range" id="eye_render_scale" min="0.5" max="1.5" step="0.01" value="{ers:.3}">
+  <div class="desc">Multiplies the Pimax eye render target size before ALVR negotiation. Default 1.0.</div>
 </div>
 
 <h2>Controller Pose Tuning</h2>
@@ -954,8 +1032,8 @@ fn build_html() -> String {
 <div id="status"></div>
 
 <script>
-const tuningIds = ['convergence_shift_ndc','ipd_scale','color_black_crush','color_gain','controller_rotation_x_deg','controller_rotation_y_deg','controller_rotation_z_deg'];
-const tuningLabels = {{'convergence_shift_ndc':'v_cs','ipd_scale':'v_is','color_black_crush':'v_bc','color_gain':'v_cg','controller_rotation_x_deg':'v_crx','controller_rotation_y_deg':'v_cry','controller_rotation_z_deg':'v_crz'}};
+const tuningIds = ['convergence_shift_ndc','ipd_scale','fov_scale','color_black_crush','color_gain','eye_render_scale','controller_rotation_x_deg','controller_rotation_y_deg','controller_rotation_z_deg'];
+const tuningLabels = {{'convergence_shift_ndc':'v_cs','ipd_scale':'v_is','fov_scale':'v_fs','color_black_crush':'v_bc','color_gain':'v_cg','eye_render_scale':'v_ers','controller_rotation_x_deg':'v_crx','controller_rotation_y_deg':'v_cry','controller_rotation_z_deg':'v_crz'}};
 let debounce = {{}};
 
 // Tuning sliders with debouncing
@@ -1031,8 +1109,10 @@ setInterval(refreshServerStatus, 1500);
 "#,
         cs = convergence_shift_ndc(),
         is = ipd_scale(),
+        fs = fov_scale(),
         bc = color_black_crush(),
         cg = color_gain(),
+        ers = eye_render_scale(),
         crx = controller_rotation_deg().x,
         cry = controller_rotation_deg().y,
         crz = controller_rotation_deg().z,

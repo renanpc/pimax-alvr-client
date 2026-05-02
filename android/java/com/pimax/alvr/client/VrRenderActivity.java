@@ -1,10 +1,12 @@
 package com.pimax.alvr.client;
 
 import android.app.NativeActivity;
+import android.Manifest;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Binder;
 import android.os.Bundle;
@@ -117,6 +119,9 @@ public final class VrRenderActivity extends NativeActivity {
      */
     private static final String ACTION_SHUTDOWN = "com.pimax.alvr.client.ACTION_SHUTDOWN";
 
+    /** Runtime permission request code for microphone access. */
+    private static final int REQUEST_RECORD_AUDIO = 1001;
+
     /** Pimax vendor setting used by stock WiFi Airlink's HmdSync while streaming. */
     private static final String PIMAX_EYECHIP_ON_SETTING = "eyechip_on";
 
@@ -133,6 +138,17 @@ public final class VrRenderActivity extends NativeActivity {
     /** Far samples must remain stable before the app lets Pimax put the panel to sleep. */
     private static final long PROXIMITY_FAR_SLEEP_GRACE_MS =
             ProximityWakePolicy.FAR_SLEEP_GRACE_MS;
+
+    /**
+     * Keep the Android display wake path asserted for the full lifetime of an active ALVR
+     * session, even when the headset proximity sensor reports "far".
+     *
+     * <p>This is intentionally more aggressive than stock Pimax behavior because our controlled
+     * launch and debug workflows run off-head. Releasing the activity wake lock on far/screen-off
+     * lets the panel sleep before the native renderer has a chance to present frames, which hides
+     * decoder and color bugs behind an avoidable black-screen automation failure.
+     */
+    private static final boolean KEEP_DISPLAY_AWAKE_DURING_STREAMING = true;
 
     // ---- Pimax hardware bridge constants ---------------------------------------------
 
@@ -271,6 +287,9 @@ public final class VrRenderActivity extends NativeActivity {
     /** True once both native libraries have loaded successfully. */
     private volatile boolean nativeLibrariesLoaded;
 
+    /** Sticky runtime microphone permission state mirrored into native when available. */
+    private volatile boolean microphonePermissionGranted;
+
     // ---- Pimax hardware bridge (IPD sync) -----------------------------------------
 
     /**
@@ -401,8 +420,13 @@ public final class VrRenderActivity extends NativeActivity {
                     nativeNotifyScreen(false);
                 }
                 stopDisplayWakeRetry("screen-off broadcast");
-                releaseScreenWakeLock();
-                Log.i(TAG, "screen turned off; released app wake lock until Pimax reports screen-on");
+                if (KEEP_DISPLAY_AWAKE_DURING_STREAMING) {
+                    forceScreenWakeLock("screen-off broadcast while streaming");
+                    Log.i(TAG, "screen turned off; reasserted app wake lock because streaming override is enabled");
+                } else {
+                    releaseScreenWakeLock();
+                    Log.i(TAG, "screen turned off; released app wake lock until Pimax reports screen-on");
+                }
             } else if (ACTION_SHUTDOWN.equals(action)) {
                 Log.i(TAG, "received ALVR shutdown broadcast");
                 shutdownAndFinish("shutdown broadcast");
@@ -435,6 +459,7 @@ public final class VrRenderActivity extends NativeActivity {
                 System.loadLibrary("pimax_alvr_client");
                 Log.i(TAG, "loaded pimax_alvr_client");
                 nativeLibrariesLoaded = true;
+                nativeNotifyMicrophonePermission(microphonePermissionGranted);
                 runOnUiThread(() -> flushDeferredNativeState("native bootstrap complete"));
             } catch (UnsatisfiedLinkError error) {
                 Log.w(TAG, "failed to load native libraries", error);
@@ -444,6 +469,21 @@ public final class VrRenderActivity extends NativeActivity {
         }, "PimaxNativeBootstrap");
         bootstrapThread.setDaemon(true);
         bootstrapThread.start();
+    }
+
+    /** Requests runtime microphone permission and mirrors the result to native. */
+    private void ensureMicrophonePermission() {
+        boolean granted = checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                == PackageManager.PERMISSION_GRANTED;
+        microphonePermissionGranted = granted;
+        if (nativeLibrariesLoaded) {
+            nativeNotifyMicrophonePermission(granted);
+        }
+        if (granted) {
+            return;
+        }
+        requestPermissions(new String[] { Manifest.permission.RECORD_AUDIO }, REQUEST_RECORD_AUDIO);
+        Log.i(TAG, "requested runtime microphone permission");
     }
 
     /**
@@ -564,6 +604,9 @@ public final class VrRenderActivity extends NativeActivity {
      */
     private static native void nativeNotifyControllerConnection(int hand, boolean connected);
 
+    /** Notifies the native layer whether microphone capture permission is available. */
+    private static native void nativeNotifyMicrophonePermission(boolean granted);
+
     // =========================================================================================
     // Activity lifecycle
     // =========================================================================================
@@ -605,6 +648,7 @@ public final class VrRenderActivity extends NativeActivity {
         registerPimaxHardwareBridge();
         registerProximitySensor();
         startControllerPoller();
+        ensureMicrophonePermission();
         startNativeBootstrapIfNeeded("onCreate");
     }
 
@@ -657,6 +701,7 @@ public final class VrRenderActivity extends NativeActivity {
         registerPimaxHardwareBridge();
         registerProximitySensor();
         startControllerPoller();
+        ensureMicrophonePermission();
         startNativeBootstrapIfNeeded("onResume");
     }
 
@@ -728,6 +773,20 @@ public final class VrRenderActivity extends NativeActivity {
         unregisterScreenReceiver();
         releaseScreenWakeLock();
         super.onDestroy();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQUEST_RECORD_AUDIO) {
+            boolean granted = grantResults.length > 0
+                    && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+            Log.i(TAG, "microphone permission result: granted=" + granted);
+            microphonePermissionGranted = granted;
+            if (nativeLibrariesLoaded) {
+                nativeNotifyMicrophonePermission(granted);
+            }
+        }
     }
 
     // =========================================================================================
@@ -980,7 +1039,8 @@ public final class VrRenderActivity extends NativeActivity {
 
     /** Returns true until proximity is known, and then only while the headset is worn. */
     private boolean shouldKeepDisplayAwakeForProximity() {
-        return proximityWakePolicy.shouldKeepDisplayAwakeForProximity();
+        return KEEP_DISPLAY_AWAKE_DURING_STREAMING
+                || proximityWakePolicy.shouldKeepDisplayAwakeForProximity();
     }
 
     /** Enables the normal VR keep-awake policy while the headset is being worn. */
@@ -994,6 +1054,11 @@ public final class VrRenderActivity extends NativeActivity {
 
     /** Allows Pimax's own off-head timeout to turn the panel off while preserving PC-switch guard. */
     private void allowDisplaySleep(String reason) {
+        if (KEEP_DISPLAY_AWAKE_DURING_STREAMING) {
+            Log.i(TAG, "ignoring allowDisplaySleep because streaming override is enabled: " + reason);
+            keepDisplayAwake(reason + " [streaming override]");
+            return;
+        }
         stopProximityUnknownSleep(reason);
         cancelProximityFarSleep(reason);
         getWindow().clearFlags(WINDOW_KEEP_AWAKE_FLAGS);
