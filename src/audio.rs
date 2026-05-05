@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use log::{info, warn};
 use ndk::audio::{
     AudioCallbackResult, AudioDirection, AudioError, AudioFormat, AudioInputPreset,
@@ -18,13 +18,17 @@ use ndk::audio::{
 };
 use parking_lot::Mutex;
 
+use crate::audio_common::{
+    analyze_pcm16_level, get_next_frame_batch, push_game_audio_payload, send_stream_payload,
+};
+
 #[derive(Clone, Copy, Debug)]
 pub struct AudioBufferingConfig {
     pub average_buffering_ms: u64,
     pub batch_ms: u64,
 }
 
-pub const AUDIO_STREAM_ID: u16 = 2;
+pub use crate::audio_common::AUDIO_STREAM_ID;
 const INPUT_SAMPLES_MAX_BUFFER_COUNT: usize = 20;
 const INPUT_RECV_TIMEOUT: Duration = Duration::from_millis(20);
 
@@ -98,65 +102,6 @@ impl MicrophoneCapture {
     }
 }
 
-fn frames_to_f32(payload: &[u8]) -> Vec<f32> {
-    payload
-        .chunks_exact(2)
-        .map(|bytes| i16::from_ne_bytes([bytes[0], bytes[1]]) as f32 / i16::MAX as f32)
-        .collect()
-}
-
-fn analyze_pcm16_level(payload: &[u8]) -> Option<(f32, f32)> {
-    let mut peak = 0.0_f32;
-    let mut sum_squares = 0.0_f32;
-    let mut count = 0_u32;
-
-    for sample in payload.chunks_exact(2) {
-        let value = i16::from_ne_bytes([sample[0], sample[1]]) as f32 / i16::MAX as f32;
-        peak = peak.max(value.abs());
-        sum_squares += value * value;
-        count += 1;
-    }
-
-    if count == 0 {
-        None
-    } else {
-        Some((peak, (sum_squares / count as f32).sqrt()))
-    }
-}
-
-pub fn push_game_audio_payload(
-    sample_queue: &Arc<Mutex<VecDeque<f32>>>,
-    payload: &[u8],
-    average_buffer_frames_count: usize,
-    batch_frames_count: usize,
-) {
-    let samples = frames_to_f32(payload);
-    let mut queue = sample_queue.lock();
-    queue.extend(samples);
-
-    let max_samples = (2 * average_buffer_frames_count + batch_frames_count) * 2;
-    if queue.len() > max_samples {
-        let drain_count = queue.len() - max_samples;
-        queue.drain(..drain_count);
-    }
-}
-
-fn get_next_frame_batch(
-    sample_buffer: &Arc<Mutex<VecDeque<f32>>>,
-    channels_count: usize,
-    batch_frames_count: usize,
-) -> Vec<f32> {
-    let mut sample_buffer = sample_buffer.lock();
-
-    if sample_buffer.len() / channels_count >= batch_frames_count {
-        sample_buffer
-            .drain(0..batch_frames_count * channels_count)
-            .collect::<Vec<_>>()
-    } else {
-        vec![0.0; batch_frames_count * channels_count]
-    }
-}
-
 pub fn start_game_audio_output(
     sample_rate: u32,
     buffering: AudioBufferingConfig,
@@ -200,7 +145,7 @@ pub fn start_game_audio_output(
                     let out_frames = unsafe {
                         slice::from_raw_parts_mut(data_ptr as *mut f32, frames_count * 2)
                     };
-                    let samples = get_next_frame_batch(&thread_sample_queue, 2, batch_frames_count);
+                    let samples = get_next_frame_batch(&thread_sample_queue, 2, frames_count);
                     out_frames.copy_from_slice(&samples);
                     AudioCallbackResult::Continue
                 }))
@@ -365,44 +310,4 @@ pub fn start_microphone_capture(
         stop_requested,
         join_handle: Arc::new(Mutex::new(Some(join_handle))),
     })
-}
-
-pub fn send_stream_payload(
-    socket: &UdpSocket,
-    stream_id: u16,
-    packet_index: u32,
-    payload: &[u8],
-    max_packet_size: usize,
-) -> Result<()> {
-    let max_shard_size = max_packet_size.saturating_sub(14);
-    if max_shard_size == 0 {
-        bail!("invalid ALVR packet size: {max_packet_size}");
-    }
-
-    let shards_count = payload.len().div_ceil(max_shard_size).max(1);
-    let mut buffer = Vec::with_capacity(14 + max_shard_size);
-
-    for shard_index in 0..shards_count {
-        let shard_start = shard_index * max_shard_size;
-        let shard_end = usize::min(shard_start + max_shard_size, payload.len());
-        let shard_payload = &payload[shard_start..shard_end];
-
-        buffer.clear();
-        buffer.resize(14, 0);
-        buffer.extend_from_slice(shard_payload);
-        buffer[0..2].copy_from_slice(&stream_id.to_le_bytes());
-        buffer[2..6].copy_from_slice(&packet_index.to_le_bytes());
-        buffer[6..10].copy_from_slice(&(shards_count as u32).to_le_bytes());
-        buffer[10..14].copy_from_slice(&(shard_index as u32).to_le_bytes());
-
-        let bytes_sent = socket.send(&buffer).context("send ALVR audio payload")?;
-        if bytes_sent != buffer.len() {
-            bail!(
-                "short ALVR audio send: sent {bytes_sent} of {} bytes",
-                buffer.len()
-            );
-        }
-    }
-
-    Ok(())
 }

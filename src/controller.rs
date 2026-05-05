@@ -150,22 +150,7 @@ pub fn update_controller_state(hand: Hand, state: SingleControllerState) {
         Hand::Left => snapshot.left.as_ref(),
         Hand::Right => snapshot.right.as_ref(),
     };
-    let mut state = state;
-
-    if let (Some(previous_state), Some(incoming_motion)) = (previous_state, state.motion) {
-        state.motion = Some(apply_controller_position_deadzone(
-            previous_state.motion,
-            incoming_motion,
-        ));
-    } else if state.motion.is_none() {
-        state.motion = previous_state.and_then(|previous_state| previous_state.motion);
-    }
-    if let Some(previous_state) = previous_state {
-        state.thumbstick_x =
-            stabilize_thumbstick_axis(previous_state.thumbstick_x, state.thumbstick_x);
-        state.thumbstick_y =
-            stabilize_thumbstick_axis(previous_state.thumbstick_y, state.thumbstick_y);
-    }
+    let state = merge_controller_update(previous_state, state);
 
     // Throttled diagnostic logging
     if let Ok(mut counts) = CONTROLLER_UPDATE_COUNT.lock() {
@@ -318,11 +303,26 @@ const BUTTON_TOUCH_MAP: &[ButtonBitMap] = &[
     },
 ];
 
+const ANALOG_INPUT_SUFFIXES: &[&str] = &[
+    "input/trigger/value",
+    "input/squeeze/value",
+    "input/thumbstick/x",
+    "input/thumbstick/y",
+];
+
 /// Build the full OpenXR path for a hand + suffix, e.g.,
 /// "/user/hand/left" + "input/x/click" → "/user/hand/left/input/x/click".
 fn button_path_id(hand_path: &str, suffix: &str) -> u64 {
     let full = format!("{hand_path}/{suffix}");
     hash_string(&full)
+}
+
+fn suffix_for_hand(mapping: &ButtonBitMap, hand_path: &str) -> &'static str {
+    if hand_path == LEFT_HAND_PATH {
+        mapping.left_suffix
+    } else {
+        mapping.right_suffix
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -361,48 +361,33 @@ pub fn build_button_entries(snapshot: &ControllerSnapshot) -> Vec<ButtonEntry> {
 
 pub fn format_button_entries_for_hand(entries: &[ButtonEntry], hand_path: &str) -> String {
     let mut parts = Vec::new();
-    let is_left = hand_path == LEFT_HAND_PATH;
 
     for mapping in BUTTON_PRESS_MAP {
-        let suffix = if is_left {
-            mapping.left_suffix
-        } else {
-            mapping.right_suffix
-        };
+        let suffix = suffix_for_hand(mapping, hand_path);
         if suffix.is_empty() {
             continue;
         }
-        let path_id = button_path_id(hand_path, suffix);
-        let value = entries
-            .iter()
-            .find(|entry| entry.path_id == path_id)
-            .map(|entry| match entry.value {
-                ButtonValue::Binary(value) => value.to_string(),
-                ButtonValue::Scalar(value) => format!("{value:.3}"),
-            })
-            .unwrap_or_else(|| "missing".to_string());
+        let value = format_button_entry_value(entries, button_path_id(hand_path, suffix));
         parts.push(format!("{hand_path}/{suffix}={value}"));
     }
 
-    for suffix in [
-        "input/trigger/value",
-        "input/squeeze/value",
-        "input/thumbstick/x",
-        "input/thumbstick/y",
-    ] {
-        let path_id = button_path_id(hand_path, suffix);
-        let value = entries
-            .iter()
-            .find(|entry| entry.path_id == path_id)
-            .map(|entry| match entry.value {
-                ButtonValue::Binary(value) => value.to_string(),
-                ButtonValue::Scalar(value) => format!("{value:.3}"),
-            })
-            .unwrap_or_else(|| "missing".to_string());
+    for suffix in ANALOG_INPUT_SUFFIXES {
+        let value = format_button_entry_value(entries, button_path_id(hand_path, suffix));
         parts.push(format!("{hand_path}/{suffix}={value}"));
     }
 
     parts.join(" ")
+}
+
+fn format_button_entry_value(entries: &[ButtonEntry], path_id: u64) -> String {
+    entries
+        .iter()
+        .find(|entry| entry.path_id == path_id)
+        .map(|entry| match entry.value {
+            ButtonValue::Binary(value) => value.to_string(),
+            ButtonValue::Scalar(value) => format!("{value:.3}"),
+        })
+        .unwrap_or_else(|| "missing".to_string())
 }
 
 fn push_hand_button_entries(
@@ -410,15 +395,9 @@ fn push_hand_button_entries(
     hand_path: &str,
     state: Option<&SingleControllerState>,
 ) {
-    let is_left = hand_path == LEFT_HAND_PATH;
-
     // Digital buttons (press)
     for mapping in BUTTON_PRESS_MAP {
-        let suffix = if is_left {
-            mapping.left_suffix
-        } else {
-            mapping.right_suffix
-        };
+        let suffix = suffix_for_hand(mapping, hand_path);
         if suffix.is_empty() {
             continue;
         }
@@ -433,11 +412,7 @@ fn push_hand_button_entries(
 
     // Digital buttons (touch)
     for mapping in BUTTON_TOUCH_MAP {
-        let suffix = if is_left {
-            mapping.left_suffix
-        } else {
-            mapping.right_suffix
-        };
+        let suffix = suffix_for_hand(mapping, hand_path);
         if suffix.is_empty() {
             continue;
         }
@@ -478,33 +453,20 @@ fn supported_input_ids_for_hand(hand_path: &str) -> HashSet<u64> {
     let mut ids = HashSet::new();
 
     for mapping in BUTTON_PRESS_MAP {
-        let suffix = if hand_path == LEFT_HAND_PATH {
-            mapping.left_suffix
-        } else {
-            mapping.right_suffix
-        };
+        let suffix = suffix_for_hand(mapping, hand_path);
         if !suffix.is_empty() {
             ids.insert(button_path_id(hand_path, suffix));
         }
     }
 
     for mapping in BUTTON_TOUCH_MAP {
-        let suffix = if hand_path == LEFT_HAND_PATH {
-            mapping.left_suffix
-        } else {
-            mapping.right_suffix
-        };
+        let suffix = suffix_for_hand(mapping, hand_path);
         if !suffix.is_empty() {
             ids.insert(button_path_id(hand_path, suffix));
         }
     }
 
-    for suffix in [
-        "input/trigger/value",
-        "input/squeeze/value",
-        "input/thumbstick/x",
-        "input/thumbstick/y",
-    ] {
+    for suffix in ANALOG_INPUT_SUFFIXES {
         ids.insert(button_path_id(hand_path, suffix));
     }
 
@@ -941,11 +903,47 @@ mod tests {
     }
 
     #[test]
-    fn stabilize_thumbstick_axis_ignores_extreme_sign_wrap() {
-        assert_eq!(stabilize_thumbstick_axis(-0.75, 0.95), -0.95);
-        assert_eq!(stabilize_thumbstick_axis(0.75, -0.95), 0.95);
-        assert_eq!(stabilize_thumbstick_axis(-0.25, 0.95), 0.95);
+    fn merge_controller_update_preserves_thumbstick_sign_changes() {
+        let previous = SingleControllerState {
+            connected: true,
+            handle: 1,
+            motion: None,
+            buttons_pressed: 0,
+            buttons_touched: 0,
+            trigger: 0.0,
+            grip: 0.0,
+            thumbstick_x: -1.0,
+            thumbstick_y: 1.0,
+            battery_percent: 100,
+            last_updated: Instant::now(),
+        };
+        let incoming = SingleControllerState {
+            thumbstick_x: 1.0,
+            thumbstick_y: -1.0,
+            ..previous.clone()
+        };
+
+        let merged = merge_controller_update(Some(&previous), incoming);
+
+        assert_eq!(merged.thumbstick_x, 1.0);
+        assert_eq!(merged.thumbstick_y, -1.0);
     }
+}
+
+fn merge_controller_update(
+    previous_state: Option<&SingleControllerState>,
+    mut state: SingleControllerState,
+) -> SingleControllerState {
+    if let (Some(previous_state), Some(incoming_motion)) = (previous_state, state.motion) {
+        state.motion = Some(apply_controller_position_deadzone(
+            previous_state.motion,
+            incoming_motion,
+        ));
+    } else if state.motion.is_none() {
+        state.motion = previous_state.and_then(|previous_state| previous_state.motion);
+    }
+
+    state
 }
 
 fn apply_controller_position_deadzone(
@@ -972,18 +970,5 @@ fn apply_controller_position_deadzone(
         },
         linear_velocity: incoming_motion.linear_velocity,
         angular_velocity: incoming_motion.angular_velocity,
-    }
-}
-
-fn stabilize_thumbstick_axis(previous: f32, incoming: f32) -> f32 {
-    const STRONG_DEFLECTION: f32 = 0.60;
-
-    if previous.abs() >= STRONG_DEFLECTION
-        && incoming.abs() >= STRONG_DEFLECTION
-        && previous.signum() != incoming.signum()
-    {
-        previous.signum() * incoming.abs()
-    } else {
-        incoming
     }
 }
