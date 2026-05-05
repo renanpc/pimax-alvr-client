@@ -309,6 +309,7 @@ const ANALOG_INPUT_SUFFIXES: &[&str] = &[
     "input/thumbstick/x",
     "input/thumbstick/y",
 ];
+const CONTROLLER_POSITION_DEADZONE_METERS: f32 = 0.0;
 
 /// Build the full OpenXR path for a hand + suffix, e.g.,
 /// "/user/hand/left" + "input/x/click" → "/user/hand/left/input/x/click".
@@ -928,6 +929,59 @@ mod tests {
         assert_eq!(merged.thumbstick_x, 1.0);
         assert_eq!(merged.thumbstick_y, -1.0);
     }
+
+    #[test]
+    fn merge_controller_update_keeps_incoming_motion_when_deadzone_is_disabled() {
+        let previous_motion = DeviceMotion {
+            pose: Pose {
+                orientation: glam::Quat::IDENTITY,
+                position: glam::vec3(0.0, 0.0, 0.0),
+            },
+            linear_velocity: glam::Vec3::ZERO,
+            angular_velocity: glam::Vec3::ZERO,
+        };
+        let incoming_motion = DeviceMotion {
+            pose: Pose {
+                orientation: glam::Quat::IDENTITY,
+                position: glam::vec3(0.001, 0.0, 0.0),
+            },
+            linear_velocity: glam::Vec3::ZERO,
+            angular_velocity: glam::Vec3::ZERO,
+        };
+        let previous = SingleControllerState {
+            connected: true,
+            handle: 1,
+            motion: Some(previous_motion),
+            buttons_pressed: 0,
+            buttons_touched: 0,
+            trigger: 0.0,
+            grip: 0.0,
+            thumbstick_x: 0.0,
+            thumbstick_y: 0.0,
+            battery_percent: 100,
+            last_updated: Instant::now(),
+        };
+        let incoming = SingleControllerState {
+            connected: true,
+            handle: 1,
+            motion: Some(incoming_motion),
+            buttons_pressed: 0,
+            buttons_touched: 0,
+            trigger: 0.0,
+            grip: 0.0,
+            thumbstick_x: 0.0,
+            thumbstick_y: 0.0,
+            battery_percent: 100,
+            last_updated: Instant::now(),
+        };
+
+        let merged = merge_controller_update(Some(&previous), incoming);
+
+        assert_eq!(
+            merged.motion.expect("merged motion").pose.position,
+            glam::vec3(0.001, 0.0, 0.0)
+        );
+    }
 }
 
 fn merge_controller_update(
@@ -954,7 +1008,7 @@ fn apply_controller_position_deadzone(
         return incoming_motion;
     };
 
-    let deadzone = crate::tune::controller_position_deadzone().max(0.0);
+    let deadzone = CONTROLLER_POSITION_DEADZONE_METERS.max(0.0);
     let previous_position = previous_motion.pose.position;
     let incoming_position = incoming_motion.pose.position;
     let stabilized_position = if (incoming_position - previous_position).length() < deadzone {

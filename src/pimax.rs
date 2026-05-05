@@ -2520,7 +2520,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn controller_grip_pose_offset_uses_tuned_pitch_degrees() {
+    fn controller_grip_pose_offset_uses_crystal_midpoint_pitch_degrees() {
         let offset =
             pimax_native_controller_grip_pose_offset_from_degrees(glam::vec3(45.0, 0.0, 0.0));
         let grip_up = offset * glam::Vec3::Y;
@@ -2530,6 +2530,20 @@ mod tests {
             std::f32::consts::FRAC_1_SQRT_2,
         );
         assert!((grip_up - expected_up).length() < 1.0e-5);
+    }
+
+    #[test]
+    fn controller_grip_pose_offset_uses_fixed_client_calibration() {
+        let expected = pimax_native_controller_grip_pose_offset_from_degrees(
+            pimax_native_controller_grip_pose_offset_degrees(),
+        );
+
+        assert!(
+            pimax_native_controller_grip_pose_offset()
+                .angle_between(expected)
+                .abs()
+                < 1.0e-6
+        );
     }
 
     #[test]
@@ -2722,11 +2736,18 @@ fn pimax_native_controller_grip_pose_offset_from_degrees(rotation_deg: glam::Vec
     .normalize()
 }
 
+fn pimax_native_controller_grip_pose_offset_degrees() -> glam::Vec3 {
+    glam::vec3(45.0, 0.0, 0.0)
+}
+
 fn pimax_native_controller_grip_pose_offset() -> glam::Quat {
     // Native sxrControllerGetState's model basis is pitched forward relative
-    // to ALVR/OpenXR grip poses. A full +90 degree axis swap overcorrects on
-    // Crystal OG, so keep the offset live-tunable while calibrating hardware.
-    pimax_native_controller_grip_pose_offset_from_degrees(crate::tune::controller_rotation_deg())
+    // to ALVR/OpenXR grip poses. Keep the current midpoint correction fixed
+    // in the client and leave user-facing controller offsets to the ALVR
+    // server dashboard.
+    pimax_native_controller_grip_pose_offset_from_degrees(
+        pimax_native_controller_grip_pose_offset_degrees(),
+    )
 }
 
 fn convert_pimax_native_controller_motion(
