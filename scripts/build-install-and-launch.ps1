@@ -27,7 +27,7 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "Running controlled launch test..."
 $snapshotLiteral = '@(' + ($SnapshotSeconds -join ',') + ')'
 $launchCommand = @"
-& '$scriptDir\pimax-controlled-launch-test.ps1' -Serial '$Serial' -SnapshotSeconds $snapshotLiteral -NetworkWaitTimeoutSeconds $NetworkWaitTimeoutSeconds -AdbCommandTimeoutSeconds $AdbCommandTimeoutSeconds -AdbWaitForDeviceTimeoutSeconds $AdbWaitForDeviceTimeoutSeconds$(if ($RebootBeforeRun) { ' -RebootBeforeRun' } else { '' })$(if ($RecoverAfterRun) { ' -RecoverAfterRun' } else { '' })
+& '$scriptDir\pimax-controlled-launch-test.ps1' -Serial '$Serial' -SnapshotSeconds $snapshotLiteral -NetworkWaitTimeoutSeconds $NetworkWaitTimeoutSeconds -AdbCommandTimeoutSeconds $AdbCommandTimeoutSeconds -AdbWaitForDeviceTimeoutSeconds $AdbWaitForDeviceTimeoutSeconds -LeaveRunningWhenDisplayOff$(if ($RebootBeforeRun) { ' -RebootBeforeRun' } else { '' })$(if ($RecoverAfterRun) { ' -RecoverAfterRun' } else { '' })
 "@
 
 & powershell -NoProfile -ExecutionPolicy Bypass -Command $launchCommand

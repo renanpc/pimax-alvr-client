@@ -1417,8 +1417,11 @@ void main() {
 /// Re-creates when dimensions change.
 fn get_intermediate_fbo(width: i32, height: i32) -> Result<IntermediateFbo> {
     let mut fbo = INTERMEDIATE_FBO.lock();
-        if let Some(existing) = fbo.as_ref() {
-        if existing.width == width && existing.height == height && existing.is_hdr == hdr_stream_enabled() {
+    if let Some(existing) = fbo.as_ref() {
+        if existing.width == width
+            && existing.height == height
+            && existing.is_hdr == hdr_stream_enabled()
+        {
             return Ok(IntermediateFbo {
                 framebuffer: existing.framebuffer,
                 texture: existing.texture,
@@ -2251,7 +2254,10 @@ pub(crate) fn render_ahardwarebuffer_to_target(
         let (black_crush, color_gain) = stream_color_adjustment();
         glUniform1f(passthrough.black_crush_uniform, black_crush);
         glUniform1f(passthrough.color_gain_uniform, color_gain);
-        glUniform1i(passthrough.hdr_mode_uniform, if hdr_stream_enabled() { 1 } else { 0 });
+        glUniform1i(
+            passthrough.hdr_mode_uniform,
+            if hdr_stream_enabled() { 1 } else { 0 },
+        );
         glDrawArrays(GL_TRIANGLES, 0, 3);
 
         glFlush();
@@ -2530,7 +2536,10 @@ pub(crate) fn render_ahardwarebuffer_zero_copy(
         let (black_crush, color_gain) = stream_color_adjustment();
         glUniform1f(passthrough.black_crush_uniform, black_crush);
         glUniform1f(passthrough.color_gain_uniform, color_gain);
-        glUniform1i(passthrough.hdr_mode_uniform, if hdr_stream_enabled() { 1 } else { 0 });
+        glUniform1i(
+            passthrough.hdr_mode_uniform,
+            if hdr_stream_enabled() { 1 } else { 0 },
+        );
         glDrawArrays(GL_TRIANGLES, 0, 3);
 
         // --- Pass 2: intermediate RGBA → left eye ---
@@ -2783,7 +2792,10 @@ fn copy_nv12_frame_to_target(
         let (black_crush, color_gain) = stream_color_adjustment();
         glUniform1f(program.black_crush_uniform, black_crush);
         glUniform1f(program.color_gain_uniform, color_gain);
-        glUniform1i(program.hdr_mode_uniform, if hdr_stream_enabled() { 1 } else { 0 });
+        glUniform1i(
+            program.hdr_mode_uniform,
+            if hdr_stream_enabled() { 1 } else { 0 },
+        );
         glDrawArrays(GL_TRIANGLES, 0, 3);
         if should_log_stats {
             let gl_error = glGetError();

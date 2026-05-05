@@ -1227,10 +1227,7 @@ fn run_minimal_alvr_stream(
                     .with_context(|| format!("configure decoder for {:?}", config.codec))?;
                 decoder_configured = true;
                 decoder_config_ready.store(true, Ordering::Release);
-                request_alvr_idr_best_effort(
-                    &control_writer,
-                    "decoder configuration completed",
-                );
+                request_alvr_idr_best_effort(&control_writer, "decoder configuration completed");
             }
             Ok(ServerControlPacket::ReservedBuffer(buffer)) => {
                 info!(
@@ -1701,8 +1698,13 @@ fn maintain_alvr_control_socket(writer: SharedControlWriter) {
     let mut next_keepalive = Instant::now();
     let mut next_buttons_send = Instant::now();
     let mut last_views_config_version = latest_alvr_views_config().map(|state| state.version);
+    let mut last_active_interaction_profiles: Option<
+        Vec<crate::controller::ActiveInteractionProfile>,
+    > = None;
     let mut keepalives_sent = 0_u64;
     let mut buttons_sent = 0_u64;
+    let mut active_profiles_sent = 0_u64;
+    let mut last_left_button_debug_key: Option<(u32, u32, bool, bool)> = None;
 
     loop {
         let now = Instant::now();
@@ -1742,9 +1744,73 @@ fn maintain_alvr_control_socket(writer: SharedControlWriter) {
 
         if now >= next_buttons_send {
             let snapshot = crate::controller::latest_controller_state();
+            let active_profiles = crate::controller::build_active_interaction_profiles(&snapshot);
+            if Some(&active_profiles) != last_active_interaction_profiles.as_ref() {
+                let mut profile_send_failed = false;
+                if active_profiles.is_empty() {
+                    info!("cleared ALVR active interaction profiles");
+                    last_active_interaction_profiles = None;
+                } else {
+                    for profile in &active_profiles {
+                        if let Err(err) = send_framed_locked(
+                            &writer,
+                            &ClientControlPacket::ActiveInteractionProfile {
+                                device_id: profile.device_id,
+                                profile_id: profile.profile_id,
+                                input_ids: profile.input_ids.clone(),
+                            },
+                        ) {
+                            warn!(
+                                "ALVR control maintenance thread exiting after ActiveInteractionProfile send failure: {err:#}"
+                            );
+                            profile_send_failed = true;
+                            break;
+                        }
+                    }
+                    if profile_send_failed {
+                        break;
+                    }
+                    active_profiles_sent = active_profiles_sent.wrapping_add(1);
+                    info!(
+                        "sent ALVR ActiveInteractionProfile packet set: count={} profiles={}",
+                        active_profiles_sent,
+                        active_profiles.len()
+                    );
+                    last_active_interaction_profiles = Some(active_profiles);
+                }
+            }
+
             let entries = crate::controller::build_button_entries(&snapshot);
             if !entries.is_empty() {
                 let entry_count = entries.len();
+                let left_button_debug_key = snapshot.left.as_ref().map(|state| {
+                    (
+                        state.buttons_pressed,
+                        state.buttons_touched,
+                        state.trigger > 0.01,
+                        state.grip > 0.01,
+                    )
+                });
+                if left_button_debug_key != last_left_button_debug_key {
+                    if let Some(state) = snapshot.left.as_ref() {
+                        info!(
+                            "ALVR normalized left ButtonEntry stream: buttons=0x{:08x} touch=0x{:08x} trigger={:.3} grip={:.3} stick=({:.3},{:.3}) entries=[{}]",
+                            state.buttons_pressed,
+                            state.buttons_touched,
+                            state.trigger,
+                            state.grip,
+                            state.thumbstick_x,
+                            state.thumbstick_y,
+                            crate::controller::format_button_entries_for_hand(
+                                &entries,
+                                crate::controller::LEFT_HAND_PATH,
+                            )
+                        );
+                    } else {
+                        info!("ALVR normalized left ButtonEntry stream: no fresh left controller");
+                    }
+                    last_left_button_debug_key = left_button_debug_key;
+                }
                 if let Err(err) =
                     send_framed_locked(&writer, &ClientControlPacket::Buttons(entries))
                 {

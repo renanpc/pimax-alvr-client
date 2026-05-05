@@ -3,9 +3,13 @@
 #[cfg(target_os = "android")]
 pub mod android;
 #[cfg(target_os = "android")]
-pub mod audio;
-#[cfg(target_os = "android")]
 pub mod android_video_decoder;
+#[cfg(target_os = "android")]
+pub mod audio;
+#[cfg(not(target_os = "android"))]
+#[path = "audio_host.rs"]
+pub mod audio;
+mod audio_common;
 pub mod client;
 pub mod config;
 pub mod controller;

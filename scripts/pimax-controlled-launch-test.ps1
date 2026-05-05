@@ -752,16 +752,14 @@ try {
         $displayOff = Test-DisplayOff -Label $label
     }
 
-    if ($displayOff -and $LeaveRunningWhenDisplayOff) {
-        Write-Warning "Display appears OFF during controlled launch; leaving ALVR running because -LeaveRunningWhenDisplayOff was provided."
+    if ($displayOff) {
+        if ($LeaveRunningWhenDisplayOff) {
+            Write-Warning "Display appears OFF during controlled launch; leaving ALVR running because -LeaveRunningWhenDisplayOff was provided."
+        } else {
+            Write-Warning "Display appears OFF during controlled launch; leaving ALVR running by default."
+        }
         Save-DisplaySnapshot -Label "after-display-off-left-running"
         Write-DisplaySummary -Label "after-display-off-left-running"
-    } elseif ($displayOff) {
-        Write-Warning "Display appears OFF during controlled launch; force-stopping ALVR."
-        Save-AdbSnapshot -FileName "force-stop.txt" -Description "force-stop ALVR" -AdbCommandArgs @("shell", "am force-stop $packageName") -AllowFailure | Out-Null
-        Start-Sleep -Seconds 2
-        Save-DisplaySnapshot -Label "after-force-stop"
-        Write-DisplaySummary -Label "after-force-stop"
     } else {
         Write-Host "Display stayed ON through timed window; leaving app running."
         Save-DisplaySnapshot -Label "after-snapshots"

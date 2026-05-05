@@ -127,28 +127,6 @@ static COLOR_GAIN: AtomicU32 = AtomicU32::new(0);
 pub const EYE_RENDER_SCALE_DEFAULT: f32 = 1.0;
 static EYE_RENDER_SCALE: AtomicU32 = AtomicU32::new(0);
 
-/// Default local controller X-axis calibration in degrees.
-///
-/// This is the current Crystal OG midpoint calibration: the native controller
-/// pose is pitched forward in ALVR, while a full 90 degree axis swap tilts it
-/// backward. Keep the value live-tunable while we finish hardware calibration.
-pub const CONTROLLER_ROTATION_X_DEG_DEFAULT: f32 = 45.0;
-
-/// Default local controller Y-axis calibration in degrees.
-pub const CONTROLLER_ROTATION_Y_DEG_DEFAULT: f32 = 0.0;
-
-/// Default local controller Z-axis calibration in degrees.
-pub const CONTROLLER_ROTATION_Z_DEG_DEFAULT: f32 = 0.0;
-
-/// Controller local X-axis grip-pose calibration in degrees.
-static CONTROLLER_ROTATION_X_DEG: AtomicU32 = AtomicU32::new(0);
-
-/// Controller local Y-axis grip-pose calibration in degrees.
-static CONTROLLER_ROTATION_Y_DEG: AtomicU32 = AtomicU32::new(0);
-
-/// Controller local Z-axis grip-pose calibration in degrees.
-static CONTROLLER_ROTATION_Z_DEG: AtomicU32 = AtomicU32::new(0);
-
 // =============================================================================
 // Server Connection State
 // =============================================================================
@@ -257,19 +235,6 @@ pub fn init(
         .as_ref()
         .and_then(|c| c.eye_render_scale)
         .unwrap_or(eye_render_scale);
-    let crx = config
-        .as_ref()
-        .and_then(|c| c.controller_rotation_x_deg)
-        .unwrap_or(CONTROLLER_ROTATION_X_DEG_DEFAULT);
-    let cry = config
-        .as_ref()
-        .and_then(|c| c.controller_rotation_y_deg)
-        .unwrap_or(CONTROLLER_ROTATION_Y_DEG_DEFAULT);
-    let crz = config
-        .as_ref()
-        .and_then(|c| c.controller_rotation_z_deg)
-        .unwrap_or(CONTROLLER_ROTATION_Z_DEG_DEFAULT);
-
     // Store in atomics for render thread access
     store(&CONVERGENCE_SHIFT_NDC, cs);
     store(&IPD_SCALE, is);
@@ -277,11 +242,11 @@ pub fn init(
     store(&COLOR_BLACK_CRUSH, bc);
     store(&COLOR_GAIN, cg);
     store(&EYE_RENDER_SCALE, ers);
-    store(&CONTROLLER_ROTATION_X_DEG, crx);
-    store(&CONTROLLER_ROTATION_Y_DEG, cry);
-    store(&CONTROLLER_ROTATION_Z_DEG, crz);
 
-    info!("tune: loaded settings from config: convergence_shift_ndc={:.4}, ipd_scale={:.4}, fov_scale={:.3}, color_black_crush={:.4}, color_gain={:.4}, eye_render_scale={:.3}, controller_rotation_deg=({:.1},{:.1},{:.1})", cs, is, fs, bc, cg, ers, crx, cry, crz);
+    info!(
+        "tune: loaded settings from config: convergence_shift_ndc={:.4}, ipd_scale={:.4}, fov_scale={:.3}, color_black_crush={:.4}, color_gain={:.4}, eye_render_scale={:.3}",
+        cs, is, fs, bc, cg, ers
+    );
 
     // Load server IP from config
     let initial_server_ip = config
@@ -355,21 +320,6 @@ pub fn color_gain() -> f32 {
 #[inline]
 pub fn eye_render_scale() -> f32 {
     load(&EYE_RENDER_SCALE)
-}
-
-/// Get the current local controller rotation offsets in degrees.
-///
-/// # Called From
-///
-/// `pimax::convert_pimax_native_controller_motion()` - applied to each
-/// controller pose before it is sent to ALVR.
-#[inline]
-pub fn controller_rotation_deg() -> glam::Vec3 {
-    glam::vec3(
-        load(&CONTROLLER_ROTATION_X_DEG),
-        load(&CONTROLLER_ROTATION_Y_DEG),
-        load(&CONTROLLER_ROTATION_Z_DEG),
-    )
 }
 
 // =============================================================================
@@ -622,18 +572,14 @@ fn run_http_server() {
             );
         } else if path == "/values" {
             // Return current tuning values as JSON
-            let controller_rotation = controller_rotation_deg();
             let body = format!(
-                r#"{{"convergence_shift_ndc":{:.4},"ipd_scale":{:.4},"fov_scale":{:.3},"color_black_crush":{:.4},"color_gain":{:.4},"eye_render_scale":{:.3},"controller_rotation_x_deg":{:.2},"controller_rotation_y_deg":{:.2},"controller_rotation_z_deg":{:.2},"server_ip":"{}","server_status":"{}"}}"#,
+                r#"{{"convergence_shift_ndc":{:.4},"ipd_scale":{:.4},"fov_scale":{:.3},"color_black_crush":{:.4},"color_gain":{:.4},"eye_render_scale":{:.3},"server_ip":"{}","server_status":"{}"}}"#,
                 convergence_shift_ndc(),
                 ipd_scale(),
                 fov_scale(),
                 color_black_crush(),
                 color_gain(),
                 eye_render_scale(),
-                controller_rotation.x,
-                controller_rotation.y,
-                controller_rotation.z,
                 get_server_ip(),
                 get_server_status()
             );
@@ -678,7 +624,7 @@ fn run_http_server() {
 /// # Parameter Types
 ///
 /// - Float values: convergence_shift_ndc, ipd_scale, fov_scale, color_black_crush,
-///   color_gain, eye_render_scale, controller_rotation_*_deg
+///   color_gain, eye_render_scale
 /// - String values: server_ip
 /// - Commands: discover_servers (triggers action, no value)
 ///
@@ -738,24 +684,6 @@ fn handle_set(query: &str) {
                         crate::client::notify_eye_render_scale_changed();
                         save_tuning_settings();
                     }
-                    "controller_rotation_x_deg" => {
-                        let clamped = val.clamp(-180.0, 180.0);
-                        store(&CONTROLLER_ROTATION_X_DEG, clamped);
-                        info!("tune: controller_rotation_x_deg = {clamped:.2}");
-                        save_tuning_settings();
-                    }
-                    "controller_rotation_y_deg" => {
-                        let clamped = val.clamp(-180.0, 180.0);
-                        store(&CONTROLLER_ROTATION_Y_DEG, clamped);
-                        info!("tune: controller_rotation_y_deg = {clamped:.2}");
-                        save_tuning_settings();
-                    }
-                    "controller_rotation_z_deg" => {
-                        let clamped = val.clamp(-180.0, 180.0);
-                        store(&CONTROLLER_ROTATION_Z_DEG, clamped);
-                        info!("tune: controller_rotation_z_deg = {clamped:.2}");
-                        save_tuning_settings();
-                    }
                     _ => {}
                 }
             }
@@ -795,10 +723,6 @@ fn save_tuning_settings() {
         config.color_black_crush = Some(color_black_crush());
         config.color_gain = Some(color_gain());
         config.eye_render_scale = Some(eye_render_scale());
-        let controller_rotation = controller_rotation_deg();
-        config.controller_rotation_x_deg = Some(controller_rotation.x);
-        config.controller_rotation_y_deg = Some(controller_rotation.y);
-        config.controller_rotation_z_deg = Some(controller_rotation.z);
         if let Err(e) = config.save(&config_path) {
             warn!("tune: failed to save tuning settings: {e}");
         } else {
@@ -1010,37 +934,18 @@ fn build_html() -> String {
   <div class="desc">Multiplies the Pimax eye render target size before ALVR negotiation. Default 1.0.</div>
 </div>
 
-<h2>Controller Pose Tuning</h2>
-<div class="param">
-  <label>Controller rotation X / pitch deg <span id="v_crx">{crx:.2}</span></label>
-  <input type="range" id="controller_rotation_x_deg" min="-180" max="180" step="1" value="{crx:.2}">
-  <div class="desc">Local grip-pose pitch offset. Current default 45. Use this first for forward/back tilt.</div>
-</div>
-
-<div class="param">
-  <label>Controller rotation Y / yaw deg <span id="v_cry">{cry:.2}</span></label>
-  <input type="range" id="controller_rotation_y_deg" min="-180" max="180" step="1" value="{cry:.2}">
-  <div class="desc">Local grip-pose yaw offset. Use if the controller points left/right from real life.</div>
-</div>
-
-<div class="param">
-  <label>Controller rotation Z / roll deg <span id="v_crz">{crz:.2}</span></label>
-  <input type="range" id="controller_rotation_z_deg" min="-180" max="180" step="1" value="{crz:.2}">
-  <div class="desc">Local grip-pose roll offset. Use if the controller is twisted clockwise/counter-clockwise.</div>
-</div>
-
 <div id="status"></div>
 
 <script>
-const tuningIds = ['convergence_shift_ndc','ipd_scale','fov_scale','color_black_crush','color_gain','eye_render_scale','controller_rotation_x_deg','controller_rotation_y_deg','controller_rotation_z_deg'];
-const tuningLabels = {{'convergence_shift_ndc':'v_cs','ipd_scale':'v_is','fov_scale':'v_fs','color_black_crush':'v_bc','color_gain':'v_cg','eye_render_scale':'v_ers','controller_rotation_x_deg':'v_crx','controller_rotation_y_deg':'v_cry','controller_rotation_z_deg':'v_crz'}};
+const tuningIds = ['convergence_shift_ndc','ipd_scale','fov_scale','color_black_crush','color_gain','eye_render_scale'];
+const tuningLabels = {{'convergence_shift_ndc':'v_cs','ipd_scale':'v_is','fov_scale':'v_fs','color_black_crush':'v_bc','color_gain':'v_cg','eye_render_scale':'v_ers'}};
 let debounce = {{}};
 
 // Tuning sliders with debouncing
 tuningIds.forEach(id => {{
   const el = document.getElementById(id);
   el.addEventListener('input', () => {{
-    document.getElementById(tuningLabels[id]).textContent = parseFloat(el.value).toFixed(4);
+        document.getElementById(tuningLabels[id]).textContent = parseFloat(el.value).toFixed(id === 'fov_scale' || id === 'eye_render_scale' ? 3 : (id === 'convergence_shift_ndc' || id === 'color_black_crush' || id === 'color_gain' ? 4 : 2));
     clearTimeout(debounce[id]);
     debounce[id] = setTimeout(() => {{
       fetch('/set?' + id + '=' + el.value)
@@ -1113,9 +1018,6 @@ setInterval(refreshServerStatus, 1500);
         bc = color_black_crush(),
         cg = color_gain(),
         ers = eye_render_scale(),
-        crx = controller_rotation_deg().x,
-        cry = controller_rotation_deg().y,
-        crz = controller_rotation_deg().z,
         current_server_ip = get_server_ip(),
         server_status = get_server_status(),
         servers_html = servers_html,
