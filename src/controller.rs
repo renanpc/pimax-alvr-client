@@ -30,8 +30,8 @@
 //! Pimax poller writes at 50 Hz; the Rust tracking thread reads at 90 Hz.
 //! Contention is minimal because both hold the lock for microseconds.
 
-use std::sync::Mutex;
 use std::time::Instant;
+use std::{collections::HashSet, sync::Mutex};
 
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
@@ -74,11 +74,22 @@ pub enum Hand {
     Right = 1,
 }
 
+/// OpenXR interaction profile used for the Crystal controller surface.
+pub const OCULUS_TOUCH_PROFILE_PATH: &str = "/interaction_profiles/oculus/touch_controller";
+
+/// Active interaction profile packet payload.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ActiveInteractionProfile {
+    pub device_id: u64,
+    pub profile_id: u64,
+    pub input_ids: HashSet<u64>,
+}
+
 // ---------------------------------------------------------------------------
 // Controller state
 // ---------------------------------------------------------------------------
 
-/// Raw state of a single controller, updated from the Java polling thread.
+/// Raw state of a single controller, updated from JNI callbacks.
 #[derive(Clone, Debug)]
 pub struct SingleControllerState {
     pub connected: bool,
@@ -134,6 +145,27 @@ pub fn update_controller_state(hand: Hand, state: SingleControllerState) {
             return;
         }
     };
+
+    let previous_state = match hand {
+        Hand::Left => snapshot.left.as_ref(),
+        Hand::Right => snapshot.right.as_ref(),
+    };
+    let mut state = state;
+
+    if let (Some(previous_state), Some(incoming_motion)) = (previous_state, state.motion) {
+        state.motion = Some(apply_controller_position_deadzone(
+            previous_state.motion,
+            incoming_motion,
+        ));
+    } else if state.motion.is_none() {
+        state.motion = previous_state.and_then(|previous_state| previous_state.motion);
+    }
+    if let Some(previous_state) = previous_state {
+        state.thumbstick_x =
+            stabilize_thumbstick_axis(previous_state.thumbstick_x, state.thumbstick_x);
+        state.thumbstick_y =
+            stabilize_thumbstick_axis(previous_state.thumbstick_y, state.thumbstick_y);
+    }
 
     // Throttled diagnostic logging
     if let Ok(mut counts) = CONTROLLER_UPDATE_COUNT.lock() {
@@ -304,75 +336,212 @@ fn is_fresh(state: &SingleControllerState) -> bool {
 
 /// Build ALVR `ButtonEntry` values from the current controller snapshot.
 ///
-/// Returns an empty Vec when no controllers are connected.
+/// Disconnected hands are emitted as neutral values while at least one hand is
+/// still connected, so stale pressed state gets cleared on the server.
 pub fn build_button_entries(snapshot: &ControllerSnapshot) -> Vec<ButtonEntry> {
     let mut entries = Vec::with_capacity(32);
+    let any_connected = snapshot.left.as_ref().is_some_and(is_fresh)
+        || snapshot.right.as_ref().is_some_and(is_fresh);
 
     for (hand_state, hand_path) in [
         (&snapshot.left, LEFT_HAND_PATH),
         (&snapshot.right, RIGHT_HAND_PATH),
     ] {
         let state = match hand_state {
-            Some(s) if is_fresh(s) => s,
+            Some(s) if is_fresh(s) => Some(s),
+            _ if any_connected => None,
             _ => continue,
         };
 
-        let is_left = hand_path == LEFT_HAND_PATH;
-
-        // Digital buttons (press)
-        for mapping in BUTTON_PRESS_MAP {
-            let suffix = if is_left {
-                mapping.left_suffix
-            } else {
-                mapping.right_suffix
-            };
-            if suffix.is_empty() {
-                continue;
-            }
-            let pressed = (state.buttons_pressed >> mapping.bit) & 1 != 0;
-            entries.push(ButtonEntry {
-                path_id: button_path_id(hand_path, suffix),
-                value: ButtonValue::Binary(pressed),
-            });
-        }
-
-        // Digital buttons (touch)
-        for mapping in BUTTON_TOUCH_MAP {
-            let suffix = if is_left {
-                mapping.left_suffix
-            } else {
-                mapping.right_suffix
-            };
-            if suffix.is_empty() {
-                continue;
-            }
-            let touched = (state.buttons_touched >> mapping.bit) & 1 != 0;
-            entries.push(ButtonEntry {
-                path_id: button_path_id(hand_path, suffix),
-                value: ButtonValue::Binary(touched),
-            });
-        }
-
-        // Analog axes
-        entries.push(ButtonEntry {
-            path_id: button_path_id(hand_path, "input/trigger/value"),
-            value: ButtonValue::Scalar(state.trigger),
-        });
-        entries.push(ButtonEntry {
-            path_id: button_path_id(hand_path, "input/squeeze/value"),
-            value: ButtonValue::Scalar(state.grip),
-        });
-        entries.push(ButtonEntry {
-            path_id: button_path_id(hand_path, "input/thumbstick/x"),
-            value: ButtonValue::Scalar(state.thumbstick_x),
-        });
-        entries.push(ButtonEntry {
-            path_id: button_path_id(hand_path, "input/thumbstick/y"),
-            value: ButtonValue::Scalar(state.thumbstick_y),
-        });
+        push_hand_button_entries(&mut entries, hand_path, state);
     }
 
     entries
+}
+
+pub fn format_button_entries_for_hand(entries: &[ButtonEntry], hand_path: &str) -> String {
+    let mut parts = Vec::new();
+    let is_left = hand_path == LEFT_HAND_PATH;
+
+    for mapping in BUTTON_PRESS_MAP {
+        let suffix = if is_left {
+            mapping.left_suffix
+        } else {
+            mapping.right_suffix
+        };
+        if suffix.is_empty() {
+            continue;
+        }
+        let path_id = button_path_id(hand_path, suffix);
+        let value = entries
+            .iter()
+            .find(|entry| entry.path_id == path_id)
+            .map(|entry| match entry.value {
+                ButtonValue::Binary(value) => value.to_string(),
+                ButtonValue::Scalar(value) => format!("{value:.3}"),
+            })
+            .unwrap_or_else(|| "missing".to_string());
+        parts.push(format!("{hand_path}/{suffix}={value}"));
+    }
+
+    for suffix in [
+        "input/trigger/value",
+        "input/squeeze/value",
+        "input/thumbstick/x",
+        "input/thumbstick/y",
+    ] {
+        let path_id = button_path_id(hand_path, suffix);
+        let value = entries
+            .iter()
+            .find(|entry| entry.path_id == path_id)
+            .map(|entry| match entry.value {
+                ButtonValue::Binary(value) => value.to_string(),
+                ButtonValue::Scalar(value) => format!("{value:.3}"),
+            })
+            .unwrap_or_else(|| "missing".to_string());
+        parts.push(format!("{hand_path}/{suffix}={value}"));
+    }
+
+    parts.join(" ")
+}
+
+fn push_hand_button_entries(
+    entries: &mut Vec<ButtonEntry>,
+    hand_path: &str,
+    state: Option<&SingleControllerState>,
+) {
+    let is_left = hand_path == LEFT_HAND_PATH;
+
+    // Digital buttons (press)
+    for mapping in BUTTON_PRESS_MAP {
+        let suffix = if is_left {
+            mapping.left_suffix
+        } else {
+            mapping.right_suffix
+        };
+        if suffix.is_empty() {
+            continue;
+        }
+        let pressed = state
+            .map(|state| (state.buttons_pressed >> mapping.bit) & 1 != 0)
+            .unwrap_or(false);
+        entries.push(ButtonEntry {
+            path_id: button_path_id(hand_path, suffix),
+            value: ButtonValue::Binary(pressed),
+        });
+    }
+
+    // Digital buttons (touch)
+    for mapping in BUTTON_TOUCH_MAP {
+        let suffix = if is_left {
+            mapping.left_suffix
+        } else {
+            mapping.right_suffix
+        };
+        if suffix.is_empty() {
+            continue;
+        }
+        let touched = state
+            .map(|state| (state.buttons_touched >> mapping.bit) & 1 != 0)
+            .unwrap_or(false);
+        entries.push(ButtonEntry {
+            path_id: button_path_id(hand_path, suffix),
+            value: ButtonValue::Binary(touched),
+        });
+    }
+
+    // Analog axes
+    let trigger = state.map(|state| state.trigger).unwrap_or(0.0);
+    let grip = state.map(|state| state.grip).unwrap_or(0.0);
+    let thumbstick_x = state.map(|state| state.thumbstick_x).unwrap_or(0.0);
+    let thumbstick_y = state.map(|state| state.thumbstick_y).unwrap_or(0.0);
+
+    entries.push(ButtonEntry {
+        path_id: button_path_id(hand_path, "input/trigger/value"),
+        value: ButtonValue::Scalar(trigger),
+    });
+    entries.push(ButtonEntry {
+        path_id: button_path_id(hand_path, "input/squeeze/value"),
+        value: ButtonValue::Scalar(grip),
+    });
+    entries.push(ButtonEntry {
+        path_id: button_path_id(hand_path, "input/thumbstick/x"),
+        value: ButtonValue::Scalar(thumbstick_x),
+    });
+    entries.push(ButtonEntry {
+        path_id: button_path_id(hand_path, "input/thumbstick/y"),
+        value: ButtonValue::Scalar(thumbstick_y),
+    });
+}
+
+fn supported_input_ids_for_hand(hand_path: &str) -> HashSet<u64> {
+    let mut ids = HashSet::new();
+
+    for mapping in BUTTON_PRESS_MAP {
+        let suffix = if hand_path == LEFT_HAND_PATH {
+            mapping.left_suffix
+        } else {
+            mapping.right_suffix
+        };
+        if !suffix.is_empty() {
+            ids.insert(button_path_id(hand_path, suffix));
+        }
+    }
+
+    for mapping in BUTTON_TOUCH_MAP {
+        let suffix = if hand_path == LEFT_HAND_PATH {
+            mapping.left_suffix
+        } else {
+            mapping.right_suffix
+        };
+        if !suffix.is_empty() {
+            ids.insert(button_path_id(hand_path, suffix));
+        }
+    }
+
+    for suffix in [
+        "input/trigger/value",
+        "input/squeeze/value",
+        "input/thumbstick/x",
+        "input/thumbstick/y",
+    ] {
+        ids.insert(button_path_id(hand_path, suffix));
+    }
+
+    ids
+}
+
+/// Build ALVR active interaction profiles for connected controllers.
+///
+/// ALVR server currently keeps a single button mapping manager and rebuilds it
+/// from the last received ActiveInteractionProfile packet. Send one combined
+/// input set so both hands stay mapped at the same time.
+pub fn build_active_interaction_profiles(
+    snapshot: &ControllerSnapshot,
+) -> Vec<ActiveInteractionProfile> {
+    let profile_id = hash_string(OCULUS_TOUCH_PROFILE_PATH);
+    let mut input_ids = HashSet::new();
+    let mut first_fresh_hand_path = None;
+
+    for (hand_state, hand_path) in [
+        (&snapshot.left, LEFT_HAND_PATH),
+        (&snapshot.right, RIGHT_HAND_PATH),
+    ] {
+        let Some(_state) = hand_state.as_ref().filter(|state| is_fresh(state)) else {
+            continue;
+        };
+
+        first_fresh_hand_path.get_or_insert(hand_path);
+        input_ids.extend(supported_input_ids_for_hand(hand_path));
+    }
+
+    first_fresh_hand_path.map_or_else(Vec::new, |hand_path| {
+        vec![ActiveInteractionProfile {
+            device_id: hash_string(hand_path),
+            profile_id,
+            input_ids,
+        }]
+    })
 }
 
 /// Build `DeviceMotion` entries for connected controllers.
@@ -390,14 +559,11 @@ pub(crate) fn build_controller_device_motions(
             _ => continue,
         };
 
-        motions.push((
-            hash_string(hand_path),
-            state.motion.unwrap_or(DeviceMotion {
-                pose: Pose::default(),
-                linear_velocity: glam::Vec3::ZERO,
-                angular_velocity: glam::Vec3::ZERO,
-            }),
-        ));
+        let Some(motion) = state.motion else {
+            continue;
+        };
+
+        motions.push((hash_string(hand_path), motion));
     }
 
     motions
@@ -482,18 +648,197 @@ mod tests {
     }
 
     #[test]
+    fn build_button_entries_maps_left_x_y_and_right_a_b() {
+        let snapshot = ControllerSnapshot {
+            left: Some(SingleControllerState {
+                connected: true,
+                handle: 1,
+                motion: None,
+                buttons_pressed: 0x30,
+                buttons_touched: 0,
+                trigger: 0.0,
+                grip: 0.0,
+                thumbstick_x: 0.0,
+                thumbstick_y: 0.0,
+                battery_percent: 100,
+                last_updated: Instant::now(),
+            }),
+            right: Some(SingleControllerState {
+                connected: true,
+                handle: 2,
+                motion: None,
+                buttons_pressed: 0x30,
+                buttons_touched: 0,
+                trigger: 0.0,
+                grip: 0.0,
+                thumbstick_x: 0.0,
+                thumbstick_y: 0.0,
+                battery_percent: 100,
+                last_updated: Instant::now(),
+            }),
+        };
+
+        let entries = build_button_entries(&snapshot);
+
+        let left_x = entries
+            .iter()
+            .find(|entry| entry.path_id == button_path_id(LEFT_HAND_PATH, "input/x/click"))
+            .expect("left x entry");
+        let left_y = entries
+            .iter()
+            .find(|entry| entry.path_id == button_path_id(LEFT_HAND_PATH, "input/y/click"))
+            .expect("left y entry");
+        let right_a = entries
+            .iter()
+            .find(|entry| entry.path_id == button_path_id(RIGHT_HAND_PATH, "input/a/click"))
+            .expect("right a entry");
+        let right_b = entries
+            .iter()
+            .find(|entry| entry.path_id == button_path_id(RIGHT_HAND_PATH, "input/b/click"))
+            .expect("right b entry");
+
+        assert!(matches!(left_x.value, ButtonValue::Binary(true)));
+        assert!(matches!(left_y.value, ButtonValue::Binary(true)));
+        assert!(matches!(right_a.value, ButtonValue::Binary(true)));
+        assert!(matches!(right_b.value, ButtonValue::Binary(true)));
+    }
+
+    #[test]
+    fn build_button_entries_clears_missing_hand() {
+        let snapshot = ControllerSnapshot {
+            left: Some(SingleControllerState {
+                connected: true,
+                handle: 1,
+                motion: None,
+                buttons_pressed: 0x01,
+                buttons_touched: 0x01,
+                trigger: 0.8,
+                grip: 0.5,
+                thumbstick_x: 0.25,
+                thumbstick_y: -0.25,
+                battery_percent: 75,
+                last_updated: Instant::now(),
+            }),
+            right: None,
+        };
+
+        let entries = build_button_entries(&snapshot);
+        let right_trigger = button_path_id(RIGHT_HAND_PATH, "input/trigger/value");
+        let right_trigger_entry = entries.iter().find(|entry| entry.path_id == right_trigger);
+        assert!(right_trigger_entry.is_some());
+        match &right_trigger_entry.unwrap().value {
+            ButtonValue::Scalar(v) => assert_eq!(*v, 0.0),
+            _ => panic!("expected Scalar for missing hand trigger"),
+        }
+    }
+
+    #[test]
+    fn build_button_entries_preserves_right_thumbstick_x() {
+        let snapshot = ControllerSnapshot {
+            left: None,
+            right: Some(SingleControllerState {
+                connected: true,
+                handle: 2,
+                motion: None,
+                buttons_pressed: 0,
+                buttons_touched: 0,
+                trigger: 0.0,
+                grip: 0.0,
+                thumbstick_x: 0.5,
+                thumbstick_y: 0.0,
+                battery_percent: 100,
+                last_updated: Instant::now(),
+            }),
+        };
+
+        let entries = build_button_entries(&snapshot);
+        let right_thumbstick_x = button_path_id(RIGHT_HAND_PATH, "input/thumbstick/x");
+        let entry = entries
+            .iter()
+            .find(|entry| entry.path_id == right_thumbstick_x)
+            .expect("right thumbstick X entry");
+        match &entry.value {
+            ButtonValue::Scalar(v) => assert_eq!(*v, 0.5),
+            _ => panic!("expected Scalar for right thumbstick X"),
+        }
+    }
+
+    #[test]
+    fn update_controller_state_overwrites_buttons_and_touches() {
+        let initial = SingleControllerState {
+            connected: true,
+            handle: 9,
+            motion: Some(DeviceMotion::default()),
+            buttons_pressed: 0x03,
+            buttons_touched: 0x03,
+            trigger: 0.0,
+            grip: 0.0,
+            thumbstick_x: 0.0,
+            thumbstick_y: 0.0,
+            battery_percent: 100,
+            last_updated: Instant::now(),
+        };
+        update_controller_state(Hand::Left, initial);
+
+        update_controller_state(
+            Hand::Left,
+            SingleControllerState {
+                connected: true,
+                handle: 9,
+                motion: None,
+                buttons_pressed: 0,
+                buttons_touched: 0,
+                trigger: 0.0,
+                grip: 0.0,
+                thumbstick_x: 0.0,
+                thumbstick_y: 0.0,
+                battery_percent: 100,
+                last_updated: Instant::now(),
+            },
+        );
+
+        let snapshot = latest_controller_state();
+        let left = snapshot.left.expect("left controller state");
+        assert_eq!(left.buttons_pressed, 0x00);
+        assert_eq!(left.buttons_touched, 0x00);
+        assert!(left.motion.is_some());
+    }
+
+    #[test]
     fn build_device_motions_empty_when_no_controllers() {
         let snapshot = ControllerSnapshot::default();
         assert!(build_controller_device_motions(&snapshot).is_empty());
     }
 
     #[test]
-    fn build_device_motions_includes_connected_controller() {
+    fn build_device_motions_skips_controller_without_motion() {
         let snapshot = ControllerSnapshot {
             left: Some(SingleControllerState {
                 connected: true,
                 handle: 1,
                 motion: None,
+                buttons_pressed: 0,
+                buttons_touched: 0,
+                trigger: 0.0,
+                grip: 0.0,
+                thumbstick_x: 0.0,
+                thumbstick_y: 0.0,
+                battery_percent: 100,
+                last_updated: Instant::now(),
+            }),
+            right: None,
+        };
+        let motions = build_controller_device_motions(&snapshot);
+        assert!(motions.is_empty());
+    }
+
+    #[test]
+    fn build_device_motions_includes_connected_controller_with_motion() {
+        let snapshot = ControllerSnapshot {
+            left: Some(SingleControllerState {
+                connected: true,
+                handle: 1,
+                motion: Some(DeviceMotion::default()),
                 buttons_pressed: 0,
                 buttons_touched: 0,
                 trigger: 0.0,
@@ -518,5 +863,127 @@ mod tests {
         // Left and right should differ
         let c = button_path_id(RIGHT_HAND_PATH, "input/a/click");
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn build_active_interaction_profiles_includes_supported_inputs() {
+        let snapshot = ControllerSnapshot {
+            left: Some(SingleControllerState {
+                connected: true,
+                handle: 7,
+                motion: None,
+                buttons_pressed: 0,
+                buttons_touched: 0,
+                trigger: 0.0,
+                grip: 0.0,
+                thumbstick_x: 0.0,
+                thumbstick_y: 0.0,
+                battery_percent: 100,
+                last_updated: Instant::now(),
+            }),
+            right: None,
+        };
+
+        let profiles = build_active_interaction_profiles(&snapshot);
+        assert_eq!(profiles.len(), 1);
+        let profile = &profiles[0];
+        assert_eq!(profile.device_id, hash_string(LEFT_HAND_PATH));
+        assert_eq!(profile.profile_id, hash_string(OCULUS_TOUCH_PROFILE_PATH));
+        assert!(profile
+            .input_ids
+            .contains(&button_path_id(LEFT_HAND_PATH, "input/x/click")));
+        assert!(profile
+            .input_ids
+            .contains(&button_path_id(LEFT_HAND_PATH, "input/trigger/value")));
+        assert!(profile
+            .input_ids
+            .contains(&button_path_id(LEFT_HAND_PATH, "input/thumbstick/y")));
+    }
+
+    #[test]
+    fn build_active_interaction_profiles_combines_both_hands() {
+        let fresh_state = || SingleControllerState {
+            connected: true,
+            handle: 1,
+            motion: None,
+            buttons_pressed: 0,
+            buttons_touched: 0,
+            trigger: 0.0,
+            grip: 0.0,
+            thumbstick_x: 0.0,
+            thumbstick_y: 0.0,
+            battery_percent: 100,
+            last_updated: Instant::now(),
+        };
+        let snapshot = ControllerSnapshot {
+            left: Some(fresh_state()),
+            right: Some(SingleControllerState {
+                handle: 2,
+                ..fresh_state()
+            }),
+        };
+
+        let profiles = build_active_interaction_profiles(&snapshot);
+        assert_eq!(profiles.len(), 1);
+        let profile = &profiles[0];
+        assert!(profile
+            .input_ids
+            .contains(&button_path_id(LEFT_HAND_PATH, "input/x/click")));
+        assert!(profile
+            .input_ids
+            .contains(&button_path_id(LEFT_HAND_PATH, "input/thumbstick/x")));
+        assert!(profile
+            .input_ids
+            .contains(&button_path_id(RIGHT_HAND_PATH, "input/a/click")));
+        assert!(profile
+            .input_ids
+            .contains(&button_path_id(RIGHT_HAND_PATH, "input/thumbstick/x")));
+    }
+
+    #[test]
+    fn stabilize_thumbstick_axis_ignores_extreme_sign_wrap() {
+        assert_eq!(stabilize_thumbstick_axis(-0.75, 0.95), -0.95);
+        assert_eq!(stabilize_thumbstick_axis(0.75, -0.95), 0.95);
+        assert_eq!(stabilize_thumbstick_axis(-0.25, 0.95), 0.95);
+    }
+}
+
+fn apply_controller_position_deadzone(
+    previous_motion: Option<DeviceMotion>,
+    incoming_motion: DeviceMotion,
+) -> DeviceMotion {
+    let Some(previous_motion) = previous_motion else {
+        return incoming_motion;
+    };
+
+    let deadzone = crate::tune::controller_position_deadzone().max(0.0);
+    let previous_position = previous_motion.pose.position;
+    let incoming_position = incoming_motion.pose.position;
+    let stabilized_position = if (incoming_position - previous_position).length() < deadzone {
+        previous_position
+    } else {
+        incoming_position
+    };
+
+    DeviceMotion {
+        pose: Pose {
+            orientation: incoming_motion.pose.orientation,
+            position: stabilized_position,
+        },
+        linear_velocity: incoming_motion.linear_velocity,
+        angular_velocity: incoming_motion.angular_velocity,
+    }
+}
+
+fn stabilize_thumbstick_axis(previous: f32, incoming: f32) -> f32 {
+    const STRONG_DEFLECTION: f32 = 0.60;
+
+    if previous.abs() >= STRONG_DEFLECTION
+        && incoming.abs() >= STRONG_DEFLECTION
+        && previous.signum() != incoming.signum()
+    {
+        previous.signum() * incoming.abs()
+    } else {
+        incoming
     }
 }

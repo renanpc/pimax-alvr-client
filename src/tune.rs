@@ -127,6 +127,13 @@ static COLOR_GAIN: AtomicU32 = AtomicU32::new(0);
 pub const EYE_RENDER_SCALE_DEFAULT: f32 = 1.0;
 static EYE_RENDER_SCALE: AtomicU32 = AtomicU32::new(0);
 
+/// Controller position dead zone in meters.
+///
+/// Smaller motion than this is ignored to suppress pose jitter.
+/// Range: 0.0 to 0.05 (typical value: 0.0)
+pub const CONTROLLER_POSITION_DEADZONE_DEFAULT: f32 = 0.0;
+static CONTROLLER_POSITION_DEADZONE: AtomicU32 = AtomicU32::new(0);
+
 /// Default local controller X-axis calibration in degrees.
 ///
 /// This is the current Crystal OG midpoint calibration: the native controller
@@ -257,6 +264,10 @@ pub fn init(
         .as_ref()
         .and_then(|c| c.eye_render_scale)
         .unwrap_or(eye_render_scale);
+    let cpd = config
+        .as_ref()
+        .and_then(|c| c.controller_position_deadzone)
+        .unwrap_or(CONTROLLER_POSITION_DEADZONE_DEFAULT);
     let crx = config
         .as_ref()
         .and_then(|c| c.controller_rotation_x_deg)
@@ -277,11 +288,12 @@ pub fn init(
     store(&COLOR_BLACK_CRUSH, bc);
     store(&COLOR_GAIN, cg);
     store(&EYE_RENDER_SCALE, ers);
+    store(&CONTROLLER_POSITION_DEADZONE, cpd);
     store(&CONTROLLER_ROTATION_X_DEG, crx);
     store(&CONTROLLER_ROTATION_Y_DEG, cry);
     store(&CONTROLLER_ROTATION_Z_DEG, crz);
 
-    info!("tune: loaded settings from config: convergence_shift_ndc={:.4}, ipd_scale={:.4}, fov_scale={:.3}, color_black_crush={:.4}, color_gain={:.4}, eye_render_scale={:.3}, controller_rotation_deg=({:.1},{:.1},{:.1})", cs, is, fs, bc, cg, ers, crx, cry, crz);
+    info!("tune: loaded settings from config: convergence_shift_ndc={:.4}, ipd_scale={:.4}, fov_scale={:.3}, color_black_crush={:.4}, color_gain={:.4}, eye_render_scale={:.3}, controller_position_deadzone={:.4}, controller_rotation_deg=({:.1},{:.1},{:.1})", cs, is, fs, bc, cg, ers, cpd, crx, cry, crz);
 
     // Load server IP from config
     let initial_server_ip = config
@@ -355,6 +367,12 @@ pub fn color_gain() -> f32 {
 #[inline]
 pub fn eye_render_scale() -> f32 {
     load(&EYE_RENDER_SCALE)
+}
+
+/// Get the current controller position dead zone.
+#[inline]
+pub fn controller_position_deadzone() -> f32 {
+    load(&CONTROLLER_POSITION_DEADZONE)
 }
 
 /// Get the current local controller rotation offsets in degrees.
@@ -624,13 +642,14 @@ fn run_http_server() {
             // Return current tuning values as JSON
             let controller_rotation = controller_rotation_deg();
             let body = format!(
-                r#"{{"convergence_shift_ndc":{:.4},"ipd_scale":{:.4},"fov_scale":{:.3},"color_black_crush":{:.4},"color_gain":{:.4},"eye_render_scale":{:.3},"controller_rotation_x_deg":{:.2},"controller_rotation_y_deg":{:.2},"controller_rotation_z_deg":{:.2},"server_ip":"{}","server_status":"{}"}}"#,
+                r#"{{"convergence_shift_ndc":{:.4},"ipd_scale":{:.4},"fov_scale":{:.3},"color_black_crush":{:.4},"color_gain":{:.4},"eye_render_scale":{:.3},"controller_position_deadzone":{:.4},"controller_rotation_x_deg":{:.2},"controller_rotation_y_deg":{:.2},"controller_rotation_z_deg":{:.2},"server_ip":"{}","server_status":"{}"}}"#,
                 convergence_shift_ndc(),
                 ipd_scale(),
                 fov_scale(),
                 color_black_crush(),
                 color_gain(),
                 eye_render_scale(),
+                controller_position_deadzone(),
                 controller_rotation.x,
                 controller_rotation.y,
                 controller_rotation.z,
@@ -673,12 +692,13 @@ fn run_http_server() {
 /// # Query String Format
 ///
 /// Multiple parameters can be set in one request:
-/// `convergence_shift_ndc=0.124&ipd_scale=1.0&fov_scale=1.0&color_gain=1.22&eye_render_scale=1.0`
+/// `convergence_shift_ndc=0.124&ipd_scale=1.0&fov_scale=1.0&color_gain=1.22&eye_render_scale=1.0&controller_position_deadzone=0.004`
 ///
 /// # Parameter Types
 ///
 /// - Float values: convergence_shift_ndc, ipd_scale, fov_scale, color_black_crush,
-///   color_gain, eye_render_scale, controller_rotation_*_deg
+///   color_gain, eye_render_scale, controller_position_deadzone,
+///   controller_rotation_*_deg
 /// - String values: server_ip
 /// - Commands: discover_servers (triggers action, no value)
 ///
@@ -738,6 +758,12 @@ fn handle_set(query: &str) {
                         crate::client::notify_eye_render_scale_changed();
                         save_tuning_settings();
                     }
+                    "controller_position_deadzone" => {
+                        let clamped = val.clamp(0.0, 0.05);
+                        store(&CONTROLLER_POSITION_DEADZONE, clamped);
+                        info!("tune: controller_position_deadzone = {clamped:.4}");
+                        save_tuning_settings();
+                    }
                     "controller_rotation_x_deg" => {
                         let clamped = val.clamp(-180.0, 180.0);
                         store(&CONTROLLER_ROTATION_X_DEG, clamped);
@@ -795,6 +821,7 @@ fn save_tuning_settings() {
         config.color_black_crush = Some(color_black_crush());
         config.color_gain = Some(color_gain());
         config.eye_render_scale = Some(eye_render_scale());
+        config.controller_position_deadzone = Some(controller_position_deadzone());
         let controller_rotation = controller_rotation_deg();
         config.controller_rotation_x_deg = Some(controller_rotation.x);
         config.controller_rotation_y_deg = Some(controller_rotation.y);
@@ -1029,18 +1056,24 @@ fn build_html() -> String {
   <div class="desc">Local grip-pose roll offset. Use if the controller is twisted clockwise/counter-clockwise.</div>
 </div>
 
+<div class="param">
+  <label>Controller position dead zone <span id="v_cpd">{cpd:.4}</span></label>
+  <input type="range" id="controller_position_deadzone" min="0" max="0.05" step="0.0005" value="{cpd:.4}">
+  <div class="desc">Ignores tiny controller movement to suppress jitter. Default 0.010 m.</div>
+</div>
+
 <div id="status"></div>
 
 <script>
-const tuningIds = ['convergence_shift_ndc','ipd_scale','fov_scale','color_black_crush','color_gain','eye_render_scale','controller_rotation_x_deg','controller_rotation_y_deg','controller_rotation_z_deg'];
-const tuningLabels = {{'convergence_shift_ndc':'v_cs','ipd_scale':'v_is','fov_scale':'v_fs','color_black_crush':'v_bc','color_gain':'v_cg','eye_render_scale':'v_ers','controller_rotation_x_deg':'v_crx','controller_rotation_y_deg':'v_cry','controller_rotation_z_deg':'v_crz'}};
+const tuningIds = ['convergence_shift_ndc','ipd_scale','fov_scale','color_black_crush','color_gain','eye_render_scale','controller_position_deadzone','controller_rotation_x_deg','controller_rotation_y_deg','controller_rotation_z_deg'];
+const tuningLabels = {{'convergence_shift_ndc':'v_cs','ipd_scale':'v_is','fov_scale':'v_fs','color_black_crush':'v_bc','color_gain':'v_cg','eye_render_scale':'v_ers','controller_position_deadzone':'v_cpd','controller_rotation_x_deg':'v_crx','controller_rotation_y_deg':'v_cry','controller_rotation_z_deg':'v_crz'}};
 let debounce = {{}};
 
 // Tuning sliders with debouncing
 tuningIds.forEach(id => {{
   const el = document.getElementById(id);
   el.addEventListener('input', () => {{
-    document.getElementById(tuningLabels[id]).textContent = parseFloat(el.value).toFixed(4);
+        document.getElementById(tuningLabels[id]).textContent = parseFloat(el.value).toFixed(id === 'fov_scale' || id === 'eye_render_scale' ? 3 : (id === 'convergence_shift_ndc' || id === 'color_black_crush' || id === 'color_gain' || id === 'controller_position_deadzone' ? 4 : 2));
     clearTimeout(debounce[id]);
     debounce[id] = setTimeout(() => {{
       fetch('/set?' + id + '=' + el.value)
@@ -1113,6 +1146,7 @@ setInterval(refreshServerStatus, 1500);
         bc = color_black_crush(),
         cg = color_gain(),
         ers = eye_render_scale(),
+        cpd = controller_position_deadzone(),
         crx = controller_rotation_deg().x,
         cry = controller_rotation_deg().y,
         crz = controller_rotation_deg().z,

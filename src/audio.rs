@@ -4,8 +4,7 @@ use std::{
     slice,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc,
-        Arc,
+        mpsc, Arc,
     },
     thread,
     time::Duration,
@@ -187,29 +186,27 @@ pub fn start_game_audio_output(
             return;
         }
 
-        let stream: AudioStream = match AudioStreamBuilder::new()
-            .and_then(|builder| {
-                builder
-                    .direction(AudioDirection::Output)
-                    .channel_count(2)
-                    .sample_rate(sample_rate as _)
-                    .format(AudioFormat::PCM_Float)
-                    .frames_per_data_callback(batch_frames_count as _)
-                    .performance_mode(AudioPerformanceMode::LowLatency)
-                    .sharing_mode(AudioSharingMode::Shared)
-                    .data_callback(Box::new(move |_, data_ptr, frames_count| {
-                        let frames_count = frames_count as usize;
-                        let out_frames = unsafe {
-                            slice::from_raw_parts_mut(data_ptr as *mut f32, frames_count * 2)
-                        };
-                        let samples = get_next_frame_batch(&thread_sample_queue, 2, batch_frames_count);
-                        out_frames.copy_from_slice(&samples);
-                        AudioCallbackResult::Continue
-                    }))
-                    .error_callback(Box::new(move |_, e| *thread_error.lock() = Some(e)))
-                    .open_stream()
-            })
-        {
+        let stream: AudioStream = match AudioStreamBuilder::new().and_then(|builder| {
+            builder
+                .direction(AudioDirection::Output)
+                .channel_count(2)
+                .sample_rate(sample_rate as _)
+                .format(AudioFormat::PCM_Float)
+                .frames_per_data_callback(batch_frames_count as _)
+                .performance_mode(AudioPerformanceMode::LowLatency)
+                .sharing_mode(AudioSharingMode::Shared)
+                .data_callback(Box::new(move |_, data_ptr, frames_count| {
+                    let frames_count = frames_count as usize;
+                    let out_frames = unsafe {
+                        slice::from_raw_parts_mut(data_ptr as *mut f32, frames_count * 2)
+                    };
+                    let samples = get_next_frame_batch(&thread_sample_queue, 2, batch_frames_count);
+                    out_frames.copy_from_slice(&samples);
+                    AudioCallbackResult::Continue
+                }))
+                .error_callback(Box::new(move |_, e| *thread_error.lock() = Some(e)))
+                .open_stream()
+        }) {
             Ok(stream) => stream,
             Err(err) => {
                 warn!("failed to create game audio output stream: {err:#}");
@@ -284,10 +281,9 @@ pub fn start_microphone_capture(
                     .sharing_mode(AudioSharingMode::Shared)
                     .data_callback(Box::new(move |_, data_ptr, frames_count| {
                         let buffer_size = frames_count as usize * std::mem::size_of::<i16>();
-                        let sample_buffer = unsafe {
-                            slice::from_raw_parts(data_ptr as *const u8, buffer_size)
-                        }
-                        .to_vec();
+                        let sample_buffer =
+                            unsafe { slice::from_raw_parts(data_ptr as *const u8, buffer_size) }
+                                .to_vec();
                         samples_sender.send(sample_buffer).ok();
                         AudioCallbackResult::Continue
                     }))
@@ -401,7 +397,10 @@ pub fn send_stream_payload(
 
         let bytes_sent = socket.send(&buffer).context("send ALVR audio payload")?;
         if bytes_sent != buffer.len() {
-            bail!("short ALVR audio send: sent {bytes_sent} of {} bytes", buffer.len());
+            bail!(
+                "short ALVR audio send: sent {bytes_sent} of {} bytes",
+                buffer.len()
+            );
         }
     }
 

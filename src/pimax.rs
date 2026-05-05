@@ -1886,10 +1886,10 @@ fn push_pimax_controller_states(
     if has_flag(buttons, PIMAX_BUTTON_BACK) {
         left_buttons |= ALVR_BUTTON_MENU;
     }
-    if has_flag(buttons, PIMAX_BUTTON_THREE) {
+    if has_flag(buttons, PIMAX_BUTTON_ONE) {
         left_buttons |= ALVR_BUTTON_AX;
     }
-    if has_flag(buttons, PIMAX_BUTTON_FOUR) {
+    if has_flag(buttons, PIMAX_BUTTON_TWO) {
         left_buttons |= ALVR_BUTTON_BY;
     }
 
@@ -1917,10 +1917,10 @@ fn push_pimax_controller_states(
     if has_flag(touches, PIMAX_TOUCH_PRIMARY_THUMBSTICK) {
         left_touches |= ALVR_BUTTON_THUMBSTICK_CLICK;
     }
-    if has_flag(touches, PIMAX_TOUCH_THREE) {
+    if has_flag(touches, PIMAX_TOUCH_ONE) {
         left_touches |= ALVR_BUTTON_AX;
     }
-    if has_flag(touches, PIMAX_TOUCH_FOUR) {
+    if has_flag(touches, PIMAX_TOUCH_TWO) {
         left_touches |= ALVR_BUTTON_BY;
     }
     if has_flag(touches, PIMAX_TOUCH_SECONDARY_THUMBSTICK) {
@@ -2235,8 +2235,6 @@ struct PimaxNativeControllerHandle {
 struct PimaxNativeControllerParsed {
     orientation: glam::Quat,
     position: glam::Vec3,
-    linear_velocity: glam::Vec3,
-    angular_velocity: glam::Vec3,
     timestamp_ns: u64,
     buttons: u32,
     touches: u32,
@@ -2244,6 +2242,7 @@ struct PimaxNativeControllerParsed {
     thumbstick_y: f32,
     trigger: f32,
     grip: f32,
+    pose_valid: bool,
 }
 
 impl Default for PimaxNativeControllerParsed {
@@ -2251,8 +2250,6 @@ impl Default for PimaxNativeControllerParsed {
         Self {
             orientation: glam::Quat::IDENTITY,
             position: glam::Vec3::ZERO,
-            linear_velocity: glam::Vec3::ZERO,
-            angular_velocity: glam::Vec3::ZERO,
             timestamp_ns: 0,
             buttons: 0,
             touches: 0,
@@ -2260,6 +2257,7 @@ impl Default for PimaxNativeControllerParsed {
             thumbstick_y: 0.0,
             trigger: 0.0,
             grip: 0.0,
+            pose_valid: false,
         }
     }
 }
@@ -2382,14 +2380,24 @@ fn sanitize_pimax_quat(raw: glam::Quat) -> glam::Quat {
     raw.normalize()
 }
 
-fn normalize_pimax_native_axis(value: f32) -> f32 {
-    if !value.is_finite() {
+fn normalize_pimax_native_thumbstick_axis(value: f32) -> f32 {
+    const CENTER: f32 = 128.0;
+    const RANGE: f32 = 127.0;
+    const DEADZONE: f32 = 0.08;
+
+    if !value.is_finite() || value == 0.0 {
         return 0.0;
     }
-    if value.abs() > 2.0 {
-        ((value - 128.0) / 127.0).clamp(-1.0, 1.0)
+
+    if !(1.0..=255.0).contains(&value) {
+        return 0.0;
+    }
+
+    let normalized = ((value - CENTER) / RANGE).clamp(-1.0, 1.0);
+    if normalized.abs() < DEADZONE {
+        0.0
     } else {
-        value.clamp(-1.0, 1.0)
+        normalized
     }
 }
 
@@ -2404,6 +2412,53 @@ fn normalize_pimax_native_trigger(value: f32) -> f32 {
     }
 }
 
+fn apply_pimax_native_axis_direction_fallback(
+    axis: f32,
+    negative_direction: bool,
+    positive_direction: bool,
+) -> f32 {
+    if axis.abs() >= 0.05 {
+        return axis;
+    }
+
+    match (negative_direction, positive_direction) {
+        (true, false) => -1.0,
+        (false, true) => 1.0,
+        _ => axis,
+    }
+}
+
+fn apply_pimax_native_thumbstick_fallback(
+    hand: crate::controller::Hand,
+    parsed: &mut PimaxNativeControllerParsed,
+) {
+    let (thumbstick_left, thumbstick_right, thumbstick_down, thumbstick_up) = match hand {
+        crate::controller::Hand::Left => (
+            PIMAX_BUTTON_PRIMARY_THUMBSTICK_LEFT,
+            PIMAX_BUTTON_PRIMARY_THUMBSTICK_RIGHT,
+            PIMAX_BUTTON_PRIMARY_THUMBSTICK_DOWN,
+            PIMAX_BUTTON_PRIMARY_THUMBSTICK_UP,
+        ),
+        crate::controller::Hand::Right => (
+            PIMAX_BUTTON_SECONDARY_THUMBSTICK_LEFT,
+            PIMAX_BUTTON_SECONDARY_THUMBSTICK_RIGHT,
+            PIMAX_BUTTON_SECONDARY_THUMBSTICK_DOWN,
+            PIMAX_BUTTON_SECONDARY_THUMBSTICK_UP,
+        ),
+    };
+
+    parsed.thumbstick_x = apply_pimax_native_axis_direction_fallback(
+        parsed.thumbstick_x,
+        has_flag(parsed.buttons, thumbstick_left),
+        has_flag(parsed.buttons, thumbstick_right),
+    );
+    parsed.thumbstick_y = apply_pimax_native_axis_direction_fallback(
+        parsed.thumbstick_y,
+        has_flag(parsed.buttons, thumbstick_down),
+        has_flag(parsed.buttons, thumbstick_up),
+    );
+}
+
 fn parse_pimax_native_controller_state(
     state: &PimaxNativeControllerState,
 ) -> PimaxNativeControllerParsed {
@@ -2415,21 +2470,21 @@ fn parse_pimax_native_controller_state(
         read_f32_at(bytes, 0x0c),
     ));
     let position = read_vec3_at(bytes, 0x10);
-    let angular_velocity = read_vec3_at(bytes, 0x1c);
-    let linear_velocity = read_vec3_at(bytes, 0x28);
     let timestamp_ns = read_u64_at(bytes, 0x38);
     let buttons = read_u32_at(bytes, 0x40);
-    let thumbstick_x = normalize_pimax_native_axis(read_f32_at(bytes, 0x44));
-    let thumbstick_y = normalize_pimax_native_axis(read_f32_at(bytes, 0x48));
+    // sxrControllerGetState exposes thumbsticks as float-encoded 8-bit axes:
+    // 128 is centered, 1/255 are the extremes. The following 0x4c/0x50 words
+    // are volatile on Crystal OG and can decode as impossible f32 values.
+    let thumbstick_x = normalize_pimax_native_thumbstick_axis(read_f32_at(bytes, 0x44));
+    let thumbstick_y = normalize_pimax_native_thumbstick_axis(read_f32_at(bytes, 0x48));
     let trigger = normalize_pimax_native_trigger(read_f32_at(bytes, 0x64));
     let grip = normalize_pimax_native_trigger(read_f32_at(bytes, 0x6c));
     let touches = read_u32_at(bytes, 0x84);
+    let pose_valid = (bytes.get(0x8c).copied().unwrap_or_default() & 0x1) != 0;
 
     PimaxNativeControllerParsed {
         orientation,
         position,
-        linear_velocity,
-        angular_velocity,
         timestamp_ns,
         buttons,
         touches,
@@ -2437,6 +2492,7 @@ fn parse_pimax_native_controller_state(
         thumbstick_y,
         trigger,
         grip,
+        pose_valid,
     }
 }
 
@@ -2475,6 +2531,90 @@ mod tests {
         );
         assert!((grip_up - expected_up).length() < 1.0e-5);
     }
+
+    #[test]
+    fn map_pimax_native_buttons_maps_left_x_y_and_right_a_b() {
+        let mut parsed = PimaxNativeControllerParsed::default();
+
+        parsed.buttons = PIMAX_BUTTON_ONE | PIMAX_BUTTON_TWO;
+        let (left_pressed, left_touched) =
+            map_pimax_native_buttons(crate::controller::Hand::Left, &parsed);
+        assert_eq!(left_pressed & ALVR_BUTTON_AX, ALVR_BUTTON_AX);
+        assert_eq!(left_pressed & ALVR_BUTTON_BY, ALVR_BUTTON_BY);
+        assert_eq!(left_touched, 0);
+
+        parsed.buttons = PIMAX_BUTTON_ONE | PIMAX_BUTTON_TWO;
+        let (right_pressed, right_touched) =
+            map_pimax_native_buttons(crate::controller::Hand::Right, &parsed);
+        assert_eq!(right_pressed & ALVR_BUTTON_AX, ALVR_BUTTON_AX);
+        assert_eq!(right_pressed & ALVR_BUTTON_BY, ALVR_BUTTON_BY);
+        assert_eq!(right_touched, 0);
+    }
+
+    #[test]
+    fn map_pimax_native_buttons_uses_live_menu_and_touch_bits() {
+        let mut parsed = PimaxNativeControllerParsed::default();
+        parsed.buttons = PIMAX_BUTTON_START | PIMAX_BUTTON_ONE | PIMAX_BUTTON_TWO;
+        parsed.touches = PIMAX_TOUCH_ONE | PIMAX_TOUCH_TWO;
+        let (left_pressed, left_touched) =
+            map_pimax_native_buttons(crate::controller::Hand::Left, &parsed);
+        assert_eq!(left_pressed & ALVR_BUTTON_MENU, ALVR_BUTTON_MENU);
+        assert_eq!(left_pressed & ALVR_BUTTON_AX, ALVR_BUTTON_AX);
+        assert_eq!(left_pressed & ALVR_BUTTON_BY, ALVR_BUTTON_BY);
+        assert_eq!(left_touched & ALVR_BUTTON_AX, ALVR_BUTTON_AX);
+        assert_eq!(left_touched & ALVR_BUTTON_BY, ALVR_BUTTON_BY);
+
+        parsed.buttons = PIMAX_BUTTON_BACK | PIMAX_BUTTON_ONE | PIMAX_BUTTON_TWO;
+        parsed.touches = PIMAX_TOUCH_ONE | PIMAX_TOUCH_TWO;
+        let (right_pressed, right_touched) =
+            map_pimax_native_buttons(crate::controller::Hand::Right, &parsed);
+        assert_eq!(right_pressed & ALVR_BUTTON_MENU, ALVR_BUTTON_MENU);
+        assert_eq!(right_pressed & ALVR_BUTTON_AX, ALVR_BUTTON_AX);
+        assert_eq!(right_pressed & ALVR_BUTTON_BY, ALVR_BUTTON_BY);
+        assert_eq!(right_touched & ALVR_BUTTON_AX, ALVR_BUTTON_AX);
+        assert_eq!(right_touched & ALVR_BUTTON_BY, ALVR_BUTTON_BY);
+    }
+
+    #[test]
+    fn parse_pimax_native_controller_state_uses_stable_thumbstick_offsets() {
+        let mut state = PimaxNativeControllerState::default();
+        state.bytes[0x44..0x48].copy_from_slice(&(128.0 + 0.75 * 127.0f32).to_le_bytes());
+        state.bytes[0x48..0x4c].copy_from_slice(&(128.0 - 0.5 * 127.0f32).to_le_bytes());
+        state.bytes[0x4c..0x50].copy_from_slice(&f32::MAX.to_le_bytes());
+        state.bytes[0x50..0x54].copy_from_slice(&2.0f32.to_le_bytes());
+
+        let parsed = parse_pimax_native_controller_state(&state);
+
+        assert!((parsed.thumbstick_x - 0.75).abs() < 1.0e-6);
+        assert!((parsed.thumbstick_y + 0.5).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn parse_pimax_native_controller_state_centers_idle_thumbsticks() {
+        let mut state = PimaxNativeControllerState::default();
+        state.bytes[0x44..0x48].copy_from_slice(&128.0f32.to_le_bytes());
+        state.bytes[0x48..0x4c].copy_from_slice(&128.0f32.to_le_bytes());
+        state.bytes[0x4c..0x50].copy_from_slice(&f32::MAX.to_le_bytes());
+        state.bytes[0x50..0x54].copy_from_slice(&2.0f32.to_le_bytes());
+
+        let parsed = parse_pimax_native_controller_state(&state);
+
+        assert_eq!(parsed.thumbstick_x, 0.0);
+        assert_eq!(parsed.thumbstick_y, 0.0);
+    }
+
+    #[test]
+    fn pimax_native_thumbstick_fallback_uses_direction_bits_when_axis_is_centered() {
+        let mut parsed = PimaxNativeControllerParsed {
+            buttons: PIMAX_BUTTON_PRIMARY_THUMBSTICK_LEFT | PIMAX_BUTTON_PRIMARY_THUMBSTICK_UP,
+            ..Default::default()
+        };
+
+        apply_pimax_native_thumbstick_fallback(crate::controller::Hand::Left, &mut parsed);
+
+        assert_eq!(parsed.thumbstick_x, -1.0);
+        assert_eq!(parsed.thumbstick_y, 1.0);
+    }
 }
 
 fn read_pimax_controller_battery(hand: crate::controller::Hand) -> Option<u8> {
@@ -2496,35 +2636,26 @@ fn map_pimax_native_buttons(
     let buttons = parsed.buttons;
     let touches = parsed.touches;
 
-    if has_flag(buttons, PIMAX_BUTTON_PRIMARY_INDEX_TRIGGER)
-        || has_flag(buttons, PIMAX_BUTTON_SECONDARY_INDEX_TRIGGER)
-        || parsed.trigger > 0.2
-    {
+    if parsed.trigger > 0.2 {
         pressed |= ALVR_BUTTON_TRIGGER;
     }
-    if has_flag(buttons, PIMAX_BUTTON_PRIMARY_HAND_TRIGGER)
-        || has_flag(buttons, PIMAX_BUTTON_SECONDARY_HAND_TRIGGER)
-        || parsed.grip > 0.2
-    {
+    if parsed.grip > 0.2 {
         pressed |= ALVR_BUTTON_GRIP;
     }
+
     if has_flag(buttons, PIMAX_BUTTON_PRIMARY_THUMBSTICK)
         || has_flag(buttons, PIMAX_BUTTON_SECONDARY_THUMBSTICK)
     {
         pressed |= ALVR_BUTTON_THUMBSTICK_CLICK;
     }
+
     if has_flag(buttons, PIMAX_BUTTON_BACK) || has_flag(buttons, PIMAX_BUTTON_START) {
         pressed |= ALVR_BUTTON_MENU;
     }
-
-    // Crystal OG native sxrControllerGetState reports the face buttons as the
-    // low two bits for both hands: left X/right A = bit 0, left Y/right B = bit 1.
-    // Keep the older THREE/FOUR constants as a harmless fallback for the Binder
-    // query layout seen in Pimax/Qualcomm docs.
-    if has_flag(buttons, PIMAX_BUTTON_ONE) || has_flag(buttons, PIMAX_BUTTON_THREE) {
+    if has_flag(buttons, PIMAX_BUTTON_ONE) {
         pressed |= ALVR_BUTTON_AX;
     }
-    if has_flag(buttons, PIMAX_BUTTON_TWO) || has_flag(buttons, PIMAX_BUTTON_FOUR) {
+    if has_flag(buttons, PIMAX_BUTTON_TWO) {
         pressed |= ALVR_BUTTON_BY;
     }
 
@@ -2539,14 +2670,46 @@ fn map_pimax_native_buttons(
     {
         touched |= ALVR_BUTTON_THUMBSTICK_CLICK;
     }
-    if has_flag(touches, PIMAX_TOUCH_ONE) || has_flag(touches, PIMAX_TOUCH_THREE) {
+
+    if has_flag(touches, PIMAX_TOUCH_ONE) {
         touched |= ALVR_BUTTON_AX;
     }
-    if has_flag(touches, PIMAX_TOUCH_TWO) || has_flag(touches, PIMAX_TOUCH_FOUR) {
+    if has_flag(touches, PIMAX_TOUCH_TWO) {
         touched |= ALVR_BUTTON_BY;
     }
 
     (pressed, touched)
+}
+
+fn format_pimax_native_flag_list(flags: &[(&'static str, u32)], value: u32) -> String {
+    let mut names = Vec::new();
+    for (name, bit) in flags {
+        if has_flag(value, *bit) {
+            names.push(*name);
+        }
+    }
+    if names.is_empty() {
+        "none".to_string()
+    } else {
+        names.join("|")
+    }
+}
+
+fn format_pimax_native_word_window(bytes: &[u8], offsets: &[usize]) -> String {
+    offsets
+        .iter()
+        .map(|offset| format!("0x{offset:02x}=0x{:08x}", read_u32_at(bytes, *offset)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn format_pimax_native_byte_window(bytes: &[u8], start: usize, end: usize) -> String {
+    if start >= end || start >= bytes.len() {
+        return String::new();
+    }
+
+    let end = end.min(bytes.len());
+    format_hex_bytes(&bytes[start..end])
 }
 
 fn pimax_native_controller_grip_pose_offset_from_degrees(rotation_deg: glam::Vec3) -> glam::Quat {
@@ -2579,24 +2742,32 @@ fn convert_pimax_native_controller_motion(
             // the expected up/down direction; do not mirror Y here.
             position: parsed.position,
         },
-        linear_velocity: parsed.linear_velocity,
-        angular_velocity: parsed.angular_velocity,
+        // Crystal OG's native controller velocity fields are noisy enough to
+        // make ALVR/SteamVR extrapolate hand poses past the measured position.
+        // The stock streaming app only forwards pose/input, so keep controller
+        // velocity at zero unless we find a stable runtime source.
+        linear_velocity: glam::Vec3::ZERO,
+        angular_velocity: glam::Vec3::ZERO,
     }
 }
 
 fn push_pimax_native_controller_state(
-    controller: &PimaxNativeControllerHandle,
-    parsed: PimaxNativeControllerParsed,
+    controller: &mut PimaxNativeControllerHandle,
+    mut parsed: PimaxNativeControllerParsed,
 ) {
+    apply_pimax_native_thumbstick_fallback(controller.hand, &mut parsed);
+
     let (buttons_pressed, buttons_touched) = map_pimax_native_buttons(controller.hand, &parsed);
-    let motion = convert_pimax_native_controller_motion(&parsed);
+    let motion = parsed
+        .pose_valid
+        .then(|| convert_pimax_native_controller_motion(&parsed));
 
     crate::controller::update_controller_state(
         controller.hand,
         crate::controller::SingleControllerState {
             connected: true,
             handle: controller.handle,
-            motion: Some(motion),
+            motion,
             buttons_pressed,
             buttons_touched,
             trigger: parsed.trigger,
@@ -2654,14 +2825,13 @@ fn start_pimax_native_controller_runtime() -> Result<Option<PimaxNativeControlle
     }
 
     info!(
-        "native Pimax controller runtime active: handles={}",
+        "native Pimax controller runtime active: handles={} pose_source=get_state",
         controllers
             .iter()
             .map(|controller| format!("{:?}:{}", controller.hand, controller.handle))
             .collect::<Vec<_>>()
             .join(", ")
     );
-
     Ok(Some(PimaxNativeControllerRuntime {
         api,
         controllers,
@@ -2685,7 +2855,6 @@ fn poll_pimax_native_controller_runtime(runtime: &mut PimaxNativeControllerRunti
     let can_log_change =
         runtime.last_change_log.elapsed() >= PIMAX_NATIVE_CONTROLLER_CHANGE_LOG_INTERVAL;
     let mut logged_change = false;
-
     for controller in &mut runtime.controllers {
         if controller.last_battery_poll.elapsed() >= PIMAX_NATIVE_CONTROLLER_BATTERY_INTERVAL {
             if let Some(battery) = read_pimax_controller_battery(controller.hand) {
@@ -2703,21 +2872,96 @@ fn poll_pimax_native_controller_runtime(runtime: &mut PimaxNativeControllerRunti
             || (parsed.grip - controller.last_parsed.grip).abs() > 0.01
             || (parsed.thumbstick_x - controller.last_parsed.thumbstick_x).abs() > 0.01
             || (parsed.thumbstick_y - controller.last_parsed.thumbstick_y).abs() > 0.01;
+        let decoded_buttons = format_pimax_native_flag_list(
+            &[
+                ("one", PIMAX_BUTTON_ONE),
+                ("two", PIMAX_BUTTON_TWO),
+                ("three", PIMAX_BUTTON_THREE),
+                ("four", PIMAX_BUTTON_FOUR),
+                ("back", PIMAX_BUTTON_BACK),
+                ("start", PIMAX_BUTTON_START),
+                ("thumbstick", PIMAX_BUTTON_PRIMARY_THUMBSTICK),
+                ("thumbstick2", PIMAX_BUTTON_SECONDARY_THUMBSTICK),
+                ("thumbstick_up", PIMAX_BUTTON_PRIMARY_THUMBSTICK_UP),
+                ("thumbstick_down", PIMAX_BUTTON_PRIMARY_THUMBSTICK_DOWN),
+                ("thumbstick_left", PIMAX_BUTTON_PRIMARY_THUMBSTICK_LEFT),
+                ("thumbstick_right", PIMAX_BUTTON_PRIMARY_THUMBSTICK_RIGHT),
+                ("thumbstick2_up", PIMAX_BUTTON_SECONDARY_THUMBSTICK_UP),
+                ("thumbstick2_down", PIMAX_BUTTON_SECONDARY_THUMBSTICK_DOWN),
+                ("thumbstick2_left", PIMAX_BUTTON_SECONDARY_THUMBSTICK_LEFT),
+                ("thumbstick2_right", PIMAX_BUTTON_SECONDARY_THUMBSTICK_RIGHT),
+                ("trigger", PIMAX_BUTTON_PRIMARY_INDEX_TRIGGER),
+                ("trigger2", PIMAX_BUTTON_SECONDARY_INDEX_TRIGGER),
+                ("grip", PIMAX_BUTTON_PRIMARY_HAND_TRIGGER),
+                ("grip2", PIMAX_BUTTON_SECONDARY_HAND_TRIGGER),
+            ],
+            parsed.buttons,
+        );
+        let decoded_touches = format_pimax_native_flag_list(
+            &[
+                ("thumbstick", PIMAX_TOUCH_PRIMARY_THUMBSTICK),
+                ("thumbstick2", PIMAX_TOUCH_SECONDARY_THUMBSTICK),
+                ("one", PIMAX_TOUCH_ONE),
+                ("two", PIMAX_TOUCH_TWO),
+                ("three", PIMAX_TOUCH_THREE),
+                ("four", PIMAX_TOUCH_FOUR),
+                ("trigger", PIMAX_NATIVE_TOUCH_TRIGGER),
+                ("grip", PIMAX_NATIVE_TOUCH_GRIP),
+            ],
+            parsed.touches,
+        );
+        let left_word_window = if controller.hand == crate::controller::Hand::Left {
+            format_pimax_native_word_window(
+                &state.bytes,
+                &[
+                    0x40, 0x44, 0x48, 0x4c, 0x50, 0x54, 0x58, 0x5c, 0x60, 0x64, 0x68, 0x6c, 0x70,
+                    0x74, 0x78, 0x7c, 0x80, 0x84, 0x88, 0x8c, 0x90, 0x94, 0x98, 0x9c, 0xa0, 0xa4,
+                    0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0xc0, 0xc4, 0xc8, 0xcc,
+                ],
+            )
+        } else {
+            String::new()
+        };
+        let left_byte_window = if controller.hand == crate::controller::Hand::Left {
+            format_pimax_native_byte_window(&state.bytes, 0x40, 0x90)
+        } else {
+            String::new()
+        };
+        let left_field_window = if controller.hand == crate::controller::Hand::Left {
+            format!(
+                "buttons@0x40=0x{:08x} stick_raw@0x44/0x48=({:.3},{:.3}) volatile@0x4c/0x50=({:.3},{:.3}) trigger@0x64={:.3} grip@0x6c={:.3} touches@0x84=0x{:08x} pose_valid@0x8c={}",
+                read_u32_at(&state.bytes, 0x40),
+                read_f32_at(&state.bytes, 0x44),
+                read_f32_at(&state.bytes, 0x48),
+                read_f32_at(&state.bytes, 0x4c),
+                read_f32_at(&state.bytes, 0x50),
+                read_f32_at(&state.bytes, 0x64),
+                read_f32_at(&state.bytes, 0x6c),
+                read_u32_at(&state.bytes, 0x84),
+                (state.bytes.get(0x8c).copied().unwrap_or_default() & 0x1) != 0,
+            )
+        } else {
+            String::new()
+        };
 
+        let should_log_state_change = state_changed && (can_log_change || runtime.poll_count <= 5);
         let should_log_control_change =
             controls_changed && (can_log_change || runtime.poll_count <= 5);
         let should_log_initial_state = state_changed && runtime.poll_count <= 5;
 
-        if should_log_control_change || should_log_initial_state {
+        if should_log_state_change || should_log_control_change || should_log_initial_state {
             let changes = format_pimax_native_state_changes(&controller.last_state, &state);
             info!(
-                "native Pimax controller control state: count={} hand={:?} descriptor={} handle={} buttons=0x{:08x} touches=0x{:08x} trigger={:.3} grip={:.3} stick=({:.3},{:.3}) pos=({:.3},{:.3},{:.3}) rot=({:.3},{:.3},{:.3},{:.3}) timestamp_ns={} battery={} changes=[{}]",
+                "native Pimax controller control state: count={} hand={:?} descriptor={} handle={} valid={} buttons=0x{:08x} touches=0x{:08x} decoded_buttons={} decoded_touches={} trigger={:.3} grip={:.3} stick=({:.3},{:.3}) pos=({:.3},{:.3},{:.3}) rot=({:.3},{:.3},{:.3},{:.3}) timestamp_ns={} battery={} left_words={} left_fields={} left_bytes={} changes=[{}]",
                 runtime.poll_count,
                 controller.hand,
                 controller.descriptor.to_string_lossy(),
                 controller.handle,
+                parsed.pose_valid,
                 parsed.buttons,
                 parsed.touches,
+                decoded_buttons,
+                decoded_touches,
                 parsed.trigger,
                 parsed.grip,
                 parsed.thumbstick_x,
@@ -2731,15 +2975,19 @@ fn poll_pimax_native_controller_runtime(runtime: &mut PimaxNativeControllerRunti
                 parsed.orientation.w,
                 parsed.timestamp_ns,
                 controller.last_battery,
+                left_word_window,
+                left_field_window,
+                left_byte_window,
                 changes
             );
             logged_change = true;
         } else if runtime.poll_count <= 5 || runtime.poll_count % 180 == 0 {
             info!(
-                "native Pimax controller poll: count={} hand={:?} handle={} buttons=0x{:08x} touches=0x{:08x} trigger={:.3} grip={:.3} stick=({:.3},{:.3}) pos=({:.3},{:.3},{:.3}) rot=({:.3},{:.3},{:.3},{:.3}) battery={}",
+                "native Pimax controller poll: count={} hand={:?} handle={} valid={} buttons=0x{:08x} touches=0x{:08x} trigger={:.3} grip={:.3} stick=({:.3},{:.3}) pos=({:.3},{:.3},{:.3}) rot=({:.3},{:.3},{:.3},{:.3}) battery={} left_words={} left_fields={} left_bytes={}",
                 runtime.poll_count,
                 controller.hand,
                 controller.handle,
+                parsed.pose_valid,
                 parsed.buttons,
                 parsed.touches,
                 parsed.trigger,
@@ -2753,7 +3001,10 @@ fn poll_pimax_native_controller_runtime(runtime: &mut PimaxNativeControllerRunti
                 parsed.orientation.y,
                 parsed.orientation.z,
                 parsed.orientation.w,
-                controller.last_battery
+                controller.last_battery,
+                left_word_window,
+                left_field_window,
+                left_byte_window
             );
         }
 
@@ -4029,9 +4280,7 @@ fn create_eye_render_target(width: i32, height: i32) -> Result<EyeRenderTarget> 
     match create_gl_eye_render_target(width, height, is_hdr) {
         Ok(target) => Ok(target),
         Err(err) if is_hdr => {
-            warn!(
-                "HDR eye target unavailable, falling back to RGBA8 eye textures: {err:#}"
-            );
+            warn!("HDR eye target unavailable, falling back to RGBA8 eye textures: {err:#}");
             create_gl_eye_render_target(width, height, false)
         }
         Err(err) => Err(err),
@@ -5423,6 +5672,10 @@ fn try_begin_and_submit_frame<'local>(
     if !render_window_surface_mirror_enabled {
         info!("NativeActivity surface mirror disabled for VR texture submission run");
     }
+    info!(
+        "controller runtime startup: native_enabled={} native_controller_runtime_expected=true",
+        ENABLE_NATIVE_PIMAX_CONTROLLER_RUNTIME
+    );
     let mut native_controller_runtime = if ENABLE_NATIVE_PIMAX_CONTROLLER_RUNTIME {
         match start_pimax_native_controller_runtime() {
             Ok(runtime) => runtime,
@@ -5436,7 +5689,9 @@ fn try_begin_and_submit_frame<'local>(
         None
     };
     let mut controller_runtime = if native_controller_runtime.is_some() {
-        info!("skipping Java/Binder controller runtime because native pxrapi controller runtime is active");
+        info!(
+            "native Pimax controller runtime owns controller state; skipping Java/Binder controller runtime"
+        );
         None
     } else {
         match start_pimax_controller_runtime(env, context) {
@@ -5465,7 +5720,10 @@ fn try_begin_and_submit_frame<'local>(
         {
             render_eye_width = desired_render_eye_width;
             render_eye_height = desired_render_eye_height;
-            info!("rebuilding eye render targets for hdr={hdr_enabled} scale={}", crate::tune::eye_render_scale());
+            info!(
+                "rebuilding eye render targets for hdr={hdr_enabled} scale={}",
+                crate::tune::eye_render_scale()
+            );
             eye_buffers.clear();
             for pair_index in 0..PIMAX_EYE_BUFFER_PAIR_COUNT {
                 let left = create_eye_render_target(render_eye_width, render_eye_height)
@@ -5540,10 +5798,11 @@ fn try_begin_and_submit_frame<'local>(
         let slot_index = (frame_index.rem_euclid(eye_buffers.len() as i32)) as usize;
         let current_buffers = &eye_buffers[slot_index];
         let mut submitted_video_timestamp = None::<u64>;
+        if let Some(runtime) = controller_runtime.as_mut() {
+            poll_pimax_controller_runtime(env, runtime);
+        }
         if let Some(runtime) = native_controller_runtime.as_mut() {
             poll_pimax_native_controller_runtime(runtime);
-        } else if let Some(runtime) = controller_runtime.as_mut() {
-            poll_pimax_controller_runtime(env, runtime);
         }
         if let Some(offset) = vsync_offset_nanos {
             let phase_start = Instant::now();

@@ -31,6 +31,7 @@
 /// - `color_black_crush`: Black level adjustment (default: 0.072)
 /// - `color_gain`: Contrast gain (default: 1.22)
 /// - `eye_render_scale`: Multiplier for the Pimax-reported target eye size
+/// - `controller_position_deadzone`: Ignore tiny controller pose movement
 /// - `controller_rotation_*_deg`: Live controller grip-pose calibration
 ///
 /// # Versioning
@@ -175,6 +176,12 @@ pub struct ClientConfig {
     /// Range: 0.5 to 1.5 (typical: 1.0)
     pub eye_render_scale: Option<f32>,
 
+    /// Controller position dead zone in meters.
+    ///
+    /// Smaller motion than this is ignored to suppress pose jitter.
+    /// Range: 0.0 to 0.05 (typical: 0.010)
+    pub controller_position_deadzone: Option<f32>,
+
     /// Controller local X-axis rotation offset in degrees.
     ///
     /// Used to calibrate the native Pimax controller model basis into ALVR's
@@ -222,6 +229,7 @@ impl Default for ClientConfig {
             color_black_crush: Some(crate::video_receiver::COLOR_BLACK_CRUSH_DEFAULT),
             color_gain: Some(crate::video_receiver::COLOR_GAIN_DEFAULT),
             eye_render_scale: Some(crate::tune::EYE_RENDER_SCALE_DEFAULT),
+            controller_position_deadzone: Some(crate::tune::CONTROLLER_POSITION_DEADZONE_DEFAULT),
             controller_rotation_x_deg: Some(crate::tune::CONTROLLER_ROTATION_X_DEG_DEFAULT),
             controller_rotation_y_deg: Some(crate::tune::CONTROLLER_ROTATION_Y_DEG_DEFAULT),
             controller_rotation_z_deg: Some(crate::tune::CONTROLLER_ROTATION_Z_DEG_DEFAULT),

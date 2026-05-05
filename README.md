@@ -43,6 +43,7 @@ A native Rust client for the Pimax Crystal OG standalone headset, implementing t
 | `ipd_scale` | 0.0 - 2.0 | ALVR stereo strength (1.0 = full physical IPD) |
 | `fov_scale` | 0.8 - 1.2 | Fine-tune headset FOV for Pimax warp alignment |
 | `eye_render_scale` | 0.5 - 2.0 | Scale eye render targets for sharper/stabler output |
+| `controller_position_deadzone` | 0.0 - 0.05 | Ignore tiny controller pose movement to suppress jitter |
 | `color_black_crush` | 0.0 - 0.3 | BT.709 black level (0.072 default) |
 | `color_gain` | 0.5 - 2.0 | BT.709 contrast gain (1.22 default) |
 

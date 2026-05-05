@@ -1647,7 +1647,7 @@ public final class VrRenderActivity extends NativeActivity {
 
     private static final long CONTROLLER_POLL_INTERVAL_MS = 33;
     private static final boolean USE_NATIVE_PIMAX_SDK_CONTROLLER_POLLER = true;
-    private static final boolean LOG_ANDROID_CONTROLLER_INPUT_EVENTS = false;
+    private static final boolean LOG_ANDROID_CONTROLLER_INPUT_EVENTS = true;
     private static final String CONTROLLER_DEVICE_NAME_LEFT = "nrfinput_left";
     private static final String CONTROLLER_DEVICE_NAME_RIGHT = "nrfinput_right";
     private static final String CONTROLLER_BATTERY_PATH_LEFT =
@@ -1681,6 +1681,7 @@ public final class VrRenderActivity extends NativeActivity {
     private final ControllerState rightController = new ControllerState();
     private volatile Thread controllerPoller = null;
     private volatile boolean controllerPollerRunning = false;
+    private volatile boolean controllerDeviceInventoryLogged = false;
     private long controllerLogCounter = 0L;
 
     private ControllerState controllerStateForDevice(InputDevice device) {
@@ -1879,6 +1880,10 @@ public final class VrRenderActivity extends NativeActivity {
     }
 
     private void startControllerPoller() {
+        if (!nativeLibrariesLoaded) {
+            Log.i(TAG, "deferring ControllerPoller until native libraries load");
+            return;
+        }
         if (USE_NATIVE_PIMAX_SDK_CONTROLLER_POLLER) {
             Log.i(TAG, "skipping Android InputDevice ControllerPoller; native Pimax SDK poller owns controller state");
             return;
@@ -1925,6 +1930,23 @@ public final class VrRenderActivity extends NativeActivity {
     }
 
     private void pollControllersOnce() {
+        if (!controllerDeviceInventoryLogged) {
+            controllerDeviceInventoryLogged = true;
+            int[] deviceIds = InputDevice.getDeviceIds();
+            for (int id : deviceIds) {
+                InputDevice device = InputDevice.getDevice(id);
+                if (device == null) {
+                    continue;
+                }
+                Log.i(TAG, "input device inventory: id=" + id
+                        + " name=" + device.getName()
+                        + " descriptor=" + device.getDescriptor()
+                        + " sources=0x" + Integer.toHexString(device.getSources())
+                        + " vendor=0x" + Integer.toHexString(device.getVendorId())
+                        + " product=0x" + Integer.toHexString(device.getProductId()));
+            }
+        }
+
         boolean leftSeen = false;
         boolean rightSeen = false;
         int[] deviceIds = InputDevice.getDeviceIds();

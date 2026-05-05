@@ -25,9 +25,7 @@ pub fn configure_hdr_stream(_enable_hdr: bool) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        COLOR_BLACK_CRUSH_DEFAULT, COLOR_GAIN_DEFAULT,
-    };
+    use super::{COLOR_BLACK_CRUSH_DEFAULT, COLOR_GAIN_DEFAULT};
 
     fn color_adjustment_for_hdr_enabled(enable_hdr: bool) -> (f32, f32) {
         if enable_hdr {
