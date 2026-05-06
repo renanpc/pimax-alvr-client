@@ -340,7 +340,8 @@ const ALVR_HEAD_PATH: &str = "/user/head";
 
 static ALVR_CONTROL_LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
 static ALVR_STREAM_SESSION_COUNTER: AtomicU32 = AtomicU32::new(1);
-static ALVR_DISCOVERY_RECOVERY_ACTIVE: AtomicBool = AtomicBool::new(false);
+static ALVR_DISCOVERY_RECOVERY_OWNER: AtomicU32 = AtomicU32::new(0);
+static ALVR_DISCOVERY_RECOVERY_GENERATION: AtomicU32 = AtomicU32::new(1);
 static ALVR_MDNS_DAEMON: LazyLock<Mutex<Option<mdns_sd::ServiceDaemon>>> =
     LazyLock::new(|| Mutex::new(None));
 static LATEST_HEAD_TRACKING_POSE: Mutex<Option<AlvrHeadTrackingPose>> = Mutex::new(None);
@@ -1177,8 +1178,44 @@ fn refresh_alvr_discovery_after_control_disconnect(config: &ClientConfig) {
     }
 }
 
+fn next_alvr_discovery_recovery_token() -> u32 {
+    loop {
+        let current = ALVR_DISCOVERY_RECOVERY_GENERATION.load(Ordering::Acquire);
+        let next = current.wrapping_add(1).max(1);
+        match ALVR_DISCOVERY_RECOVERY_GENERATION.compare_exchange(
+            current,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return next,
+            Err(_) => continue,
+        }
+    }
+}
+
+fn try_claim_alvr_discovery_recovery(token: u32) -> bool {
+    ALVR_DISCOVERY_RECOVERY_OWNER
+        .compare_exchange(0, token, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+fn is_current_alvr_discovery_recovery(token: u32) -> bool {
+    ALVR_DISCOVERY_RECOVERY_OWNER.load(Ordering::Acquire) == token
+}
+
+fn release_alvr_discovery_recovery(token: u32) {
+    let _ = ALVR_DISCOVERY_RECOVERY_OWNER.compare_exchange(
+        token,
+        0,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+}
+
 fn start_alvr_discovery_recovery(config: ClientConfig) {
-    if ALVR_DISCOVERY_RECOVERY_ACTIVE.swap(true, Ordering::AcqRel) {
+    let token = next_alvr_discovery_recovery_token();
+    if !try_claim_alvr_discovery_recovery(token) {
         return;
     }
 
@@ -1186,7 +1223,7 @@ fn start_alvr_discovery_recovery(config: ClientConfig) {
         .name("alvr-discovery-recovery".to_string())
         .spawn(move || {
             for attempt in 0..ALVR_DISCOVERY_RECOVERY_ATTEMPTS {
-                if !ALVR_DISCOVERY_RECOVERY_ACTIVE.load(Ordering::Acquire) {
+                if !is_current_alvr_discovery_recovery(token) {
                     break;
                 }
 
@@ -1197,17 +1234,17 @@ fn start_alvr_discovery_recovery(config: ClientConfig) {
                 }
             }
 
-            ALVR_DISCOVERY_RECOVERY_ACTIVE.store(false, Ordering::Release);
+            release_alvr_discovery_recovery(token);
         });
 
     if let Err(err) = spawn_result {
-        ALVR_DISCOVERY_RECOVERY_ACTIVE.store(false, Ordering::Release);
+        release_alvr_discovery_recovery(token);
         warn!("failed to spawn ALVR discovery recovery helper: {err:#}");
     }
 }
 
 fn stop_alvr_discovery_recovery() {
-    ALVR_DISCOVERY_RECOVERY_ACTIVE.store(false, Ordering::Release);
+    ALVR_DISCOVERY_RECOVERY_OWNER.store(0, Ordering::Release);
 }
 
 pub fn start_alvr_control_listener(config: ClientConfig) -> Result<()> {
@@ -3209,6 +3246,10 @@ enum ClientControlPacket {
 mod tests {
     use super::*;
     use crate::protocol::DISCOVERY_PORT;
+    use std::sync::LazyLock;
+
+    static DISCOVERY_RECOVERY_TEST_GUARD: LazyLock<Mutex<()>> =
+        LazyLock::new(|| Mutex::new(()));
 
     #[test]
     fn discovered_streamer_can_be_debugged() {
@@ -3263,6 +3304,42 @@ mod tests {
         );
 
         assert_eq!(targets, vec![SocketAddr::from((Ipv4Addr::BROADCAST, DISCOVERY_PORT))]);
+    }
+
+    #[test]
+    fn discovery_recovery_owner_can_only_be_released_by_current_token() {
+        let _guard = DISCOVERY_RECOVERY_TEST_GUARD.lock().unwrap();
+        ALVR_DISCOVERY_RECOVERY_OWNER.store(0, Ordering::Release);
+
+        let first = next_alvr_discovery_recovery_token();
+        let second = next_alvr_discovery_recovery_token();
+
+        assert!(try_claim_alvr_discovery_recovery(first));
+        assert!(!try_claim_alvr_discovery_recovery(second));
+
+        release_alvr_discovery_recovery(second);
+        assert!(is_current_alvr_discovery_recovery(first));
+
+        stop_alvr_discovery_recovery();
+        assert!(!is_current_alvr_discovery_recovery(first));
+
+        assert!(try_claim_alvr_discovery_recovery(second));
+        release_alvr_discovery_recovery(first);
+        assert!(is_current_alvr_discovery_recovery(second));
+
+        release_alvr_discovery_recovery(second);
+        assert_eq!(ALVR_DISCOVERY_RECOVERY_OWNER.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn discovery_recovery_tokens_never_use_zero() {
+        let _guard = DISCOVERY_RECOVERY_TEST_GUARD.lock().unwrap();
+        ALVR_DISCOVERY_RECOVERY_GENERATION.store(u32::MAX, Ordering::Release);
+
+        let token = next_alvr_discovery_recovery_token();
+
+        assert_ne!(token, 0);
+        ALVR_DISCOVERY_RECOVERY_GENERATION.store(1, Ordering::Release);
     }
 
     // Regression: bincode 2 with `config::standard()` encodes enum variant
