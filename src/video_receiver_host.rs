@@ -3,6 +3,11 @@
 //! The production receiver depends on Android GL and MediaCodec types. Host
 //! tests only need the shared foveated-encoding shape and tuning defaults.
 
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, OnceLock,
+};
+
 pub const PIMAX_BLIT_CONVERGENCE_SHIFT_NDC_DEFAULT: f32 = 0.124;
 pub const COLOR_BLACK_CRUSH_DEFAULT: f32 = 0.072;
 pub const COLOR_GAIN_DEFAULT: f32 = 1.22;
@@ -22,6 +27,26 @@ pub struct FoveatedEncodingConfig {
 pub fn configure_foveated_encoding(_config: Option<FoveatedEncodingConfig>) {}
 
 pub fn configure_hdr_stream(_enable_hdr: bool) {}
+
+pub struct AlvrVideoReceiver {
+    connected: AtomicBool,
+}
+
+static VIDEO_RECEIVER: OnceLock<Arc<AlvrVideoReceiver>> = OnceLock::new();
+
+pub fn get_video_receiver() -> Arc<AlvrVideoReceiver> {
+    VIDEO_RECEIVER
+        .get_or_init(|| {
+            Arc::new(AlvrVideoReceiver {
+                connected: AtomicBool::new(false),
+            })
+        })
+        .clone()
+}
+
+pub fn disconnect(receiver: &AlvrVideoReceiver) {
+    receiver.connected.store(false, Ordering::SeqCst);
+}
 
 #[cfg(test)]
 mod tests {

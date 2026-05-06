@@ -824,8 +824,39 @@ pub async fn connect_to_alvr(
 /// Disconnect from ALVR server
 pub fn disconnect(receiver: &AlvrVideoReceiver) {
     *receiver.state.lock() = ReceiverState::Disconnected;
+    *receiver.latest_frame.lock() = None;
     receiver.connected.store(false, Ordering::SeqCst);
     info!("Disconnected from ALVR server");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disconnect_clears_latest_frame_and_connection_state() {
+        let receiver = AlvrVideoReceiver {
+            state: Mutex::new(ReceiverState::Streaming),
+            latest_frame: Mutex::new(Some(VideoFrame {
+                timestamp_ns: 1,
+                buffer_ptr: 2,
+                width: 3,
+                height: 4,
+                row_pitch: 5,
+                hardware_buffer_lease: None,
+                rgba: None,
+                nv12: None,
+            })),
+            connected: Arc::new(AtomicBool::new(true)),
+            server_addr: Mutex::new(Some("127.0.0.1:9944".to_owned())),
+        };
+
+        disconnect(&receiver);
+
+        assert_eq!(*receiver.state.lock(), ReceiverState::Disconnected);
+        assert!(receiver.latest_frame.lock().is_none());
+        assert!(!receiver.connected.load(Ordering::SeqCst));
+    }
 }
 
 /// Push a video frame to the receiver

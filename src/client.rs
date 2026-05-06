@@ -102,14 +102,15 @@ use std::{
     collections::{HashMap, VecDeque},
     io::{Read, Write},
     net::{
-        IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream,
+        IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener as StdTcpListener,
+        TcpStream as StdTcpStream,
         UdpSocket as StdUdpSocket,
     },
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
-        Arc, Mutex,
+        Arc, LazyLock, Mutex,
     },
-    thread,
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -163,6 +164,117 @@ fn alvr_protocol_string(version_string: &str) -> String {
 /// - TcpStream is not Clone, so we share ownership
 type SharedControlWriter = Arc<Mutex<StdTcpStream>>;
 
+struct AlvrStreamSession {
+    session_id: u32,
+    shutdown_requested: Arc<AtomicBool>,
+    cleanup_reason: String,
+    control_maintenance_handle: Option<JoinHandle<()>>,
+    tracking_sender_handle: Option<JoinHandle<()>>,
+    udp_receiver_handle: Option<JoinHandle<()>>,
+    microphone_capture: Option<crate::audio::MicrophoneCapture>,
+    game_audio_output: Option<crate::audio::GameAudioOutput>,
+    statistics_sender_guard: Option<AlvrStatisticsSenderGuard>,
+}
+
+impl AlvrStreamSession {
+    fn new(
+        session_id: u32,
+        microphone_capture: Option<crate::audio::MicrophoneCapture>,
+        game_audio_output: Option<crate::audio::GameAudioOutput>,
+    ) -> Self {
+        Self {
+            session_id,
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+            cleanup_reason: "ALVR stream session ended".to_owned(),
+            control_maintenance_handle: None,
+            tracking_sender_handle: None,
+            udp_receiver_handle: None,
+            microphone_capture,
+            game_audio_output,
+            statistics_sender_guard: None,
+        }
+    }
+
+    fn shutdown_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shutdown_requested)
+    }
+
+    fn set_cleanup_reason(&mut self, reason: impl Into<String>) {
+        self.cleanup_reason = reason.into();
+    }
+
+    fn request_shutdown(&self) {
+        self.shutdown_requested.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for AlvrStreamSession {
+    fn drop(&mut self) {
+        self.request_shutdown();
+        info!(
+            "ALVR stream session cleanup starting: session_id={} reason={}",
+            self.session_id, self.cleanup_reason
+        );
+
+        if let Some(capture) = self.microphone_capture.as_ref() {
+            info!(
+                "ALVR stream session cleanup: shutting down microphone capture for session_id={}",
+                self.session_id
+            );
+            capture.shutdown();
+        }
+        if let Some(output) = self.game_audio_output.as_ref() {
+            info!(
+                "ALVR stream session cleanup: shutting down game audio output for session_id={}",
+                self.session_id
+            );
+            output.shutdown();
+        }
+
+        self.statistics_sender_guard.take();
+        clear_alvr_statistics_state();
+
+        if let Some(handle) = self.control_maintenance_handle.take() {
+            info!(
+                "ALVR stream session cleanup: joining control-maintenance for session_id={}",
+                self.session_id
+            );
+            drain_alvr_stream_thread("control-maintenance", self.session_id, handle);
+        }
+        if let Some(handle) = self.tracking_sender_handle.take() {
+            info!(
+                "ALVR stream session cleanup: joining tracking-sender for session_id={}",
+                self.session_id
+            );
+            drain_alvr_stream_thread("tracking-sender", self.session_id, handle);
+        }
+        if let Some(handle) = self.udp_receiver_handle.take() {
+            info!(
+                "ALVR stream session cleanup: joining udp-receiver for session_id={}",
+                self.session_id
+            );
+            drain_alvr_stream_thread("udp-receiver", self.session_id, handle);
+        }
+
+        info!(
+            "ALVR stream session cleanup: releasing decoder state for session_id={}",
+            self.session_id
+        );
+        release_alvr_stream_decoder();
+        let receiver = crate::video_receiver::get_video_receiver();
+        info!(
+            "ALVR stream session cleanup: disconnecting video receiver for session_id={}",
+            self.session_id
+        );
+        crate::video_receiver::disconnect(receiver.as_ref());
+
+        info!(
+            "ALVR stream session cleanup complete: session_id={} reason={}",
+            self.session_id, self.cleanup_reason
+        );
+    }
+}
+
 #[cfg(target_os = "android")]
 type VideoDecoderBridge = crate::android_video_decoder::AlvrAndroidVideoDecoder;
 
@@ -195,7 +307,10 @@ impl VideoDecoderBridge {
 const HANDSHAKE_ACTION_TIMEOUT: Duration = Duration::from_secs(5);
 const ALVR_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(500);
 const ALVR_RUNTIME_IDR_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(500);
-const ALVR_STREAM_RECV_TIMEOUT: Duration = Duration::from_millis(500);
+const ALVR_CONTROL_RECV_TIMEOUT: Duration = Duration::from_millis(500);
+const ALVR_STREAM_THREAD_JOIN_GRACE: Duration = Duration::from_millis(500);
+const ALVR_DISCOVERY_RECOVERY_ATTEMPTS: usize = 30;
+const ALVR_DISCOVERY_RECOVERY_INTERVAL: Duration = Duration::from_secs(2);
 const ALVR_STREAM_SHARD_PREFIX_SIZE: usize = 14;
 #[cfg(target_os = "android")]
 const ALVR_UDP_RECEIVE_BUFFER_BYTES: i32 = 4 * 1024 * 1024;
@@ -224,6 +339,10 @@ pub const ALVR_IPD_SCALE_DEFAULT: f32 = 1.0;
 const ALVR_HEAD_PATH: &str = "/user/head";
 
 static ALVR_CONTROL_LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
+static ALVR_STREAM_SESSION_COUNTER: AtomicU32 = AtomicU32::new(1);
+static ALVR_DISCOVERY_RECOVERY_ACTIVE: AtomicBool = AtomicBool::new(false);
+static ALVR_MDNS_DAEMON: LazyLock<Mutex<Option<mdns_sd::ServiceDaemon>>> =
+    LazyLock::new(|| Mutex::new(None));
 static LATEST_HEAD_TRACKING_POSE: Mutex<Option<AlvrHeadTrackingPose>> = Mutex::new(None);
 static ALVR_STATISTICS_STATE: Mutex<Option<AlvrClientStatisticsState>> = Mutex::new(None);
 static ALVR_STATISTICS_SENDER: Mutex<Option<AlvrStreamHeaderSender>> = Mutex::new(None);
@@ -558,6 +677,15 @@ fn reset_alvr_statistics_state() {
     }
 }
 
+fn clear_alvr_statistics_state() {
+    if let Ok(mut state) = ALVR_STATISTICS_STATE.lock() {
+        *state = None;
+        info!("ALVR statistics state cleared");
+    } else {
+        warn!("ALVR statistics state mutex is poisoned during cleanup");
+    }
+}
+
 fn with_alvr_statistics_state<T>(f: impl FnOnce(&mut AlvrClientStatisticsState) -> T) -> Option<T> {
     let mut state = match ALVR_STATISTICS_STATE.lock() {
         Ok(state) => state,
@@ -601,6 +729,62 @@ impl Drop for AlvrStatisticsSenderGuard {
         }
     }
 }
+
+fn join_alvr_stream_thread(name: &str, handle: JoinHandle<()>) {
+    match handle.join() {
+        Ok(()) => info!("ALVR stream thread joined: {name}"),
+        Err(_) => warn!("ALVR stream thread panicked during join: {name}"),
+    }
+}
+
+fn drain_alvr_stream_thread(name: &str, session_id: u32, handle: JoinHandle<()>) {
+    let deadline = Instant::now() + ALVR_STREAM_THREAD_JOIN_GRACE;
+
+    while !handle.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    if handle.is_finished() {
+        join_alvr_stream_thread(name, handle);
+    } else {
+        warn!(
+            "ALVR stream thread did not finish within {:?}; detaching: session_id={} thread={}",
+            ALVR_STREAM_THREAD_JOIN_GRACE,
+            session_id,
+            name
+        );
+        drop(handle);
+    }
+}
+
+fn request_alvr_control_shutdown(
+    writer: &SharedControlWriter,
+    shutdown_requested: &Arc<AtomicBool>,
+    reason: &str,
+) {
+    let already_requested = shutdown_requested.swap(true, Ordering::AcqRel);
+    if !already_requested {
+        warn!("requesting ALVR control session shutdown: {reason}");
+    }
+
+    match writer.lock() {
+        Ok(stream) => {
+            if let Err(err) = stream.shutdown(Shutdown::Both) {
+                warn!("failed to shutdown ALVR control socket after {reason}: {err:#}");
+            }
+        }
+        Err(_) => warn!("failed to lock ALVR control socket for shutdown after {reason}"),
+    }
+}
+
+#[cfg(target_os = "android")]
+fn release_alvr_stream_decoder() {
+    crate::android_video_decoder::release_upstream_decoder();
+    info!("released ALVR upstream decoder state");
+}
+
+#[cfg(not(target_os = "android"))]
+fn release_alvr_stream_decoder() {}
 
 struct AlvrStreamHeaderSender {
     socket: StdUdpSocket,
@@ -773,15 +957,11 @@ impl SessionHandle {
 
 pub struct AlvrClient {
     pub config: ClientConfig,
-    mdns_daemon: std::sync::Mutex<Option<mdns_sd::ServiceDaemon>>,
 }
 
 impl AlvrClient {
     pub fn new(config: ClientConfig) -> Self {
-        Self {
-            config,
-            mdns_daemon: std::sync::Mutex::new(None),
-        }
+        Self { config }
     }
 
     /// Advertise this client via mDNS so an ALVR v20 server can discover and
@@ -791,40 +971,41 @@ impl AlvrClient {
     /// because the ServiceDaemon re-announces automatically. Retries on the
     /// next call if the first attempt fails (e.g. WiFi not yet up).
     pub fn announce(&self) -> Result<()> {
-        let mut guard = self.mdns_daemon.lock().unwrap();
-        if guard.is_some() {
-            return Ok(());
+        ensure_alvr_mdns_registration(&self.config, false)
+    }
+
+    pub fn refresh_announcement(&self) -> Result<()> {
+        ensure_alvr_mdns_registration(&self.config, true)
+    }
+
+    pub fn send_discovery_heartbeat(&self, server_ip: Option<IpAddr>) -> Result<()> {
+        let packet = DiscoveryPacket {
+            protocol_id: self.config.protocol_id(),
+            hostname: self.config.client_name.clone(),
+        };
+        let socket =
+            StdUdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).context("bind discovery heartbeat socket")?;
+        socket
+            .set_broadcast(true)
+            .context("enable discovery heartbeat broadcast")?;
+
+        let mut errors = Vec::new();
+        let mut sent_any = false;
+        for target in discovery_heartbeat_targets(server_ip, self.config.discovery_port) {
+            match socket.send_to(&packet.encode(), target) {
+                Ok(_) => sent_any = true,
+                Err(err) => errors.push(format!("{target}: {err}")),
+            }
         }
 
-        let local_ip = IpAddr::V4(wifi_ipv4().context("get local IPv4 for mDNS")?);
-        let protocol_str = alvr_protocol_string(&self.config.version_string);
-
-        let daemon = mdns_sd::ServiceDaemon::new().context("create mDNS ServiceDaemon")?;
-
-        let service_info = mdns_sd::ServiceInfo::new(
-            "_alvr._tcp.local.",
-            &format!("alvr-{}", self.config.client_name),
-            &format!("{}.local.", self.config.client_name),
-            local_ip,
-            self.config.discovery_port,
-            &[
-                ("protocol", protocol_str.as_str()),
-                ("device_id", self.config.client_name.as_str()),
-            ][..],
-        )
-        .context("build mDNS ServiceInfo")?;
-
-        daemon
-            .register(service_info)
-            .context("register mDNS service")?;
-
-        *guard = Some(daemon);
-
-        info!(
-            "mDNS: registered _alvr._tcp.local. hostname={} addr={}:{} protocol={}",
-            self.config.client_name, local_ip, self.config.discovery_port, protocol_str
-        );
-        Ok(())
+        if sent_any {
+            Ok(())
+        } else {
+            bail!(
+                "send ALVR discovery heartbeat failed for all targets: {}",
+                errors.join("; ")
+            );
+        }
     }
 
     pub async fn discover(&self, listen_timeout: Duration) -> Result<Vec<DiscoveredStreamer>> {
@@ -918,6 +1099,117 @@ impl AlvrClient {
     }
 }
 
+fn discovery_heartbeat_targets(server_ip: Option<IpAddr>, discovery_port: u16) -> Vec<SocketAddr> {
+    let mut targets = vec![SocketAddr::from((Ipv4Addr::BROADCAST, discovery_port))];
+
+    if let Some(IpAddr::V4(server_ip)) = server_ip {
+        let target = SocketAddr::from((server_ip, discovery_port));
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+
+    targets
+}
+
+fn shutdown_alvr_mdns_daemon(daemon: mdns_sd::ServiceDaemon) {
+    if let Err(err) = daemon.shutdown() {
+        warn!("mDNS: failed to shutdown previous daemon before refresh: {err:#}");
+    }
+}
+
+fn ensure_alvr_mdns_registration(config: &ClientConfig, force_refresh: bool) -> Result<()> {
+    let mut guard = ALVR_MDNS_DAEMON.lock().unwrap();
+    if force_refresh {
+        if let Some(previous) = guard.take() {
+            shutdown_alvr_mdns_daemon(previous);
+        }
+    } else if guard.is_some() {
+        return Ok(());
+    }
+
+    let local_ip = IpAddr::V4(wifi_ipv4().context("get local IPv4 for mDNS")?);
+    let protocol_str = alvr_protocol_string(&config.version_string);
+
+    let daemon = mdns_sd::ServiceDaemon::new().context("create mDNS ServiceDaemon")?;
+
+    let service_info = mdns_sd::ServiceInfo::new(
+        "_alvr._tcp.local.",
+        &format!("alvr-{}", config.client_name),
+        &format!("{}.local.", config.client_name),
+        local_ip,
+        config.discovery_port,
+        &[
+            ("protocol", protocol_str.as_str()),
+            ("device_id", config.client_name.as_str()),
+        ][..],
+    )
+    .context("build mDNS ServiceInfo")?;
+
+    daemon
+        .register(service_info)
+        .context("register mDNS service")?;
+
+    *guard = Some(daemon);
+
+    let action = if force_refresh {
+        "refreshed"
+    } else {
+        "registered"
+    };
+    info!(
+        "mDNS: {action} _alvr._tcp.local. hostname={} addr={}:{} protocol={}",
+        config.client_name, local_ip, config.discovery_port, protocol_str
+    );
+
+    Ok(())
+}
+
+fn refresh_alvr_discovery_after_control_disconnect(config: &ClientConfig) {
+    let discovery_client = AlvrClient::new(config.clone());
+    if let Err(err) = discovery_client.refresh_announcement() {
+        warn!("ALVR discovery refresh after control disconnect failed: {err:#}");
+    }
+
+    let directed_server_ip = crate::tune::get_server_ip().parse::<IpAddr>().ok();
+    if let Err(err) = discovery_client.send_discovery_heartbeat(directed_server_ip) {
+        warn!("ALVR discovery heartbeat after control disconnect failed: {err:#}");
+    }
+}
+
+fn start_alvr_discovery_recovery(config: ClientConfig) {
+    if ALVR_DISCOVERY_RECOVERY_ACTIVE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    let spawn_result = thread::Builder::new()
+        .name("alvr-discovery-recovery".to_string())
+        .spawn(move || {
+            for attempt in 0..ALVR_DISCOVERY_RECOVERY_ATTEMPTS {
+                if !ALVR_DISCOVERY_RECOVERY_ACTIVE.load(Ordering::Acquire) {
+                    break;
+                }
+
+                refresh_alvr_discovery_after_control_disconnect(&config);
+
+                if attempt + 1 < ALVR_DISCOVERY_RECOVERY_ATTEMPTS {
+                    thread::sleep(ALVR_DISCOVERY_RECOVERY_INTERVAL);
+                }
+            }
+
+            ALVR_DISCOVERY_RECOVERY_ACTIVE.store(false, Ordering::Release);
+        });
+
+    if let Err(err) = spawn_result {
+        ALVR_DISCOVERY_RECOVERY_ACTIVE.store(false, Ordering::Release);
+        warn!("failed to spawn ALVR discovery recovery helper: {err:#}");
+    }
+}
+
+fn stop_alvr_discovery_recovery() {
+    ALVR_DISCOVERY_RECOVERY_ACTIVE.store(false, Ordering::Release);
+}
+
 pub fn start_alvr_control_listener(config: ClientConfig) -> Result<()> {
     if ALVR_CONTROL_LISTENER_STARTED.swap(true, Ordering::SeqCst) {
         info!("ALVR control listener already started");
@@ -947,7 +1239,10 @@ pub fn start_alvr_control_listener(config: ClientConfig) -> Result<()> {
                     Ok(stream) => {
                         if let Err(err) = handle_alvr_server_control(stream, &config) {
                             warn!("ALVR server control connection ended: {err:#}");
+                        } else {
+                            info!("ALVR server control connection ended cleanly; listener ready for reconnect");
                         }
+                        start_alvr_discovery_recovery(config.clone());
                     }
                     Err(err) => warn!("ALVR TCP control accept failed: {err:#}"),
                 }
@@ -1006,6 +1301,7 @@ fn handle_alvr_server_control(mut stream: StdTcpStream, config: &ClientConfig) -
 
     let stream_config: StreamConfigPacket =
         recv_framed(&mut stream).context("receive ALVR stream config packet")?;
+    stop_alvr_discovery_recovery();
     info!(
         "received ALVR stream config: session_json={} bytes negotiated={{view={}x{} refresh={} foveated={} wired={} hdr={}}}",
         stream_config.session.len(),
@@ -1025,6 +1321,7 @@ fn handle_alvr_server_control(mut stream: StdTcpStream, config: &ClientConfig) -
             info!("received ALVR StartStream; opening minimal stream socket");
             run_minimal_alvr_stream(&mut stream, peer, &stream_config)
                 .context("run minimal ALVR stream socket")?;
+            info!("ALVR stream session returned to control handler for peer {peer}");
         }
         ServerControlPacket::Restarting => {
             info!("ALVR server requested SteamVR restart after config negotiation");
@@ -1042,6 +1339,10 @@ fn run_minimal_alvr_stream(
     peer: SocketAddr,
     stream_config: &StreamConfigPacket,
 ) -> Result<()> {
+    let session_id = ALVR_STREAM_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    stream
+        .set_read_timeout(Some(ALVR_CONTROL_RECV_TIMEOUT))
+        .context("set ALVR control socket read timeout for stream session")?;
     let settings = StreamSocketSettings::from_stream_config(stream_config)?;
     let audio_settings = AudioStreamSettings::from_stream_config(stream_config);
     crate::video_receiver::configure_foveated_encoding(settings.foveated_encoding);
@@ -1059,8 +1360,8 @@ fn run_minimal_alvr_stream(
     let udp = StdUdpSocket::bind((Ipv4Addr::UNSPECIFIED, settings.port))
         .with_context(|| format!("bind ALVR UDP stream socket on 0.0.0.0:{}", settings.port))?;
     configure_udp_receive_buffer(&udp);
-    udp.set_read_timeout(Some(ALVR_STREAM_RECV_TIMEOUT))
-        .context("set ALVR UDP stream read timeout")?;
+    udp.set_nonblocking(true)
+        .context("set ALVR UDP stream socket nonblocking mode")?;
     udp.connect(SocketAddr::new(peer.ip(), settings.port))
         .with_context(|| {
             format!(
@@ -1122,7 +1423,8 @@ fn run_minimal_alvr_stream(
     };
 
     info!(
-        "ALVR UDP stream socket ready: local=0.0.0.0:{} peer={}:{} packet_size={}",
+        "ALVR UDP stream socket ready: session_id={} local=0.0.0.0:{} peer={}:{} packet_size={}",
+        session_id,
         settings.port,
         peer.ip(),
         settings.port,
@@ -1150,58 +1452,88 @@ fn run_minimal_alvr_stream(
         "stream startup so the server sends DecoderConfig and a fresh keyframe",
     );
     info!(
-        "sent ALVR StreamReady and initial LocalViewParams; waiting for UDP stream shards and control keepalives"
+        "sent ALVR StreamReady and initial LocalViewParams; session_id={} waiting for UDP stream shards and control keepalives",
+        session_id
     );
 
     let video_decoder = Arc::new(VideoDecoderBridge::new());
     let decoder_config_ready = Arc::new(AtomicBool::new(false));
-    thread::Builder::new()
-        .name("alvr-control-maintenance".to_string())
-        .spawn({
-            let control_writer = Arc::clone(&control_writer);
-            move || maintain_alvr_control_socket(control_writer)
-        })
-        .context("spawn ALVR control maintenance thread")?;
+    let mut stream_session =
+        AlvrStreamSession::new(session_id, microphone_capture, game_audio_output);
+    let session_shutdown = stream_session.shutdown_signal();
+    info!(
+        "ALVR stream session started: session_id={} peer={} udp_port={}",
+        session_id, peer, settings.port
+    );
+
+    stream_session.control_maintenance_handle = Some(
+        thread::Builder::new()
+            .name("alvr-control-maintenance".to_string())
+            .spawn({
+                let control_writer = Arc::clone(&control_writer);
+                let session_shutdown = Arc::clone(&session_shutdown);
+                move || maintain_alvr_control_socket(control_writer, session_shutdown)
+            })
+            .context("spawn ALVR control maintenance thread")?,
+    );
 
     let receive_packet_size = settings.packet_size;
     reset_alvr_statistics_state();
-    let _statistics_sender_guard = install_alvr_statistics_sender(
-        udp.try_clone()
-            .context("clone ALVR UDP stream socket for statistics sender")?,
-        receive_packet_size,
-    )
-    .context("install ALVR statistics stream sender")?;
+    stream_session.statistics_sender_guard = Some(
+        install_alvr_statistics_sender(
+            udp.try_clone()
+                .context("clone ALVR UDP stream socket for statistics sender")?,
+            receive_packet_size,
+        )
+        .context("install ALVR statistics stream sender")?,
+    );
     let tracking_udp = udp
         .try_clone()
         .context("clone ALVR UDP stream socket for tracking sender")?;
-    thread::Builder::new()
-        .name("alvr-tracking-send".to_string())
-        .spawn(move || send_minimal_tracking_stream(tracking_udp, receive_packet_size))
-        .context("spawn ALVR tracking sender thread")?;
+    stream_session.tracking_sender_handle = Some(
+        thread::Builder::new()
+            .name("alvr-tracking-send".to_string())
+            .spawn({
+                let session_shutdown = Arc::clone(&session_shutdown);
+                move || {
+                    send_minimal_tracking_stream(
+                        tracking_udp,
+                        receive_packet_size,
+                        session_shutdown,
+                    )
+                }
+            })
+            .context("spawn ALVR tracking sender thread")?,
+    );
 
-    thread::Builder::new()
-        .name("alvr-udp-stream-recv".to_string())
-        .spawn({
-            let video_decoder = Arc::clone(&video_decoder);
-            let control_writer = Arc::clone(&control_writer);
-            let decoder_config_ready = Arc::clone(&decoder_config_ready);
-            let game_audio_output = game_audio_output.clone();
-            move || {
-                receive_alvr_udp_stream(
-                    udp,
-                    receive_packet_size,
-                    video_decoder,
-                    control_writer,
-                    decoder_config_ready,
-                    game_audio_output,
-                )
-            }
-        })
-        .context("spawn ALVR UDP stream receiver thread")?;
+    stream_session.udp_receiver_handle = Some(
+        thread::Builder::new()
+            .name("alvr-udp-stream-recv".to_string())
+            .spawn({
+                let video_decoder = Arc::clone(&video_decoder);
+                let control_writer = Arc::clone(&control_writer);
+                let decoder_config_ready = Arc::clone(&decoder_config_ready);
+                let game_audio_output = stream_session.game_audio_output.clone();
+                let session_shutdown = Arc::clone(&session_shutdown);
+                move || {
+                    receive_alvr_udp_stream(
+                        udp,
+                        receive_packet_size,
+                        video_decoder,
+                        control_writer,
+                        decoder_config_ready,
+                        session_shutdown,
+                        game_audio_output,
+                    )
+                }
+            })
+            .context("spawn ALVR UDP stream receiver thread")?,
+    );
 
     let mut decoder_configured = false;
+    let mut last_decoder_config: Option<(CodecType, Vec<u8>)> = None;
     loop {
-        match recv_framed::<ServerControlPacket>(stream) {
+        match recv_framed_until_shutdown::<ServerControlPacket>(stream, &session_shutdown) {
             Ok(ServerControlPacket::KeepAlive) => {}
             Ok(ServerControlPacket::DecoderConfig(config)) => {
                 info!(
@@ -1209,23 +1541,34 @@ fn run_minimal_alvr_stream(
                     config.codec,
                     config.config_buffer.len()
                 );
-                if decoder_configured {
-                    info!("ignoring duplicate ALVR decoder config");
+
+                let is_duplicate_config = last_decoder_config
+                    .as_ref()
+                    .is_some_and(|previous| same_decoder_config(previous, &config));
+                if decoder_configured && is_duplicate_config {
+                    info!(
+                        "ignoring duplicate ALVR decoder config while decoder is already configured"
+                    );
                     continue;
+                }
+                if decoder_configured {
+                    info!("reconfiguring decoder after ALVR decoder config change");
                 }
 
                 let frame_width = (stream_config.negotiated.view_resolution.x * 2) as i32;
                 let frame_height = stream_config.negotiated.view_resolution.y as i32;
+                let decoder_config_buffer = config.config_buffer.clone();
                 video_decoder
                     .configure(
                         config.codec.mime_type(),
                         config.codec.label(),
-                        config.config_buffer,
+                        decoder_config_buffer.clone(),
                         frame_width,
                         frame_height,
                     )
                     .with_context(|| format!("configure decoder for {:?}", config.codec))?;
                 decoder_configured = true;
+                last_decoder_config = Some((config.codec, decoder_config_buffer));
                 decoder_config_ready.store(true, Ordering::Release);
                 request_alvr_idr_best_effort(&control_writer, "decoder configuration completed");
             }
@@ -1247,12 +1590,8 @@ fn run_minimal_alvr_stream(
             }
             Ok(ServerControlPacket::Restarting) => {
                 info!("ALVR server requested SteamVR restart during stream");
-                if let Some(capture) = microphone_capture.as_ref() {
-                    capture.shutdown();
-                }
-                if let Some(output) = game_audio_output.as_ref() {
-                    output.shutdown();
-                }
+                stream_session
+                    .set_cleanup_reason("ALVR server requested SteamVR restart during stream");
                 return Ok(());
             }
             Ok(other) => {
@@ -1260,12 +1599,8 @@ fn run_minimal_alvr_stream(
             }
             Err(err) => {
                 warn!("ALVR control receive loop ended: {err:#}");
-                if let Some(capture) = microphone_capture.as_ref() {
-                    capture.shutdown();
-                }
-                if let Some(output) = game_audio_output.as_ref() {
-                    output.shutdown();
-                }
+                stream_session
+                    .set_cleanup_reason(format!("ALVR control receive loop ended: {err:#}"));
                 return Ok(());
             }
         }
@@ -1321,12 +1656,25 @@ fn request_alvr_idr_if_due(
     *last_request_at = Some(now);
 }
 
+fn enter_waiting_for_idr(
+    waiting_for_idr: &mut bool,
+    video_assembler: &mut VideoPacketAssembler,
+    last_completed_video_packet_index: &mut Option<u32>,
+    reason: &str,
+) {
+    *waiting_for_idr = true;
+    video_assembler.clear();
+    *last_completed_video_packet_index = None;
+    info!("reset ALVR video continuity state while waiting for next IDR: {reason}");
+}
+
 fn receive_alvr_udp_stream(
     socket: StdUdpSocket,
     packet_size: usize,
     video_decoder: Arc<VideoDecoderBridge>,
     control_writer: SharedControlWriter,
     decoder_config_ready: Arc<AtomicBool>,
+    shutdown_requested: Arc<AtomicBool>,
     game_audio_output: Option<crate::audio::GameAudioOutput>,
 ) {
     let mut buffer = vec![0_u8; packet_size.max(ALVR_STREAM_SHARD_PREFIX_SIZE)];
@@ -1344,8 +1692,18 @@ fn receive_alvr_udp_stream(
     let game_audio_output = game_audio_output;
 
     loop {
+        if shutdown_requested.load(Ordering::Acquire) {
+            info!("ALVR UDP stream receiver exiting after session shutdown request");
+            break;
+        }
+
         match socket.recv(&mut buffer) {
             Ok(len) if len >= ALVR_STREAM_SHARD_PREFIX_SIZE => {
+                if shutdown_requested.load(Ordering::Acquire) {
+                    info!("ALVR UDP stream receiver exiting after session shutdown request");
+                    break;
+                }
+
                 shards += 1;
 
                 let stream_id = u16::from_le_bytes(buffer[0..2].try_into().unwrap());
@@ -1366,6 +1724,11 @@ fn receive_alvr_udp_stream(
                         shard_index,
                         &buffer[ALVR_STREAM_SHARD_PREFIX_SIZE..len],
                     ) {
+                        if shutdown_requested.load(Ordering::Acquire) {
+                            info!("ALVR UDP stream receiver exiting after session shutdown request");
+                            break;
+                        }
+
                         if !waiting_for_idr {
                             if let Some(previous) = last_completed_video_packet_index {
                                 let expected = previous.wrapping_add(1);
@@ -1377,8 +1740,12 @@ fn receive_alvr_udp_stream(
                                             packet_index
                                         );
                                     } else {
-                                        waiting_for_idr = true;
-                                        video_assembler.clear();
+                                        enter_waiting_for_idr(
+                                            &mut waiting_for_idr,
+                                            &mut video_assembler,
+                                            &mut last_completed_video_packet_index,
+                                            "video packet gap",
+                                        );
                                         warn!(
                                             "detected ALVR video packet gap: expected_packet_index={} got={} - waiting for next IDR",
                                             expected,
@@ -1472,7 +1839,16 @@ fn receive_alvr_udp_stream(
                         if submitted {
                             decoder_backpressure_drops = 0;
                         } else {
-                            waiting_for_idr = true;
+                            enter_waiting_for_idr(
+                                &mut waiting_for_idr,
+                                &mut video_assembler,
+                                &mut last_completed_video_packet_index,
+                                if packet.header.is_idr {
+                                    "decoder unavailable for IDR packet"
+                                } else {
+                                    "decoder saturation"
+                                },
+                            );
                             request_alvr_idr_if_due(
                                 &control_writer,
                                 if packet.header.is_idr {
@@ -1504,6 +1880,11 @@ fn receive_alvr_udp_stream(
                         shard_index,
                         &buffer[ALVR_STREAM_SHARD_PREFIX_SIZE..len],
                     ) {
+                        if shutdown_requested.load(Ordering::Acquire) {
+                            info!("ALVR UDP stream receiver exiting after session shutdown request");
+                            break;
+                        }
+
                         if let Some(output) = game_audio_output.as_ref() {
                             output.push_payload(&payload);
                         }
@@ -1548,6 +1929,11 @@ fn receive_alvr_udp_stream(
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
+                if shutdown_requested.load(Ordering::Acquire) {
+                    info!("ALVR UDP stream receiver observed shutdown while idle");
+                    break;
+                }
+                thread::sleep(Duration::from_millis(2));
                 continue;
             }
             Err(err) => {
@@ -1558,7 +1944,11 @@ fn receive_alvr_udp_stream(
     }
 }
 
-fn send_minimal_tracking_stream(socket: StdUdpSocket, max_packet_size: usize) {
+fn send_minimal_tracking_stream(
+    socket: StdUdpSocket,
+    max_packet_size: usize,
+    shutdown_requested: Arc<AtomicBool>,
+) {
     let head_id = hash_string(ALVR_HEAD_PATH);
     let start = Instant::now();
     let mut next_send = Instant::now();
@@ -1575,6 +1965,11 @@ fn send_minimal_tracking_stream(socket: StdUdpSocket, max_packet_size: usize) {
     );
 
     loop {
+        if shutdown_requested.load(Ordering::Acquire) {
+            info!("ALVR tracking sender exiting after session shutdown request");
+            break;
+        }
+
         let now = Instant::now();
         if now < next_send {
             thread::sleep((next_send - now).min(Duration::from_millis(5)));
@@ -1694,7 +2089,7 @@ fn send_alvr_stream_header_packet<H: Serialize>(
     Ok(bytes_sent)
 }
 
-fn maintain_alvr_control_socket(writer: SharedControlWriter) {
+fn maintain_alvr_control_socket(writer: SharedControlWriter, shutdown_requested: Arc<AtomicBool>) {
     let mut next_keepalive = Instant::now();
     let mut next_buttons_send = Instant::now();
     let mut last_views_config_version = latest_alvr_views_config().map(|state| state.version);
@@ -1707,11 +2102,21 @@ fn maintain_alvr_control_socket(writer: SharedControlWriter) {
     let mut last_left_button_debug_key: Option<(u32, u32, bool, bool)> = None;
 
     loop {
+        if shutdown_requested.load(Ordering::Acquire) {
+            info!("ALVR control maintenance thread exiting after session shutdown request");
+            break;
+        }
+
         let now = Instant::now();
 
         if now >= next_keepalive {
             if let Err(err) = send_framed_locked(&writer, &ClientControlPacket::KeepAlive) {
                 warn!("ALVR control maintenance thread exiting after keepalive failure: {err:#}");
+                request_alvr_control_shutdown(
+                    &writer,
+                    &shutdown_requested,
+                    "keepalive send failure",
+                );
                 break;
             }
             keepalives_sent = keepalives_sent.wrapping_add(1);
@@ -1731,6 +2136,11 @@ fn maintain_alvr_control_socket(writer: SharedControlWriter) {
                 ) {
                     warn!(
                         "ALVR control maintenance thread exiting after LocalViewParams update failure: {err:#}"
+                    );
+                    request_alvr_control_shutdown(
+                        &writer,
+                        &shutdown_requested,
+                        "LocalViewParams update failure",
                     );
                     break;
                 }
@@ -1762,6 +2172,11 @@ fn maintain_alvr_control_socket(writer: SharedControlWriter) {
                         ) {
                             warn!(
                                 "ALVR control maintenance thread exiting after ActiveInteractionProfile send failure: {err:#}"
+                            );
+                            request_alvr_control_shutdown(
+                                &writer,
+                                &shutdown_requested,
+                                "ActiveInteractionProfile send failure",
                             );
                             profile_send_failed = true;
                             break;
@@ -1815,6 +2230,11 @@ fn maintain_alvr_control_socket(writer: SharedControlWriter) {
                     send_framed_locked(&writer, &ClientControlPacket::Buttons(entries))
                 {
                     warn!("ALVR control maintenance thread exiting after Buttons send failure: {err:#}");
+                    request_alvr_control_shutdown(
+                        &writer,
+                        &shutdown_requested,
+                        "Buttons send failure",
+                    );
                     break;
                 }
                 buttons_sent = buttons_sent.wrapping_add(1);
@@ -2250,6 +2670,117 @@ fn send_framed_locked<S: Serialize>(writer: &SharedControlWriter, packet: &S) ->
     send_framed(&mut stream, packet)
 }
 
+fn read_exact_until_shutdown(
+    stream: &mut StdTcpStream,
+    buffer: &mut [u8],
+    shutdown_requested: &Arc<AtomicBool>,
+    context: &'static str,
+) -> Result<()> {
+    let mut read = 0;
+    while read < buffer.len() {
+        if shutdown_requested.load(Ordering::Acquire) {
+            bail!("ALVR control session shutdown requested while waiting to {context}");
+        }
+
+        wait_for_alvr_control_read_ready(stream, shutdown_requested, context)?;
+
+        match read_alvr_control_socket(stream, &mut buffer[read..]) {
+            Ok(0) => bail!("ALVR control socket closed while trying to {context}"),
+            Ok(bytes_read) => {
+                read += bytes_read;
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(err) => return Err(err).with_context(|| format!("{context}")),
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+fn read_alvr_control_socket(stream: &mut StdTcpStream, buffer: &mut [u8]) -> std::io::Result<usize> {
+    let result = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            libc::MSG_DONTWAIT,
+        )
+    };
+
+    if result >= 0 {
+        return Ok(result as usize);
+    }
+
+    Err(std::io::Error::last_os_error())
+}
+
+#[cfg(not(target_os = "android"))]
+fn read_alvr_control_socket(stream: &mut StdTcpStream, buffer: &mut [u8]) -> std::io::Result<usize> {
+    stream.read(buffer)
+}
+
+#[cfg(target_os = "android")]
+fn wait_for_alvr_control_read_ready(
+    stream: &StdTcpStream,
+    shutdown_requested: &Arc<AtomicBool>,
+    context: &'static str,
+) -> Result<()> {
+    const ALVR_CONTROL_POLL_INTERVAL_MS: i32 = 100;
+
+    loop {
+        if shutdown_requested.load(Ordering::Acquire) {
+            bail!("ALVR control session shutdown requested while waiting to {context}");
+        }
+
+        let mut poll_fd = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut poll_fd, 1, ALVR_CONTROL_POLL_INTERVAL_MS) };
+
+        if result > 0 {
+            if poll_fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                bail!("ALVR control socket became invalid while trying to {context}");
+            }
+
+            return Ok(());
+        }
+
+        if result == 0 {
+            continue;
+        }
+
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+
+        return Err(err).with_context(|| format!("poll ALVR control socket to {context}"));
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn wait_for_alvr_control_read_ready(
+    _stream: &StdTcpStream,
+    shutdown_requested: &Arc<AtomicBool>,
+    context: &'static str,
+) -> Result<()> {
+    if shutdown_requested.load(Ordering::Acquire) {
+        bail!("ALVR control session shutdown requested while waiting to {context}");
+    }
+
+    Ok(())
+}
+
 fn recv_framed<R: DeserializeOwned>(stream: &mut StdTcpStream) -> Result<R> {
     let mut len_bytes = [0_u8; 4];
     stream
@@ -2268,6 +2799,42 @@ fn recv_framed<R: DeserializeOwned>(stream: &mut StdTcpStream) -> Result<R> {
         bincode::serde::decode_from_slice(&payload, bincode::config::standard())
             .context("deserialize ALVR framed packet")?;
     Ok(value)
+}
+
+fn recv_framed_until_shutdown<R: DeserializeOwned>(
+    stream: &mut StdTcpStream,
+    shutdown_requested: &Arc<AtomicBool>,
+) -> Result<R> {
+    let mut len_bytes = [0_u8; 4];
+    read_exact_until_shutdown(
+        stream,
+        &mut len_bytes,
+        shutdown_requested,
+        "read ALVR frame length",
+    )?;
+    let len = u32::from_le_bytes(len_bytes) as usize;
+    if len > 64 * 1024 * 1024 {
+        bail!("ALVR frame too large: {len} bytes");
+    }
+
+    let mut payload = vec![0_u8; len];
+    read_exact_until_shutdown(
+        stream,
+        &mut payload,
+        shutdown_requested,
+        "read ALVR frame payload",
+    )?;
+    let (value, _consumed) =
+        bincode::serde::decode_from_slice(&payload, bincode::config::standard())
+            .context("deserialize ALVR framed packet")?;
+    Ok(value)
+}
+
+fn same_decoder_config(
+    previous: &(CodecType, Vec<u8>),
+    current: &DecoderInitializationConfig,
+) -> bool {
+    previous.0 == current.codec && previous.1 == current.config_buffer
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2674,6 +3241,30 @@ mod tests {
         assert_eq!(alvr_protocol_string("not-a-version"), "not-a-version");
     }
 
+    #[test]
+    fn discovery_heartbeat_targets_include_broadcast_and_directed_ipv4() {
+        let targets =
+            discovery_heartbeat_targets(Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 44))), 9943);
+
+        assert_eq!(
+            targets,
+            vec![
+                SocketAddr::from((Ipv4Addr::BROADCAST, 9943)),
+                SocketAddr::from((Ipv4Addr::new(192, 168, 1, 44), 9943)),
+            ]
+        );
+    }
+
+    #[test]
+    fn discovery_heartbeat_targets_ignore_non_ipv4_directed_targets() {
+        let targets = discovery_heartbeat_targets(
+            Some(IpAddr::V6("fe80::1".parse().unwrap())),
+            DISCOVERY_PORT,
+        );
+
+        assert_eq!(targets, vec![SocketAddr::from((Ipv4Addr::BROADCAST, DISCOVERY_PORT))]);
+    }
+
     // Regression: bincode 2 with `config::standard()` encodes enum variant
     // indices as varints. The ALVR master server matches by ordinal — reorder
     // the variants and the server mis-decodes every control packet. Variant
@@ -2718,5 +3309,127 @@ mod tests {
             decoded.global_view_params[0].pose.position,
             header.global_view_params[0].pose.position
         );
+    }
+
+    #[test]
+    fn stream_session_drop_requests_shutdown_and_clears_statistics_state() {
+        reset_alvr_statistics_state();
+
+        let shutdown_requested = {
+            let session = AlvrStreamSession::new(99, None, None);
+            let shutdown_requested = session.shutdown_signal();
+            assert!(!shutdown_requested.load(Ordering::Acquire));
+            shutdown_requested
+        };
+
+        assert!(shutdown_requested.load(Ordering::Acquire));
+        assert!(ALVR_STATISTICS_STATE.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn enter_waiting_for_idr_clears_video_continuity_state() {
+        let mut waiting_for_idr = false;
+        let mut video_assembler = VideoPacketAssembler::new(16);
+        video_assembler.packets.insert(
+            7,
+            PartialVideoPacket {
+                shards_count: 2,
+                received: vec![true, false],
+                received_count: 1,
+                data: vec![1, 2, 3],
+                first_seen: Instant::now(),
+            },
+        );
+        let mut last_completed_video_packet_index = Some(42);
+
+        enter_waiting_for_idr(
+            &mut waiting_for_idr,
+            &mut video_assembler,
+            &mut last_completed_video_packet_index,
+            "test reset",
+        );
+
+        assert!(waiting_for_idr);
+        assert!(video_assembler.packets.is_empty());
+        assert_eq!(last_completed_video_packet_index, None);
+    }
+
+    #[test]
+    fn request_alvr_control_shutdown_marks_session_and_closes_socket() {
+        let listener =
+            StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback control socket");
+        let addr = listener.local_addr().expect("listener local addr");
+        let client = StdTcpStream::connect(addr).expect("connect loopback control socket");
+        let (mut server, _) = listener.accept().expect("accept loopback control socket");
+        server
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("set server read timeout");
+
+        let writer = Arc::new(Mutex::new(client));
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+
+        request_alvr_control_shutdown(&writer, &shutdown_requested, "unit test");
+
+        assert!(shutdown_requested.load(Ordering::Acquire));
+
+        let mut byte = [0_u8; 1];
+        let read = server.read(&mut byte).expect("server observes peer shutdown");
+        assert_eq!(read, 0);
+    }
+
+    #[test]
+    fn recv_framed_until_shutdown_exits_when_session_shutdown_is_requested() {
+        let listener =
+            StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback control socket");
+        let addr = listener.local_addr().expect("listener local addr");
+        let client = StdTcpStream::connect(addr).expect("connect loopback control socket");
+        let (mut server, _) = listener.accept().expect("accept loopback control socket");
+        client
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("set client read timeout");
+        server
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("set server read timeout");
+
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let shutdown_signal = Arc::clone(&shutdown_requested);
+        let wake_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(120));
+            shutdown_signal.store(true, Ordering::Release);
+        });
+
+        let result = recv_framed_until_shutdown::<ServerControlPacket>(&mut server, &shutdown_requested);
+        wake_thread.join().expect("join shutdown wake thread");
+
+        let err = result.expect_err("shutdown should interrupt framed recv");
+        assert!(
+            err.to_string()
+                .contains("ALVR control session shutdown requested"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn same_decoder_config_detects_exact_duplicates_only() {
+        let previous = (CodecType::Hevc, vec![1, 2, 3, 4]);
+        let same = DecoderInitializationConfig {
+            codec: CodecType::Hevc,
+            config_buffer: vec![1, 2, 3, 4],
+            ext_str: String::new(),
+        };
+        let different_codec = DecoderInitializationConfig {
+            codec: CodecType::H264,
+            config_buffer: vec![1, 2, 3, 4],
+            ext_str: String::new(),
+        };
+        let different_bytes = DecoderInitializationConfig {
+            codec: CodecType::Hevc,
+            config_buffer: vec![1, 2, 3, 5],
+            ext_str: String::new(),
+        };
+
+        assert!(same_decoder_config(&previous, &same));
+        assert!(!same_decoder_config(&previous, &different_codec));
+        assert!(!same_decoder_config(&previous, &different_bytes));
     }
 }
