@@ -96,7 +96,7 @@
 //! adb shell cat /sdcard/Android/data/com.pimax.alvr.client/files/PimaxALVR/client.json
 //! ```
 
-use std::{sync::Once, thread, time::Duration};
+use std::{net::IpAddr, sync::Once, thread, time::Duration};
 
 use android_logger::Config as AndroidLoggerConfig;
 use anyhow::{Context, Result};
@@ -212,6 +212,11 @@ fn run_inner() -> Result<()> {
                 loop {
                     if let Err(err) = discovery_client.announce() {
                         warn!("mDNS announce #{iteration} failed: {err:#}");
+                    }
+                    let directed_server_ip = crate::tune::get_server_ip().parse::<IpAddr>().ok();
+                    if let Err(err) = discovery_client.send_discovery_heartbeat(directed_server_ip)
+                    {
+                        warn!("ALVR discovery heartbeat #{iteration} failed: {err:#}");
                     }
                     iteration = iteration.wrapping_add(1);
                     thread::sleep(Duration::from_secs(5));

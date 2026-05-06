@@ -16,3 +16,7 @@ pub fn eye_render_scale() -> f32 {
 pub fn fov_scale() -> f32 {
     FOV_SCALE_DEFAULT
 }
+
+pub fn get_server_ip() -> String {
+    String::new()
+}
