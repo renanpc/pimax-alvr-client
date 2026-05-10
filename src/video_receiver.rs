@@ -420,6 +420,9 @@ struct BlitProgram {
     texture_target: u32,
     texture_target_label: &'static str,
     texture_uniform: i32,
+    black_crush_uniform: i32,
+    color_gain_uniform: i32,
+    hdr_mode_uniform: i32,
     uv_rect_uniform: i32,
     foveation_enabled_uniform: i32,
     view_index_uniform: i32,
@@ -1591,6 +1594,9 @@ fn get_blit_program() -> Result<BlitProgram> {
             texture_target: existing.texture_target,
             texture_target_label: existing.texture_target_label,
             texture_uniform: existing.texture_uniform,
+            black_crush_uniform: existing.black_crush_uniform,
+            color_gain_uniform: existing.color_gain_uniform,
+            hdr_mode_uniform: existing.hdr_mode_uniform,
             uv_rect_uniform: existing.uv_rect_uniform,
             foveation_enabled_uniform: existing.foveation_enabled_uniform,
             view_index_uniform: existing.view_index_uniform,
@@ -1612,6 +1618,9 @@ fn get_blit_program() -> Result<BlitProgram> {
         texture_target: created.texture_target,
         texture_target_label: created.texture_target_label,
         texture_uniform: created.texture_uniform,
+        black_crush_uniform: created.black_crush_uniform,
+        color_gain_uniform: created.color_gain_uniform,
+        hdr_mode_uniform: created.hdr_mode_uniform,
         uv_rect_uniform: created.uv_rect_uniform,
         foveation_enabled_uniform: created.foveation_enabled_uniform,
         view_index_uniform: created.view_index_uniform,
@@ -1634,6 +1643,9 @@ fn get_external_blit_program() -> Result<BlitProgram> {
             texture_target: existing.texture_target,
             texture_target_label: existing.texture_target_label,
             texture_uniform: existing.texture_uniform,
+            black_crush_uniform: existing.black_crush_uniform,
+            color_gain_uniform: existing.color_gain_uniform,
+            hdr_mode_uniform: existing.hdr_mode_uniform,
             uv_rect_uniform: existing.uv_rect_uniform,
             foveation_enabled_uniform: existing.foveation_enabled_uniform,
             view_index_uniform: existing.view_index_uniform,
@@ -1654,6 +1666,9 @@ fn get_external_blit_program() -> Result<BlitProgram> {
         texture_target: created.texture_target,
         texture_target_label: created.texture_target_label,
         texture_uniform: created.texture_uniform,
+        black_crush_uniform: created.black_crush_uniform,
+        color_gain_uniform: created.color_gain_uniform,
+        hdr_mode_uniform: created.hdr_mode_uniform,
         uv_rect_uniform: created.uv_rect_uniform,
         foveation_enabled_uniform: created.foveation_enabled_uniform,
         view_index_uniform: created.view_index_uniform,
@@ -1976,6 +1991,16 @@ fn create_blit_program(use_external_texture: bool) -> Result<BlitProgram> {
     } else {
         "precision highp float;\nuniform sampler2D u_texture;"
     };
+    let color_correction_declaration = if use_external_texture {
+        "uniform float u_black_crush;\nuniform float u_color_gain;\nuniform int u_hdr_mode;"
+    } else {
+        ""
+    };
+    let color_correction_body = if use_external_texture {
+        "    color.rgb = (color.rgb - u_black_crush) * u_color_gain;\n    if (u_hdr_mode == 0) {\n        color.rgb = clamp(color.rgb, 0.0, 1.0);\n    }\n"
+    } else {
+        ""
+    };
 
     let vertex_shader = compile_shader(
         GL_VERTEX_SHADER,
@@ -2006,6 +2031,7 @@ void main() {
     let fragment_source = format!(
         r#"#version 300 es
 {sampler_declaration}
+{color_correction_declaration}
 uniform vec4 u_uv_rect;
 uniform int u_enable_foveation;
 uniform int u_view_index;
@@ -2075,7 +2101,8 @@ vec2 apply_foveation(vec2 uv) {{
 void main() {{
     vec2 corrected_uv = clamp(apply_foveation(v_uv), vec2(0.0), vec2(1.0));
     vec2 sample_uv = mix(u_uv_rect.xy, u_uv_rect.zw, corrected_uv);
-    out_color = texture(u_texture, sample_uv);
+    vec4 color = texture(u_texture, sample_uv);
+{color_correction_body}    out_color = color;
 }}
 "#,
     );
@@ -2097,6 +2124,21 @@ void main() {{
         unsafe { glGetUniformLocation(linked, texture_name.as_ptr().cast::<i8>()) };
     let uv_rect_uniform =
         unsafe { glGetUniformLocation(linked, uv_rect_name.as_ptr().cast::<i8>()) };
+    let black_crush_uniform = if use_external_texture {
+        uniform_location(linked, "u_black_crush")?
+    } else {
+        -1
+    };
+    let color_gain_uniform = if use_external_texture {
+        uniform_location(linked, "u_color_gain")?
+    } else {
+        -1
+    };
+    let hdr_mode_uniform = if use_external_texture {
+        uniform_location(linked, "u_hdr_mode")?
+    } else {
+        -1
+    };
     let foveation_enabled_uniform = uniform_location(linked, "u_enable_foveation")?;
     let view_index_uniform = uniform_location(linked, "u_view_index")?;
     let position_offset_x_uniform = uniform_location(linked, "u_position_offset_x")?;
@@ -2121,6 +2163,9 @@ void main() {{
         texture_target,
         texture_target_label,
         texture_uniform,
+        black_crush_uniform,
+        color_gain_uniform,
+        hdr_mode_uniform,
         uv_rect_uniform,
         foveation_enabled_uniform,
         view_index_uniform,
@@ -2706,6 +2751,15 @@ fn blit_texture_to_eye(
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(blit_program.texture_target, texture);
         glUniform1i(blit_program.texture_uniform, 0);
+        if blit_program.black_crush_uniform >= 0 {
+            let (black_crush, color_gain) = stream_color_adjustment();
+            glUniform1f(blit_program.black_crush_uniform, black_crush);
+            glUniform1f(blit_program.color_gain_uniform, color_gain);
+            glUniform1i(
+                blit_program.hdr_mode_uniform,
+                if hdr_stream_enabled() { 1 } else { 0 },
+            );
+        }
         glUniform4f(blit_program.uv_rect_uniform, u0, v0, u1, v1);
         glUniform1i(blit_program.foveation_enabled_uniform, 0); // TODO: foveation for zero-copy
         glUniform1i(blit_program.view_index_uniform, view_index);
@@ -2721,7 +2775,7 @@ fn blit_texture_to_eye(
             let pass2_stats =
                 readback_framebuffer_luma_stats(target.framebuffer, target.width, target.height);
             info!(
-                "{stats_label}: eye={:?} target={}x{} center_pixel={:?} luma_avg={:.1} dark_pct={:.1} bright_pct={:.1} gl_errors={:?}",
+                "{stats_label}: eye={:?} target={}x{} center_pixel={:?} luma_avg={:.1} dark_pct={:.1} bright_pct={:.1} gl_errors={:?} corrected={} hdr_stream={}",
                 eye,
                 target.width,
                 target.height,
@@ -2730,6 +2784,8 @@ fn blit_texture_to_eye(
                 pass2_stats.dark_percent,
                 pass2_stats.bright_percent,
                 pass2_errors,
+                blit_program.black_crush_uniform >= 0,
+                hdr_stream_enabled(),
             );
         }
     }
