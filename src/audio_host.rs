@@ -111,6 +111,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn host_game_audio_output_starts_without_microphone_permission() {
+        set_microphone_permission_granted(false);
+
+        let output = start_game_audio_output(
+            48_000,
+            AudioBufferingConfig {
+                average_buffering_ms: 10,
+                batch_ms: 10,
+            },
+        );
+
+        assert!(output.is_ok());
+    }
+
+    #[test]
     fn host_game_audio_output_buffers_payloads_like_android_path() {
         let output = start_game_audio_output(
             48_000,
