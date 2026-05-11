@@ -157,7 +157,7 @@ use std::{
     mem,
     path::PathBuf,
     ptr,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
     thread,
     time::{Duration, Instant},
 };
@@ -189,11 +189,108 @@ static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// Raised when the headset comes back on-face or the screen reports itself on again.
 static PRESENTATION_REFRESH_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Global flag that asks the ALVR control thread to reassert stream continuity after a native
+/// presentation refresh.
+///
+/// Lifecycle recovery can leave stale decoded surfaces and pre-interruption timestamps around.
+/// After we reassert Pimax presentation state, request a fresh ALVR keyframe so rendering resumes
+/// from a clean decoder output.
+static ALVR_STREAM_RECOVERY_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Latest Android activity lifecycle phase mirrored from {@code VrRenderActivity}.
+static ACTIVITY_LIFECYCLE_STATE: AtomicU8 = AtomicU8::new(PimaxActivityLifecycleState::New as u8);
+
 /// Latest headset proximity state reported by the Android activity.
 ///
 /// The render loop uses this to avoid waking the panel immediately after Pimax's
 /// own proximity state-machine has intentionally put it to sleep off-head.
 static HEADSET_NEAR: AtomicBool = AtomicBool::new(false);
+
+/// Latest screen state reported by the Android activity.
+///
+/// Presentation refresh should wait until the panel path is reported on again, not merely until
+/// the activity is resumed.
+static SCREEN_ON: AtomicBool = AtomicBool::new(true);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum PimaxActivityLifecycleState {
+    New = 0,
+    Created = 1,
+    Resumed = 2,
+    Paused = 3,
+    Stopped = 4,
+    Destroyed = 5,
+}
+
+impl PimaxActivityLifecycleState {
+    fn from_java_value(value: i32) -> Option<Self> {
+        match value {
+            0 => Some(Self::New),
+            1 => Some(Self::Created),
+            2 => Some(Self::Resumed),
+            3 => Some(Self::Paused),
+            4 => Some(Self::Stopped),
+            5 => Some(Self::Destroyed),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::New => "New",
+            Self::Created => "Created",
+            Self::Resumed => "Resumed",
+            Self::Paused => "Paused",
+            Self::Stopped => "Stopped",
+            Self::Destroyed => "Destroyed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(i32)]
+enum PimaxPresentationRefreshReason {
+    ActivityResume = 1,
+    WindowFocusGain = 2,
+    NativeReady = 3,
+}
+
+impl PimaxPresentationRefreshReason {
+    fn from_java_value(value: i32) -> Option<Self> {
+        match value {
+            1 => Some(Self::ActivityResume),
+            2 => Some(Self::WindowFocusGain),
+            3 => Some(Self::NativeReady),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::ActivityResume => "activity resume",
+            Self::WindowFocusGain => "window focus gain",
+            Self::NativeReady => "native ready",
+        }
+    }
+}
+
+fn current_activity_lifecycle_state() -> PimaxActivityLifecycleState {
+    PimaxActivityLifecycleState::from_java_value(
+        ACTIVITY_LIFECYCLE_STATE.load(Ordering::SeqCst) as i32
+    )
+    .unwrap_or(PimaxActivityLifecycleState::New)
+}
+
+fn set_activity_lifecycle_state(state: PimaxActivityLifecycleState) {
+    let previous = current_activity_lifecycle_state();
+    ACTIVITY_LIFECYCLE_STATE.store(state as u8, Ordering::SeqCst);
+    info!(
+        "Pimax activity lifecycle changed: {} -> {}",
+        previous.label(),
+        state.label()
+    );
+}
 
 /// Check if shutdown has been requested
 fn is_shutdown_requested() -> bool {
@@ -214,12 +311,37 @@ fn request_presentation_refresh(reason: &str) {
     log::info!("Pimax presentation refresh requested: {reason}");
 }
 
-fn take_presentation_refresh_requested() -> bool {
+fn is_presentation_refresh_requested() -> bool {
+    PRESENTATION_REFRESH_REQUESTED.load(Ordering::SeqCst)
+}
+
+fn clear_presentation_refresh_requested() -> bool {
     PRESENTATION_REFRESH_REQUESTED.swap(false, Ordering::SeqCst)
+}
+
+fn request_alvr_stream_recovery(reason: &str) {
+    ALVR_STREAM_RECOVERY_REQUESTED.store(true, Ordering::SeqCst);
+    info!("Pimax requested ALVR stream recovery: {reason}");
+}
+
+pub(crate) fn take_alvr_stream_recovery_request() -> bool {
+    ALVR_STREAM_RECOVERY_REQUESTED.swap(false, Ordering::SeqCst)
 }
 
 fn is_headset_near() -> bool {
     HEADSET_NEAR.load(Ordering::SeqCst)
+}
+
+fn is_screen_on() -> bool {
+    SCREEN_ON.load(Ordering::SeqCst)
+}
+
+fn should_refresh_presentation_now(
+    lifecycle_state: PimaxActivityLifecycleState,
+    headset_near: bool,
+    screen_on: bool,
+) -> bool {
+    lifecycle_state == PimaxActivityLifecycleState::Resumed && headset_near && screen_on
 }
 
 #[no_mangle]
@@ -237,6 +359,32 @@ pub extern "system" fn Java_com_pimax_alvr_client_VrRenderActivity_nativeResetSh
 ) {
     reset_shutdown_requested();
     log::info!("Pimax shutdown reset: VrRenderActivity active");
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_pimax_alvr_client_VrRenderActivity_nativeSetLifecycleState(
+    _env: jni::JNIEnv<'_>,
+    _class: JClass<'_>,
+    state: jni::sys::jint,
+) {
+    let Some(state) = PimaxActivityLifecycleState::from_java_value(state) else {
+        warn!("ignoring invalid Java lifecycle state value {state}");
+        return;
+    };
+    set_activity_lifecycle_state(state);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_pimax_alvr_client_VrRenderActivity_nativeRequestPresentationRefresh(
+    _env: jni::JNIEnv<'_>,
+    _class: JClass<'_>,
+    reason_code: jni::sys::jint,
+) {
+    let Some(reason) = PimaxPresentationRefreshReason::from_java_value(reason_code) else {
+        warn!("ignoring invalid Java presentation refresh reason {reason_code}");
+        return;
+    };
+    request_presentation_refresh(reason.label());
 }
 
 #[no_mangle]
@@ -269,6 +417,7 @@ pub extern "system" fn Java_com_pimax_alvr_client_VrRenderActivity_nativeNotifyS
     is_screen_on: jni::sys::jboolean,
 ) {
     let is_screen_on = is_screen_on != 0;
+    SCREEN_ON.store(is_screen_on, Ordering::SeqCst);
     info!("Pimax screen state changed: on={is_screen_on}");
     if is_screen_on && is_headset_near() {
         request_presentation_refresh("screen on");
@@ -522,6 +671,10 @@ pub const PIMAX_EYE_RENDER_SCALE_DEFAULT: f32 = 1.0;
 const PIMAX_HIDE_SYSTEM_UI_EVERY_N_FRAMES: i32 = 120;
 const PIMAX_UV_MAP_SAMPLES: i32 = 50;
 const PIMAX_ENABLE_UV_MAP_HACK: bool = false;
+// Crystal OG eye-target submission is currently stable with SDR RGBA8 targets.
+// Allowing the runtime to rebuild submitted eye textures for HDR has been
+// producing black submitted frames immediately after the rebuild.
+const PIMAX_ENABLE_HDR_EYE_TARGETS: bool = false;
 const PIMAX_CONFIGURE_TEXTURE_METADATA: bool = true;
 const PIMAX_RENDER_DIAGNOSTIC_PATTERN: bool = false;
 const PIMAX_ANIMATE_DIAGNOSTIC_PATTERN: bool = false;
@@ -957,10 +1110,7 @@ fn configure_activity_window() {
 
     ndk_glue::native_activity().set_window_format(HardwareBufferFormat::R8G8B8A8_UNORM);
     ndk_glue::native_activity().set_window_flags(
-        WindowFlags::KEEP_SCREEN_ON
-            | WindowFlags::TURN_SCREEN_ON
-            | WindowFlags::SHOW_WHEN_LOCKED
-            | WindowFlags::FULLSCREEN,
+        WindowFlags::TURN_SCREEN_ON | WindowFlags::SHOW_WHEN_LOCKED | WindowFlags::FULLSCREEN,
         WindowFlags::empty(),
     );
 }
@@ -1059,12 +1209,15 @@ fn acquire_display_wake_lock(env: &mut jni::JNIEnv<'_>, wake_lock: &GlobalRef) -
     Ok(())
 }
 
-fn release_display_wake_lock(env: &mut jni::JNIEnv<'_>, wake_lock: &GlobalRef) -> Result<()> {
-    let held = env
-        .call_method(wake_lock.as_obj(), "isHeld", "()Z", &[])
+fn is_display_wake_lock_held(env: &mut jni::JNIEnv<'_>, wake_lock: &GlobalRef) -> Result<bool> {
+    env.call_method(wake_lock.as_obj(), "isHeld", "()Z", &[])
         .context("query display wake lock held state")?
         .z()
-        .context("decode display wake lock held state")?;
+        .context("decode display wake lock held state")
+}
+
+fn release_display_wake_lock(env: &mut jni::JNIEnv<'_>, wake_lock: &GlobalRef) -> Result<()> {
+    let held = is_display_wake_lock_held(env, wake_lock)?;
     if held {
         env.call_method(wake_lock.as_obj(), "release", "()V", &[])
             .context("release display wake lock")?;
@@ -2628,6 +2781,75 @@ mod tests {
 
         assert_eq!(parsed.thumbstick_x, -1.0);
         assert_eq!(parsed.thumbstick_y, 1.0);
+    }
+
+    #[test]
+    fn pimax_activity_lifecycle_state_maps_java_values() {
+        assert_eq!(
+            PimaxActivityLifecycleState::from_java_value(2),
+            Some(PimaxActivityLifecycleState::Resumed)
+        );
+        assert_eq!(
+            PimaxActivityLifecycleState::from_java_value(5),
+            Some(PimaxActivityLifecycleState::Destroyed)
+        );
+        assert_eq!(PimaxActivityLifecycleState::from_java_value(9), None);
+    }
+
+    #[test]
+    fn pimax_presentation_refresh_reason_labels_are_stable() {
+        assert_eq!(
+            PimaxPresentationRefreshReason::from_java_value(1)
+                .expect("resume refresh reason should exist")
+                .label(),
+            "activity resume"
+        );
+        assert_eq!(
+            PimaxPresentationRefreshReason::from_java_value(3)
+                .expect("native-ready refresh reason should exist")
+                .label(),
+            "native ready"
+        );
+        assert_eq!(PimaxPresentationRefreshReason::from_java_value(99), None);
+    }
+
+    #[test]
+    fn presentation_refresh_requires_resumed_lifecycle_and_near_headset() {
+        assert!(should_refresh_presentation_now(
+            PimaxActivityLifecycleState::Resumed,
+            true,
+            true
+        ));
+        assert!(!should_refresh_presentation_now(
+            PimaxActivityLifecycleState::Paused,
+            true,
+            true
+        ));
+        assert!(!should_refresh_presentation_now(
+            PimaxActivityLifecycleState::Stopped,
+            true,
+            true
+        ));
+        assert!(!should_refresh_presentation_now(
+            PimaxActivityLifecycleState::Resumed,
+            false,
+            true
+        ));
+        assert!(!should_refresh_presentation_now(
+            PimaxActivityLifecycleState::Resumed,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn alvr_stream_recovery_request_is_one_shot() {
+        ALVR_STREAM_RECOVERY_REQUESTED.store(false, Ordering::SeqCst);
+
+        request_alvr_stream_recovery("test");
+
+        assert!(take_alvr_stream_recovery_request());
+        assert!(!take_alvr_stream_recovery_request());
     }
 }
 
@@ -4274,10 +4496,9 @@ fn use_hardware_buffer_eye_targets() -> bool {
     false
 }
 
-fn create_eye_render_target(width: i32, height: i32) -> Result<EyeRenderTarget> {
+fn create_eye_render_target(width: i32, height: i32, is_hdr: bool) -> Result<EyeRenderTarget> {
     let width = width.max(1);
     let height = height.max(1);
-    let is_hdr = crate::video_receiver::hdr_stream_enabled();
     if use_hardware_buffer_eye_targets() {
         match create_hardware_buffer_eye_render_target(width, height) {
             Ok(target) => {
@@ -4975,7 +5196,10 @@ fn refresh_pimax_presentation(
     pvr_service_client: Option<&GlobalRef>,
     reason: &str,
 ) {
-    info!("refreshing Pimax presentation state: {reason}");
+    info!(
+        "refreshing Pimax presentation state: reason={reason} lifecycle={}",
+        current_activity_lifecycle_state().label()
+    );
 
     let mut temp_client_connected = false;
 
@@ -5101,10 +5325,16 @@ fn try_begin_and_submit_frame<'local>(
     info!("requested NativeActivity headset window flags");
     let display_wake_lock = match create_display_wake_lock(env, context) {
         Ok(wake_lock) => {
-            if let Err(err) = acquire_display_wake_lock(env, &wake_lock) {
-                warn!("failed to acquire display wake lock: {err:#}");
+            if is_headset_near() {
+                if let Err(err) = acquire_display_wake_lock(env, &wake_lock) {
+                    warn!("failed to acquire display wake lock: {err:#}");
+                } else {
+                    info!("acquired display wake lock for headset session");
+                }
             } else {
-                info!("acquired display wake lock for headset session");
+                info!(
+                    "created display wake lock for headset session but left it released while headset proximity is far"
+                );
             }
             Some(wake_lock)
         }
@@ -5522,14 +5752,18 @@ fn try_begin_and_submit_frame<'local>(
         render_eye_height,
         crate::tune::eye_render_scale()
     );
+    let initial_hdr_enabled =
+        PIMAX_ENABLE_HDR_EYE_TARGETS && crate::video_receiver::hdr_stream_enabled();
     let mut eye_buffers = Vec::new();
     for pair_index in 0..PIMAX_EYE_BUFFER_PAIR_COUNT {
-        let left = create_eye_render_target(render_eye_width, render_eye_height)
-            .with_context(|| format!("create left eye render target {pair_index}"))?;
-        let right = create_eye_render_target(render_eye_width, render_eye_height)
-            .with_context(|| format!("create right eye render target {pair_index}"))?;
+        let left =
+            create_eye_render_target(render_eye_width, render_eye_height, initial_hdr_enabled)
+                .with_context(|| format!("create left eye render target {pair_index}"))?;
+        let right =
+            create_eye_render_target(render_eye_width, render_eye_height, initial_hdr_enabled)
+                .with_context(|| format!("create right eye render target {pair_index}"))?;
         info!(
-            "created eye render target pair {pair_index}: left(tex={}, fb={}) right(tex={}, fb={}) size={}x{}",
+            "created eye render target pair {pair_index}: left(tex={}, fb={}) right(tex={}, fb={}) size={}x{} hdr={initial_hdr_enabled}",
             left.texture,
             left.framebuffer,
             right.texture,
@@ -5728,7 +5962,14 @@ fn try_begin_and_submit_frame<'local>(
             info!("Pimax render loop exiting after shutdown request at frame {frame_index}");
             break;
         }
-        let hdr_enabled = crate::video_receiver::hdr_stream_enabled();
+        let stream_hdr_enabled = crate::video_receiver::hdr_stream_enabled();
+        if stream_hdr_enabled
+            && !PIMAX_ENABLE_HDR_EYE_TARGETS
+            && (frame_index < 5 || frame_index % 120 == 0)
+        {
+            info!("keeping Pimax submitted eye targets in SDR despite HDR stream flag");
+        }
+        let hdr_enabled = PIMAX_ENABLE_HDR_EYE_TARGETS && stream_hdr_enabled;
         let desired_render_eye_width = scaled_eye_dimension(eye_width);
         let desired_render_eye_height = scaled_eye_dimension(eye_height);
         let eye_targets_hdr = eye_buffers
@@ -5747,10 +5988,14 @@ fn try_begin_and_submit_frame<'local>(
             );
             eye_buffers.clear();
             for pair_index in 0..PIMAX_EYE_BUFFER_PAIR_COUNT {
-                let left = create_eye_render_target(render_eye_width, render_eye_height)
-                    .with_context(|| format!("recreate left eye render target {pair_index}"))?;
-                let right = create_eye_render_target(render_eye_width, render_eye_height)
-                    .with_context(|| format!("recreate right eye render target {pair_index}"))?;
+                let left =
+                    create_eye_render_target(render_eye_width, render_eye_height, hdr_enabled)
+                        .with_context(|| format!("recreate left eye render target {pair_index}"))?;
+                let right =
+                    create_eye_render_target(render_eye_width, render_eye_height, hdr_enabled)
+                        .with_context(|| {
+                            format!("recreate right eye render target {pair_index}")
+                        })?;
                 info!(
                     "recreated eye render target pair {pair_index}: left(tex={}, fb={}) right(tex={}, fb={}) size={}x{} hdr={}",
                     left.texture,
@@ -5790,20 +6035,41 @@ fn try_begin_and_submit_frame<'local>(
             }
             continue;
         }
-        if take_presentation_refresh_requested() {
-            if is_headset_near() {
-                if let Some(wake_lock) = display_wake_lock.as_ref() {
-                    if let Err(err) = acquire_display_wake_lock(env, wake_lock) {
-                        warn!("failed to acquire display wake lock for near-face refresh: {err:#}");
-                    } else {
-                        info!("acquired display wake lock for near-face refresh");
+        if is_presentation_refresh_requested() {
+            let lifecycle_state = current_activity_lifecycle_state();
+            let headset_near = is_headset_near();
+            let screen_on = is_screen_on();
+            if should_refresh_presentation_now(lifecycle_state, headset_near, screen_on) {
+                if clear_presentation_refresh_requested() {
+                    info!(
+                        "consuming deferred presentation refresh after lifecycle recovery: lifecycle={} headset_near={headset_near} screen_on={screen_on}",
+                        lifecycle_state.label()
+                    );
+                    if let Some(wake_lock) = display_wake_lock.as_ref() {
+                        if let Err(err) = acquire_display_wake_lock(env, wake_lock) {
+                            warn!(
+                                "failed to acquire display wake lock for near-face refresh: {err:#}"
+                            );
+                        } else {
+                            info!("acquired display wake lock for near-face refresh");
+                        }
                     }
+                    let controller_client =
+                        controller_runtime.as_ref().map(|runtime| &runtime.client);
+                    let presentation_client = controller_client.or(pvr_service_client);
+                    refresh_pimax_presentation(env, context, presentation_client, "near-face wake");
+                    last_video_timestamps_by_slot.fill(None);
+                    if let Some(state) = diagnostic_pattern_state.as_mut() {
+                        state.last_marker_rects.fill(None);
+                    }
+                    crate::video_receiver::clear_latest_frame(video_receiver.as_ref());
+                    request_alvr_stream_recovery("native lifecycle presentation refresh");
                 }
-                let controller_client = controller_runtime.as_ref().map(|runtime| &runtime.client);
-                let presentation_client = controller_client.or(pvr_service_client);
-                refresh_pimax_presentation(env, context, presentation_client, "near-face wake");
-            } else {
-                info!("skipping presentation refresh while headset proximity is far");
+            } else if frame_index < 5 || frame_index % 120 == 0 {
+                info!(
+                    "deferring presentation refresh until lifecycle is resumed, headset is near, and screen is on: lifecycle={} headset_near={headset_near} screen_on={screen_on}",
+                    lifecycle_state.label()
+                );
             }
         }
 
@@ -6186,24 +6452,50 @@ fn try_begin_and_submit_frame<'local>(
         if frame_index >= 0 && frame_index % 30 == 0 {
             match is_power_interactive(env, context) {
                 Ok(true) => {
-                    if frame_index % 720 == 0 {
-                        if is_headset_near() {
+                    if is_headset_near() {
+                        if frame_index % 720 == 0 {
                             info!("display power is still interactive at frame {frame_index}");
-                        } else {
-                            info!(
-                                "display wake lock is holding the panel interactive while headset proximity is far at frame {frame_index}"
-                            );
+                        }
+                    } else if let Some(wake_lock) = display_wake_lock.as_ref() {
+                        match is_display_wake_lock_held(env, wake_lock) {
+                            Ok(true) => {
+                                if let Err(err) = release_display_wake_lock(env, wake_lock) {
+                                    warn!(
+                                        "failed to release display wake lock while headset proximity is far at frame {frame_index}: {err:#}"
+                                    );
+                                } else {
+                                    info!(
+                                        "released display wake lock while headset proximity is far at frame {frame_index}"
+                                    );
+                                }
+                            }
+                            Ok(false) => {
+                                if frame_index % 720 == 0 {
+                                    info!(
+                                        "display wake lock already released while headset proximity is far at frame {frame_index}"
+                                    );
+                                }
+                            }
+                            Err(err) => warn!(
+                                "failed to query display wake lock state while headset proximity is far at frame {frame_index}: {err:#}"
+                            ),
                         }
                     }
                 }
                 Ok(false) => {
-                    warn!(
-                        "display power became non-interactive at frame {frame_index}; re-acquiring wake lock"
-                    );
-                    if let Some(wake_lock) = display_wake_lock.as_ref() {
-                        if let Err(err) = acquire_display_wake_lock(env, wake_lock) {
-                            warn!("failed to reacquire display wake lock: {err:#}");
+                    if is_headset_near() {
+                        warn!(
+                            "display power became non-interactive at frame {frame_index}; re-acquiring wake lock"
+                        );
+                        if let Some(wake_lock) = display_wake_lock.as_ref() {
+                            if let Err(err) = acquire_display_wake_lock(env, wake_lock) {
+                                warn!("failed to reacquire display wake lock: {err:#}");
+                            }
                         }
+                    } else if frame_index % 720 == 0 {
+                        info!(
+                            "display power is non-interactive while headset proximity is far at frame {frame_index}; leaving wake lock released"
+                        );
                     }
                 }
                 Err(err) => warn!(

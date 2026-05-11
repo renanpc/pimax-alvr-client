@@ -24,28 +24,24 @@ use std::{
 
 use crate::video_receiver::bt709_limited_rgb;
 
-const MAX_BUFFERING_FRAMES: usize = 4;
+// Match upstream ALVR's default ImageReader queue budget for MediaCodec output.
+const MAX_BUFFERING_FRAMES: usize = 10;
+// Long-term, stay aligned with upstream ALVR's MediaCodec -> ImageReader
+// architecture: PRIVATE decoder output backed by GPU-sampled hardware buffers.
+// The CPU staging path remains available for targeted diagnostics, but it is
+// not stable enough on Crystal OG to be the default runtime architecture.
 const USE_CPU_STAGING_DECODER: bool = false;
 const CPU_STAGING_IMAGE_FORMAT: ImageFormat = ImageFormat::YUV_420_888;
+const CPU_STAGING_MAX_IMAGES: i32 = 3;
 static STAGED_FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
 static QUEUE_OVERFLOW_COUNT: AtomicU64 = AtomicU64::new(0);
+static DEQUEUE_FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
+static DEQUEUE_EMPTY_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug)]
 enum AliasedChromaOrder {
     Uv,
     Vu,
-}
-
-struct LockedHardwareBuffer {
-    ptr: *mut ffi::AHardwareBuffer,
-}
-
-impl Drop for LockedHardwareBuffer {
-    fn drop(&mut self) {
-        unsafe {
-            ffi::AHardwareBuffer_unlock(self.ptr, ptr::null_mut());
-        }
-    }
 }
 
 fn neutralize_zero_chroma(u: &mut u8, v: &mut u8) {
@@ -124,6 +120,7 @@ unsafe impl Send for VideoDecoderSource {}
 impl VideoDecoderSource {
     pub fn dequeue_frame(&mut self) -> Option<(Duration, *mut c_void)> {
         let mut image_queue_lock = self.image_queue.lock();
+        let queue_len_before = image_queue_lock.len();
 
         if let Some(queued_image) = image_queue_lock.front() {
             if queued_image.in_use {
@@ -141,17 +138,36 @@ impl VideoDecoderSource {
 
         if let Some(queued_image) = image_queue_lock.front_mut() {
             queued_image.in_use = true;
+            let timestamp = queued_image.timestamp;
+            match queued_image.image.get_hardware_buffer() {
+                Ok(buffer) => {
+                    let count = DEQUEUE_FRAME_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count <= 5 || count % 120 == 0 {
+                        info!(
+                            "upstream decoder source handed frame {count}: queue_len_before={} queue_len_after={} buffering_avg={:.2} timestamp_ns={}",
+                            queue_len_before,
+                            image_queue_lock.len(),
+                            self.buffering_running_average,
+                            timestamp.as_nanos()
+                        );
+                    }
 
-            Some((
-                queued_image.timestamp,
-                queued_image
-                    .image
-                    .get_hardware_buffer()
-                    .unwrap()
-                    .as_ptr()
-                    .cast(),
-            ))
+                    Some((timestamp, buffer.as_ptr().cast()))
+                }
+                Err(err) => {
+                    warn!("failed to obtain AHardwareBuffer from decoded image: {err}");
+                    None
+                }
+            }
         } else {
+            let empty_count = DEQUEUE_EMPTY_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if empty_count <= 5 || empty_count % 600 == 0 {
+                info!(
+                    "upstream decoder source had no frame ready: queue_len_before={} buffering_avg={:.2} empties={empty_count}",
+                    queue_len_before,
+                    self.buffering_running_average
+                );
+            }
             None
         }
     }
@@ -271,6 +287,58 @@ fn stage_rgba_image(image: &Image, timestamp: Duration) -> Result<bool> {
     );
 
     Ok(true)
+}
+
+fn push_staged_nv12_as_rgba(
+    timestamp: Duration,
+    width: usize,
+    height: usize,
+    nv12: Vec<u8>,
+) -> Result<()> {
+    let uv_width = (width + 1) / 2;
+    let y_plane_len = width
+        .checked_mul(height)
+        .context("staged NV12 luma plane size overflow")?;
+    let rgba_len = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .context("staged RGBA frame size overflow")?;
+    let mut rgba = vec![0_u8; rgba_len];
+
+    for row in 0..height {
+        let y_row_start = row
+            .checked_mul(width)
+            .context("staged NV12 RGBA row overflow")?;
+        let uv_row_start = y_plane_len
+            + (row / 2)
+                .checked_mul(uv_width)
+                .and_then(|offset| offset.checked_mul(2))
+                .context("staged NV12 chroma row overflow")?;
+        for col in 0..width {
+            let y = nv12[y_row_start + col];
+            let uv_index = uv_row_start + (col / 2) * 2;
+            let mut u = nv12[uv_index];
+            let mut v = nv12[uv_index + 1];
+            neutralize_zero_chroma(&mut u, &mut v);
+            let rgb = bt709_limited_rgb(y, u, v);
+            let dst = (y_row_start + col) * 4;
+            rgba[dst] = rgb[0];
+            rgba[dst + 1] = rgb[1];
+            rgba[dst + 2] = rgb[2];
+            rgba[dst + 3] = 255;
+        }
+    }
+
+    let receiver = crate::video_receiver::get_video_receiver();
+    crate::video_receiver::push_rgba_frame(
+        receiver.as_ref(),
+        timestamp.as_nanos() as u64,
+        width as u32,
+        height as u32,
+        rgba,
+    );
+
+    Ok(())
 }
 
 fn stage_yuv420_image_as_nv12(image: &Image, timestamp: Duration) -> Result<bool> {
@@ -401,14 +469,7 @@ fn stage_yuv420_image_as_nv12(image: &Image, timestamp: Duration) -> Result<bool
             }
         }
 
-        let receiver = crate::video_receiver::get_video_receiver();
-        crate::video_receiver::push_nv12_frame(
-            receiver.as_ref(),
-            timestamp.as_nanos() as u64,
-            width as u32,
-            height as u32,
-            nv12,
-        );
+        push_staged_nv12_as_rgba(timestamp, width, height, nv12)?;
 
         let count = STAGED_FRAME_COUNT.load(Ordering::Relaxed) + 1;
         if count <= 5 {
@@ -462,239 +523,6 @@ fn stage_yuv420_image_as_nv12(image: &Image, timestamp: Duration) -> Result<bool
         return Ok(true);
     }
 
-    let hardware_buffer = image
-        .get_hardware_buffer()
-        .context("decoded image missing hardware buffer")?;
-    let hardware_buffer_ptr = hardware_buffer.as_ptr();
-
-    let mut planes: ffi::AHardwareBuffer_Planes = unsafe { std::mem::zeroed() };
-    let lock_status = unsafe {
-        ffi::AHardwareBuffer_lockPlanes(
-            hardware_buffer_ptr as *mut ffi::AHardwareBuffer,
-            ffi::AHardwareBuffer_UsageFlags::AHARDWAREBUFFER_USAGE_CPU_READ_RARELY.0,
-            -1,
-            ptr::null_mut(),
-            &mut planes as *mut ffi::AHardwareBuffer_Planes,
-        )
-    };
-    if lock_status != 0 {
-        bail!("AHardwareBuffer_lockPlanes failed for decoded YUV image: status={lock_status}");
-    }
-    let _lock_guard = LockedHardwareBuffer {
-        ptr: hardware_buffer_ptr as *mut ffi::AHardwareBuffer,
-    };
-
-    let plane_count = planes.planeCount as usize;
-    let y_row_stride = planes.planes[0].rowStride as usize;
-    let y_pixel_stride = planes.planes[0].pixelStride as usize;
-    if plane_count < 3 {
-        let crop = image.get_crop_rect().ok();
-        let mut crop_left = 0usize;
-        let mut crop_top = 0usize;
-        let mut width = image_width;
-        let mut height = image_height;
-        if let Some(crop) = crop {
-            let right = crop.right.max(crop.left) as usize;
-            let bottom = crop.bottom.max(crop.top) as usize;
-            let left = crop.left.max(0) as usize;
-            let top = crop.top.max(0) as usize;
-            let crop_width = right.saturating_sub(left);
-            let crop_height = bottom.saturating_sub(top);
-            if crop_width > 0 && crop_height > 0 && right <= image_width && bottom <= image_height {
-                crop_left = left;
-                crop_top = top;
-                width = crop_width;
-                height = crop_height;
-            }
-        }
-
-        let plane0 = image
-            .get_plane_data(0)
-            .context("decoded YUV image missing plane 0 data")?;
-        let plane0_len = plane0.len();
-        let y_len = y_row_stride
-            .checked_mul(image_height)
-            .context("Y plane length overflow")?;
-        let uv_row_stride = y_row_stride;
-        let uv_len = uv_row_stride
-            .checked_mul((image_height + 1) / 2)
-            .context("UV plane length overflow")?;
-        let has_contiguous_uv = plane0_len >= y_len.saturating_add(uv_len);
-        let y_plane = &plane0[..plane0_len.min(y_len)];
-        let uv_plane = has_contiguous_uv.then(|| &plane0[y_len..y_len + uv_len]);
-
-        if STAGED_FRAME_COUNT.load(Ordering::Relaxed) < 5 {
-            warn!(
-                "YUV_420_888 image reported only {plane_count} planes; plane0_len={plane0_len} y_stride={y_row_stride} y_px_stride={y_pixel_stride} crop={}x{}+{},{} {}",
-                width,
-                height,
-                crop_left,
-                crop_top,
-                if has_contiguous_uv {
-                    "using contiguous NV12 staging"
-                } else {
-                    "falling back to grayscale Y-only staging"
-                }
-            );
-        }
-
-        let rgba_len = width
-            .checked_mul(height)
-            .and_then(|pixels| pixels.checked_mul(4))
-            .context("RGBA staging size overflow")?;
-        let mut rgba = vec![0_u8; rgba_len];
-        for row in 0..height {
-            let src_row_start = crop_top
-                .checked_add(row)
-                .context("Y plane crop row overflow")?
-                .checked_mul(y_row_stride)
-                .and_then(|offset| {
-                    crop_left
-                        .checked_mul(y_pixel_stride)
-                        .and_then(|x_offset| offset.checked_add(x_offset))
-                })
-                .context("Y plane source row offset overflow")?;
-            let dst_row_start = row
-                .checked_mul(width)
-                .context("Y plane destination row offset overflow")?;
-            for col in 0..width {
-                let y_index = src_row_start
-                    .checked_add(
-                        col.checked_mul(y_pixel_stride)
-                            .context("Y plane pixel offset overflow")?,
-                    )
-                    .context("Y plane source index overflow")?;
-                let y = y_plane.get(y_index).copied().unwrap_or(16);
-                let (mut u, mut v) = if let Some(uv_plane) = uv_plane {
-                    let uv_row_start = (row / 2)
-                        .checked_mul(uv_row_stride)
-                        .context("NV12 chroma row overflow")?;
-                    let uv_index = uv_row_start
-                        .checked_add(
-                            (col / 2)
-                                .checked_mul(2)
-                                .context("NV12 chroma pixel offset overflow")?,
-                        )
-                        .context("NV12 chroma source index overflow")?;
-                    (
-                        uv_plane.get(uv_index).copied().unwrap_or(128),
-                        uv_plane.get(uv_index + 1).copied().unwrap_or(128),
-                    )
-                } else {
-                    (128, 128)
-                };
-                neutralize_zero_chroma(&mut u, &mut v);
-                let rgb = bt709_limited_rgb(y, u, v);
-                let dst = (dst_row_start + col) * 4;
-                rgba[dst] = rgb[0];
-                rgba[dst + 1] = rgb[1];
-                rgba[dst + 2] = rgb[2];
-                rgba[dst + 3] = 255;
-            }
-        }
-
-        let receiver = crate::video_receiver::get_video_receiver();
-        crate::video_receiver::push_rgba_frame(
-            receiver.as_ref(),
-            timestamp.as_nanos() as u64,
-            width as u32,
-            height as u32,
-            rgba,
-        );
-
-        let count = STAGED_FRAME_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if count <= 5 {
-            let center_x = width / 2;
-            let center_y = height / 2;
-            let left_x = width / 4;
-            let right_x = width.saturating_mul(3) / 4;
-            let sample_nv12 = |sample_x: usize, sample_y: usize| -> ([u8; 3], [u8; 3]) {
-                let sample_x = sample_x.min(width.saturating_sub(1));
-                let sample_y = sample_y.min(height.saturating_sub(1));
-                let y_index = sample_y
-                    .checked_mul(y_row_stride)
-                    .and_then(|offset| {
-                        crop_left
-                            .checked_mul(y_pixel_stride)
-                            .and_then(|x_offset| offset.checked_add(x_offset))
-                    })
-                    .and_then(|offset| offset.checked_add(sample_x * y_pixel_stride))
-                    .unwrap_or(0);
-                let y = y_plane.get(y_index).copied().unwrap_or(16);
-                let (mut u, mut v) = if let Some(uv_plane) = uv_plane {
-                    let uv_index = (sample_y / 2) * uv_row_stride + (sample_x / 2) * 2;
-                    (
-                        uv_plane.get(uv_index).copied().unwrap_or(128),
-                        uv_plane.get(uv_index + 1).copied().unwrap_or(128),
-                    )
-                } else {
-                    (128, 128)
-                };
-                neutralize_zero_chroma(&mut u, &mut v);
-                ([y, u, v], bt709_limited_rgb(y, u, v))
-            };
-            let left_sample = sample_nv12(left_x, center_y);
-            let center_sample = sample_nv12(center_x, center_y);
-            let right_sample = sample_nv12(right_x, center_y);
-            info!(
-                "YUV staging fallback: image={}x{} staged={}x{} y_stride={} y_px_stride={} uv_stride={} plane_lens=[{},{}] left_yuv=[{},{},{}] left_rgb={:?} center_yuv=[{},{},{}] center_rgb={:?} right_yuv=[{},{},{}] right_rgb={:?}",
-                image_width,
-                image_height,
-                width,
-                height,
-                y_row_stride,
-                y_pixel_stride,
-                uv_row_stride,
-                y_plane.len(),
-                uv_plane.map(|plane| plane.len()).unwrap_or(0),
-                left_sample.0[0],
-                left_sample.0[1],
-                left_sample.0[2],
-                left_sample.1,
-                center_sample.0[0],
-                center_sample.0[1],
-                center_sample.0[2],
-                center_sample.1,
-                right_sample.0[0],
-                right_sample.0[1],
-                right_sample.0[2],
-                right_sample.1,
-            );
-        }
-
-        return Ok(true);
-    }
-
-    let y_row_stride = planes.planes[0].rowStride as usize;
-    let u_row_stride = planes.planes[1].rowStride as usize;
-    let v_row_stride = planes.planes[2].rowStride as usize;
-    let y_pixel_stride = planes.planes[0].pixelStride as usize;
-    let u_pixel_stride = planes.planes[1].pixelStride as usize;
-    let v_pixel_stride = planes.planes[2].pixelStride as usize;
-    let y_len = y_row_stride
-        .checked_mul(image_height)
-        .context("Y plane length overflow")?;
-    let uv_len = u_row_stride
-        .checked_mul((image_height + 1) / 2)
-        .context("UV plane length overflow")?;
-    let y_plane = unsafe { std::slice::from_raw_parts(planes.planes[0].data as *const u8, y_len) };
-    let u_plane = unsafe { std::slice::from_raw_parts(planes.planes[1].data as *const u8, uv_len) };
-    let v_plane = unsafe { std::slice::from_raw_parts(planes.planes[2].data as *const u8, uv_len) };
-    let u_ptr = u_plane.as_ptr() as usize;
-    let v_ptr = v_plane.as_ptr() as usize;
-    let aliased_chroma =
-        if u_pixel_stride == 2 && v_pixel_stride == 2 && u_row_stride == v_row_stride {
-            if u_ptr.checked_add(1) == Some(v_ptr) {
-                Some(AliasedChromaOrder::Uv)
-            } else if v_ptr.checked_add(1) == Some(u_ptr) {
-                Some(AliasedChromaOrder::Vu)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
     let crop = image.get_crop_rect().ok();
     let mut crop_left = 0usize;
     let mut crop_top = 0usize;
@@ -715,22 +543,43 @@ fn stage_yuv420_image_as_nv12(image: &Image, timestamp: Duration) -> Result<bool
         }
     }
 
-    let uv_width = (width + 1) / 2;
-    let uv_height = (height + 1) / 2;
-    let y_plane_len = width
-        .checked_mul(height)
-        .context("YUV luma plane size overflow")?;
-    let uv_plane_len = uv_width
-        .checked_mul(uv_height)
-        .and_then(|samples| samples.checked_mul(2))
-        .context("YUV chroma plane size overflow")?;
-    let mut nv12 = vec![
-        0_u8;
-        y_plane_len
-            .checked_add(uv_plane_len)
-            .context("NV12 frame size overflow")?
-    ];
+    let y_row_stride = image.get_plane_row_stride(0)? as usize;
+    let y_pixel_stride = image.get_plane_pixel_stride(0).unwrap_or(1) as usize;
+    let plane0 = image
+        .get_plane_data(0)
+        .context("decoded YUV image missing plane 0 data")?;
+    let plane0_len = plane0.len();
+    let y_len = y_row_stride
+        .checked_mul(image_height)
+        .context("Y plane length overflow")?;
+    let uv_row_stride = y_row_stride;
+    let uv_len = uv_row_stride
+        .checked_mul((image_height + 1) / 2)
+        .context("UV plane length overflow")?;
+    let has_contiguous_uv = plane0_len >= y_len.saturating_add(uv_len);
+    let y_plane = &plane0[..plane0_len.min(y_len)];
+    let uv_plane = has_contiguous_uv.then(|| &plane0[y_len..y_len + uv_len]);
 
+    if STAGED_FRAME_COUNT.load(Ordering::Relaxed) < 5 {
+        warn!(
+            "YUV_420_888 image reported only {image_plane_count} Java-visible planes; plane0_len={plane0_len} y_stride={y_row_stride} y_px_stride={y_pixel_stride} crop={}x{}+{},{} {}",
+            width,
+            height,
+            crop_left,
+            crop_top,
+            if has_contiguous_uv {
+                "using contiguous NV12-style fallback staging"
+            } else {
+                "falling back to grayscale Y-only staging"
+            }
+        );
+    }
+
+    let rgba_len = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .context("RGBA staging size overflow")?;
+    let mut rgba = vec![0_u8; rgba_len];
     for row in 0..height {
         let src_row_start = crop_top
             .checked_add(row)
@@ -742,141 +591,38 @@ fn stage_yuv420_image_as_nv12(image: &Image, timestamp: Duration) -> Result<bool
                     .and_then(|x_offset| offset.checked_add(x_offset))
             })
             .context("Y plane source row offset overflow")?;
-        let src_row_end = src_row_start
-            .checked_add(
-                width
-                    .checked_mul(y_pixel_stride)
-                    .context("Y plane copy width overflow")?,
-            )
-            .context("Y plane source row end overflow")?;
         let dst_row_start = row
             .checked_mul(width)
             .context("Y plane destination row offset overflow")?;
-        if y_pixel_stride == 1 {
-            nv12[dst_row_start..dst_row_start + width]
-                .copy_from_slice(&y_plane[src_row_start..src_row_end]);
-        } else {
-            for col in 0..width {
-                let src = src_row_start
-                    + col
-                        .checked_mul(y_pixel_stride)
-                        .context("Y plane pixel offset overflow")?;
-                nv12[dst_row_start + col] = y_plane[src];
-            }
-        }
-    }
-
-    let chroma_left = crop_left / 2;
-    let chroma_top = crop_top / 2;
-    for row in 0..uv_height {
-        let u_row_start = chroma_top
-            .checked_add(row)
-            .context("U plane crop row overflow")?
-            .checked_mul(u_row_stride)
-            .and_then(|offset| {
-                chroma_left
-                    .checked_mul(u_pixel_stride)
-                    .and_then(|x_offset| offset.checked_add(x_offset))
-            })
-            .context("U plane source row offset overflow")?;
-        let v_row_start = chroma_top
-            .checked_add(row)
-            .context("V plane crop row overflow")?
-            .checked_mul(v_row_stride)
-            .and_then(|offset| {
-                chroma_left
-                    .checked_mul(v_pixel_stride)
-                    .and_then(|x_offset| offset.checked_add(x_offset))
-            })
-            .context("V plane source row offset overflow")?;
-        let dst_row_start = y_plane_len
-            + row
-                .checked_mul(uv_width)
-                .and_then(|offset| offset.checked_mul(2))
-                .context("NV12 chroma destination row offset overflow")?;
-
-        for col in 0..uv_width {
-            let dst = dst_row_start
-                + col
-                    .checked_mul(2)
-                    .context("NV12 chroma destination offset overflow")?;
-
-            let chroma_offset = col
-                .checked_mul(2)
-                .context("Aliased chroma pixel offset overflow")?;
-            match aliased_chroma {
-                Some(AliasedChromaOrder::Uv) => {
-                    let uv_src = u_row_start
-                        .checked_add(chroma_offset)
-                        .context("UV plane pixel start overflow")?;
-                    let u = *u_plane
-                        .get(uv_src)
-                        .context("UV plane U sample out of range")?;
-                    let v = u_plane
-                        .get(uv_src + 1)
-                        .copied()
-                        .or_else(|| v_plane.get(v_row_start + chroma_offset).copied())
-                        .context("UV plane V sample out of range")?;
-                    nv12[dst] = u;
-                    nv12[dst + 1] = v;
-                }
-                Some(AliasedChromaOrder::Vu) => {
-                    let vu_src = v_row_start
-                        .checked_add(chroma_offset)
-                        .context("VU plane pixel start overflow")?;
-                    let v = *v_plane
-                        .get(vu_src)
-                        .context("VU plane V sample out of range")?;
-                    let u = v_plane
-                        .get(vu_src + 1)
-                        .copied()
-                        .or_else(|| u_plane.get(u_row_start + chroma_offset).copied())
-                        .context("VU plane U sample out of range")?;
-                    nv12[dst] = u;
-                    nv12[dst + 1] = v;
-                }
-                None => {
-                    let u_src = u_row_start
-                        .checked_add(
-                            col.checked_mul(u_pixel_stride)
-                                .context("U plane pixel offset overflow")?,
-                        )
-                        .context("U plane pixel start overflow")?;
-                    let v_src = v_row_start
-                        .checked_add(
-                            col.checked_mul(v_pixel_stride)
-                                .context("V plane pixel offset overflow")?,
-                        )
-                        .context("V plane pixel start overflow")?;
-                    nv12[dst] = u_plane[u_src];
-                    nv12[dst + 1] = v_plane[v_src];
-                }
-            }
-        }
-    }
-
-    let rgba_len = width
-        .checked_mul(height)
-        .and_then(|pixels| pixels.checked_mul(4))
-        .context("RGBA staging size overflow")?;
-    let mut rgba = vec![0_u8; rgba_len];
-    for row in 0..height {
-        let y_row_start = row
-            .checked_mul(width)
-            .context("YUV staging RGBA row overflow")?;
-        let uv_row_start = y_plane_len
-            + (row / 2)
-                .checked_mul(uv_width)
-                .and_then(|offset| offset.checked_mul(2))
-                .context("YUV staging RGBA chroma row overflow")?;
         for col in 0..width {
-            let y = nv12[y_row_start + col];
-            let uv_index = uv_row_start + (col / 2) * 2;
-            let mut u = nv12[uv_index];
-            let mut v = nv12[uv_index + 1];
+            let y_index = src_row_start
+                .checked_add(
+                    col.checked_mul(y_pixel_stride)
+                        .context("Y plane pixel offset overflow")?,
+                )
+                .context("Y plane source index overflow")?;
+            let y = y_plane.get(y_index).copied().unwrap_or(16);
+            let (mut u, mut v) = if let Some(uv_plane) = uv_plane {
+                let uv_row_start = (row / 2)
+                    .checked_mul(uv_row_stride)
+                    .context("NV12 chroma row overflow")?;
+                let uv_index = uv_row_start
+                    .checked_add(
+                        (col / 2)
+                            .checked_mul(2)
+                            .context("NV12 chroma pixel offset overflow")?,
+                    )
+                    .context("NV12 chroma source index overflow")?;
+                (
+                    uv_plane.get(uv_index).copied().unwrap_or(128),
+                    uv_plane.get(uv_index + 1).copied().unwrap_or(128),
+                )
+            } else {
+                (128, 128)
+            };
             neutralize_zero_chroma(&mut u, &mut v);
             let rgb = bt709_limited_rgb(y, u, v);
-            let dst = (y_row_start + col) * 4;
+            let dst = (dst_row_start + col) * 4;
             rgba[dst] = rgb[0];
             rgba[dst + 1] = rgb[1];
             rgba[dst + 2] = rgb[2];
@@ -899,155 +645,45 @@ fn stage_yuv420_image_as_nv12(image: &Image, timestamp: Duration) -> Result<bool
         let center_y = height / 2;
         let left_x = width / 4;
         let right_x = width.saturating_mul(3) / 4;
-        let _left_y_index = center_y
-            .checked_mul(y_row_stride)
-            .and_then(|offset| {
-                crop_left
-                    .checked_mul(y_pixel_stride)
-                    .and_then(|x_offset| offset.checked_add(x_offset))
-            })
-            .and_then(|offset| {
-                offset.checked_add(
-                    left_x
+        let sample_nv12 = |sample_x: usize, sample_y: usize| -> ([u8; 3], [u8; 3]) {
+            let sample_x = sample_x.min(width.saturating_sub(1));
+            let sample_y = sample_y.min(height.saturating_sub(1));
+            let y_index = sample_y
+                .checked_mul(y_row_stride)
+                .and_then(|offset| {
+                    crop_left
                         .checked_mul(y_pixel_stride)
-                        .expect("left x should not overflow"),
+                        .and_then(|x_offset| offset.checked_add(x_offset))
+                })
+                .and_then(|offset| offset.checked_add(sample_x * y_pixel_stride))
+                .unwrap_or(0);
+            let y = y_plane.get(y_index).copied().unwrap_or(16);
+            let (mut u, mut v) = if let Some(uv_plane) = uv_plane {
+                let uv_index = (sample_y / 2) * uv_row_stride + (sample_x / 2) * 2;
+                (
+                    uv_plane.get(uv_index).copied().unwrap_or(128),
+                    uv_plane.get(uv_index + 1).copied().unwrap_or(128),
                 )
-            })
-            .context("source left Y index overflow")?;
-        let _right_y_index = center_y
-            .checked_mul(y_row_stride)
-            .and_then(|offset| {
-                crop_left
-                    .checked_mul(y_pixel_stride)
-                    .and_then(|x_offset| offset.checked_add(x_offset))
-            })
-            .and_then(|offset| {
-                offset.checked_add(
-                    right_x
-                        .checked_mul(y_pixel_stride)
-                        .expect("right x should not overflow"),
-                )
-            })
-            .context("source right Y index overflow")?;
-        let sample_chroma =
-            |sample_x: usize, sample_y: usize| -> Result<([u8; 3], [u8; 3], [u8; 3])> {
-                let uv_row = sample_y / 2;
-                let uv_col = sample_x / 2;
-                let y = *y_plane
-                    .get(
-                        sample_y
-                            .checked_mul(y_row_stride)
-                            .and_then(|offset| {
-                                crop_left
-                                    .checked_mul(y_pixel_stride)
-                                    .and_then(|x_offset| offset.checked_add(x_offset))
-                            })
-                            .and_then(|offset| offset.checked_add(sample_x * y_pixel_stride))
-                            .context("sample Y index overflow")?,
-                    )
-                    .context("sample Y sample out of range")?;
-                let (mut u, mut v) = match aliased_chroma {
-                    Some(AliasedChromaOrder::Uv) => {
-                        let u_src = chroma_top
-                            .checked_add(uv_row)
-                            .context("sample UV row overflow")?
-                            .checked_mul(u_row_stride)
-                            .and_then(|offset| {
-                                chroma_left
-                                    .checked_mul(u_pixel_stride)
-                                    .and_then(|x_offset| offset.checked_add(x_offset))
-                            })
-                            .and_then(|offset| offset.checked_add(uv_col * 2))
-                            .context("sample U index overflow")?;
-                        let u = *u_plane.get(u_src).context("sample U sample out of range")?;
-                        let v = u_plane
-                            .get(u_src + 1)
-                            .copied()
-                            .or_else(|| v_plane.get(u_src + 1).copied())
-                            .context("sample V sample out of range")?;
-                        (u, v)
-                    }
-                    Some(AliasedChromaOrder::Vu) => {
-                        let v_src = chroma_top
-                            .checked_add(uv_row)
-                            .context("sample VU row overflow")?
-                            .checked_mul(v_row_stride)
-                            .and_then(|offset| {
-                                chroma_left
-                                    .checked_mul(v_pixel_stride)
-                                    .and_then(|x_offset| offset.checked_add(x_offset))
-                            })
-                            .and_then(|offset| offset.checked_add(uv_col * 2))
-                            .context("sample V index overflow")?;
-                        let v = *v_plane.get(v_src).context("sample V sample out of range")?;
-                        let u = v_plane
-                            .get(v_src + 1)
-                            .copied()
-                            .or_else(|| u_plane.get(v_src + 1).copied())
-                            .context("sample U sample out of range")?;
-                        (u, v)
-                    }
-                    None => {
-                        let u_src = chroma_top
-                            .checked_add(uv_row)
-                            .context("sample U row overflow")?
-                            .checked_mul(u_row_stride)
-                            .and_then(|offset| {
-                                chroma_left
-                                    .checked_mul(u_pixel_stride)
-                                    .and_then(|x_offset| offset.checked_add(x_offset))
-                            })
-                            .and_then(|offset| offset.checked_add(uv_col * u_pixel_stride))
-                            .context("sample U index overflow")?;
-                        let v_src = chroma_top
-                            .checked_add(uv_row)
-                            .context("sample V row overflow")?
-                            .checked_mul(v_row_stride)
-                            .and_then(|offset| {
-                                chroma_left
-                                    .checked_mul(v_pixel_stride)
-                                    .and_then(|x_offset| offset.checked_add(x_offset))
-                            })
-                            .and_then(|offset| offset.checked_add(uv_col * v_pixel_stride))
-                            .context("sample V index overflow")?;
-                        (
-                            *u_plane.get(u_src).context("sample U sample out of range")?,
-                            *v_plane.get(v_src).context("sample V sample out of range")?,
-                        )
-                    }
-                };
-                neutralize_zero_chroma(&mut u, &mut v);
-                Ok((
-                    [y, u, v],
-                    bt709_limited_rgb(y, u, v),
-                    bt709_limited_rgb(y, v, u),
-                ))
+            } else {
+                (128, 128)
             };
-        let left_sample = sample_chroma(left_x, center_y)?;
-        let center_sample = sample_chroma(center_x, center_y)?;
-        let right_sample = sample_chroma(right_x, center_y)?;
+            neutralize_zero_chroma(&mut u, &mut v);
+            ([y, u, v], bt709_limited_rgb(y, u, v))
+        };
+        let left_sample = sample_nv12(left_x, center_y);
+        let center_sample = sample_nv12(center_x, center_y);
+        let right_sample = sample_nv12(right_x, center_y);
         info!(
-            "YUV staging metadata: image={}x{} crop_left={} crop_top={} staged={}x{} y_stride={} y_px_stride={} u_stride={} u_px_stride={} v_stride={} v_px_stride={} plane_lens=[{},{},{}] chroma_alias={:?} u_ptr={:#x} v_ptr={:#x} u_head={:?} v_head={:?} left_yuv=[{},{},{}] left_rgb_nv12={:?} center_yuv=[{},{},{}] center_rgb_nv12={:?} right_yuv=[{},{},{}] right_rgb_nv12={:?}",
+            "YUV staging fallback: image={}x{} staged={}x{} y_stride={} y_px_stride={} uv_stride={} plane_lens=[{},{}] left_yuv=[{},{},{}] left_rgb={:?} center_yuv=[{},{},{}] center_rgb={:?} right_yuv=[{},{},{}] right_rgb={:?}",
             image_width,
             image_height,
-            crop_left,
-            crop_top,
             width,
             height,
             y_row_stride,
             y_pixel_stride,
-            u_row_stride,
-            u_pixel_stride,
-            v_row_stride,
-            v_pixel_stride,
+            uv_row_stride,
             y_plane.len(),
-            u_plane.len(),
-            v_plane.len(),
-            aliased_chroma,
-            u_ptr,
-            v_ptr,
-            &u_plane[..u_plane.len().min(8)],
-            &v_plane[..v_plane.len().min(8)],
+            uv_plane.map(|plane| plane.len()).unwrap_or(0),
             left_sample.0[0],
             left_sample.0[1],
             left_sample.0[2],
@@ -1127,6 +763,52 @@ fn decoder_lifecycle(
         let image_queue = Arc::clone(&image_queue);
         let frame_result_callback = frame_result_callback.clone();
         move |image_reader| {
+            if USE_CPU_STAGING_DECODER {
+                match image_reader.acquire_latest_image() {
+                    Ok(Some(image)) => {
+                        let timestamp = match image.get_timestamp() {
+                            Ok(timestamp) => Duration::from_nanos(timestamp as u64),
+                            Err(e) => {
+                                error!("ImageReader timestamp error: {e}");
+                                return;
+                            }
+                        };
+
+                        if let Some(callback) = frame_result_callback.upgrade() {
+                            callback(Ok(timestamp));
+                        }
+
+                        match stage_decoded_image(&image, timestamp) {
+                            Ok(true) => {
+                                let count = STAGED_FRAME_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                                if count <= 5 || count % 120 == 0 {
+                                    info!(
+                                        "staged decoded frame {} via {:?}: {}x{} timestamp_ns={}",
+                                        count,
+                                        image.get_format().unwrap_or(ImageFormat::PRIVATE),
+                                        image.get_width().unwrap_or_default(),
+                                        image.get_height().unwrap_or_default(),
+                                        timestamp.as_nanos()
+                                    );
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                error!("failed to stage decoded image: {e:#}");
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        warn!("ImageReader callback found no latest image available");
+                    }
+                    Err(e) => {
+                        error!("ImageReader latest-image error: {e}");
+                    }
+                }
+
+                return;
+            }
+
             let mut image_queue_lock = image_queue.lock();
             let mut dropped = 0usize;
             if image_queue_lock.front().map(|queued| queued.in_use).unwrap_or(false) {
@@ -1162,33 +844,11 @@ fn decoder_lifecycle(
                         callback(Ok(timestamp));
                     }
 
-                    if USE_CPU_STAGING_DECODER {
-                        match stage_decoded_image(&image, timestamp) {
-                            Ok(true) => {
-                                let count = STAGED_FRAME_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                                if count <= 5 || count % 120 == 0 {
-                                    info!(
-                                        "staged decoded frame {} via {:?}: {}x{} timestamp_ns={}",
-                                        count,
-                                        image.get_format().unwrap_or(ImageFormat::PRIVATE),
-                                        image.get_width().unwrap_or_default(),
-                                        image.get_height().unwrap_or_default(),
-                                        timestamp.as_nanos()
-                                    );
-                                }
-                            }
-                            Ok(false) => {}
-                            Err(e) => {
-                                error!("failed to stage decoded image: {e:#}");
-                            }
-                        }
-                    } else {
-                        image_queue_lock.push_back(QueuedImage {
-                            timestamp,
-                            image,
-                            in_use: false,
-                        });
-                    }
+                    image_queue_lock.push_back(QueuedImage {
+                        timestamp,
+                        image,
+                        in_use: false,
+                    });
                 }
                 Ok(None) => {
                     warn!("ImageReader callback found no image available");
@@ -1316,8 +976,16 @@ pub fn video_decoder_split(
         let image_queue = Arc::clone(&image_queue);
         move || {
             let mut image_reader = match ImageReader::new_with_usage(
-                config.width,
-                config.height,
+                if USE_CPU_STAGING_DECODER {
+                    config.width
+                } else {
+                    1
+                },
+                if USE_CPU_STAGING_DECODER {
+                    config.height
+                } else {
+                    1
+                },
                 if USE_CPU_STAGING_DECODER {
                     CPU_STAGING_IMAGE_FORMAT
                 } else {
@@ -1330,7 +998,11 @@ pub fn video_decoder_split(
                         HardwareBufferUsage::GPU_SAMPLED_IMAGE.0 .0
                     },
                 )),
-                (MAX_BUFFERING_FRAMES * 3) as i32,
+                if USE_CPU_STAGING_DECODER {
+                    CPU_STAGING_MAX_IMAGES
+                } else {
+                    MAX_BUFFERING_FRAMES as i32
+                },
             ) {
                 Ok(reader) => reader,
                 Err(e) => {

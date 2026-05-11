@@ -128,7 +128,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -149,9 +149,6 @@ pub const DEBUG_RGBA_STREAM_PORT: u16 = 9950;
 
 /// EGL constants
 const EGL_NATIVE_BUFFER_ANDROID: i32 = 0x3140;
-const EGL_IMAGE_PRESERVED_KHR: i32 = 0x30D2;
-const EGL_NONE: i32 = 0x3038;
-
 /// GL constants
 const GL_TEXTURE_2D: u32 = 0x0DE1;
 const GL_TEXTURE0: u32 = 0x84C0;
@@ -312,7 +309,6 @@ extern "C" {
     );
     fn glCheckFramebufferStatus(target: u32) -> u32;
     fn glDeleteFramebuffers(n: i32, framebuffers: *const u32);
-    fn glFinish();
     fn glFlush();
     fn glFramebufferTexture2D(
         target: u32,
@@ -364,6 +360,7 @@ const DEBUG_RGBA_MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 static DEBUG_RGBA_TCP_STARTED: AtomicBool = AtomicBool::new(false);
 static AHB_BLIT_COUNT: AtomicU64 = AtomicU64::new(0);
 static BLIT_PROGRAM: Mutex<Option<BlitProgram>> = Mutex::new(None);
+static EXTERNAL_BLIT_PROGRAM: Mutex<Option<BlitProgram>> = Mutex::new(None);
 static NV12_BLIT_PROGRAM: Mutex<Option<Nv12BlitProgram>> = Mutex::new(None);
 static NV12_UPLOAD_TEXTURES: Mutex<Option<Nv12UploadTextures>> = Mutex::new(None);
 static RGBA_UPLOAD_TEXTURE: Mutex<Option<RgbaUploadTexture>> = Mutex::new(None);
@@ -380,9 +377,13 @@ const PIMAX_FLIP_STREAM_VERTICAL: bool = false;
 // Default starting values — exposed as `pub` so `android.rs` can pass them to `tune::init`.
 // The render thread reads live values from `tune::convergence_shift_ndc()` etc. each frame.
 pub const PIMAX_BLIT_CONVERGENCE_SHIFT_NDC_DEFAULT: f32 = 0.124;
-const PIMAX_DUMP_SOURCE_VIDEO_FRAMES: bool = true;
+const PIMAX_DUMP_SOURCE_VIDEO_FRAMES: bool = false;
 const PIMAX_DUMP_SOURCE_VIDEO_FRAME_LIMIT: u32 = 28;
 const PIMAX_DUMP_FRAME_START: u32 = 20;
+// The submitted Pimax eye targets are intentionally pinned to SDR right now.
+// Keep the intermediate blit target aligned with that runtime path so we avoid
+// unnecessary RGBA16F allocation churn and misleading float-FBO readback stats.
+const PIMAX_USE_HDR_INTERMEDIATE_FBO: bool = false;
 /// Default BT.709 limited-range black level for the passthrough OES shader.
 pub const COLOR_BLACK_CRUSH_DEFAULT: f32 = 0.072;
 /// Default BT.709 contrast gain for the passthrough OES shader.
@@ -419,6 +420,9 @@ struct BlitProgram {
     texture_target: u32,
     texture_target_label: &'static str,
     texture_uniform: i32,
+    black_crush_uniform: i32,
+    color_gain_uniform: i32,
+    hdr_mode_uniform: i32,
     uv_rect_uniform: i32,
     foveation_enabled_uniform: i32,
     view_index_uniform: i32,
@@ -829,6 +833,15 @@ pub fn disconnect(receiver: &AlvrVideoReceiver) {
     info!("Disconnected from ALVR server");
 }
 
+/// Clears any cached decoded frame while keeping the receiver connected.
+///
+/// This is used during lifecycle recovery so the next frame presented after wake/focus
+/// definitely comes from fresh decoder output instead of a pre-interruption surface.
+pub fn clear_latest_frame(receiver: &AlvrVideoReceiver) {
+    *receiver.latest_frame.lock() = None;
+    info!("Cleared latest ALVR video frame");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -856,6 +869,31 @@ mod tests {
         assert_eq!(*receiver.state.lock(), ReceiverState::Disconnected);
         assert!(receiver.latest_frame.lock().is_none());
         assert!(!receiver.connected.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn clear_latest_frame_preserves_connection_state() {
+        let receiver = AlvrVideoReceiver {
+            state: Mutex::new(ReceiverState::Streaming),
+            latest_frame: Mutex::new(Some(VideoFrame {
+                timestamp_ns: 1,
+                buffer_ptr: 2,
+                width: 3,
+                height: 4,
+                row_pitch: 5,
+                hardware_buffer_lease: None,
+                rgba: None,
+                nv12: None,
+            })),
+            connected: Arc::new(AtomicBool::new(true)),
+            server_addr: Mutex::new(Some("127.0.0.1:9944".to_owned())),
+        };
+
+        clear_latest_frame(&receiver);
+
+        assert_eq!(*receiver.state.lock(), ReceiverState::Streaming);
+        assert!(receiver.latest_frame.lock().is_none());
+        assert!(receiver.connected.load(Ordering::SeqCst));
     }
 }
 
@@ -1080,6 +1118,18 @@ fn current_framebuffer_binding() -> u32 {
         glGetIntegerv(GL_FRAMEBUFFER_BINDING, &mut framebuffer);
     }
     framebuffer.max(0) as u32
+}
+
+fn drain_gl_errors() -> Vec<u32> {
+    let mut errors = Vec::new();
+    loop {
+        let error = unsafe { glGetError() };
+        if error == 0 {
+            break;
+        }
+        errors.push(error);
+    }
+    errors
 }
 
 fn pixel_luma(pixel: [u8; 4]) -> f32 {
@@ -1387,8 +1437,8 @@ void main() {
     let fragment_shader = compile_shader(
         GL_FRAGMENT_SHADER,
         r#"#version 300 es
-#extension GL_OES_EGL_image_external_essl3 : require
-precision highp float;
+#extension GL_OES_EGL_image_external_essl3 : enable
+precision mediump float;
 uniform samplerExternalOES u_texture;
 uniform float u_black_crush;
 uniform float u_color_gain;
@@ -1396,13 +1446,7 @@ uniform int u_hdr_mode;
 in vec2 v_uv;
 out vec4 out_color;
 void main() {
-    vec4 color = texture(u_texture, v_uv);
-    // Expand BT.709 limited range (16-235) to full range (0-255).
-    color.rgb = (color.rgb - u_black_crush) * u_color_gain;
-    if (u_hdr_mode == 0) {
-        color.rgb = clamp(color.rgb, 0.0, 1.0);
-    }
-    out_color = color;
+    out_color = texture(u_texture, v_uv);
 }
 "#,
     )
@@ -1425,7 +1469,6 @@ void main() {
     let black_crush_uniform = uniform_location(linked, "u_black_crush")?;
     let color_gain_uniform = uniform_location(linked, "u_color_gain")?;
     let hdr_mode_uniform = uniform_location(linked, "u_hdr_mode")?;
-
     let created = PassthroughProgram {
         program: linked,
         texture_uniform,
@@ -1451,7 +1494,7 @@ fn get_intermediate_fbo(width: i32, height: i32) -> Result<IntermediateFbo> {
     if let Some(existing) = fbo.as_ref() {
         if existing.width == width
             && existing.height == height
-            && existing.is_hdr == hdr_stream_enabled()
+            && existing.is_hdr == PIMAX_USE_HDR_INTERMEDIATE_FBO
         {
             return Ok(IntermediateFbo {
                 framebuffer: existing.framebuffer,
@@ -1471,7 +1514,7 @@ fn get_intermediate_fbo(width: i32, height: i32) -> Result<IntermediateFbo> {
 
     unsafe {
         let mut texture = 0_u32;
-        let is_hdr = hdr_stream_enabled();
+        let is_hdr = PIMAX_USE_HDR_INTERMEDIATE_FBO;
         glGenTextures(1, &mut texture);
         if texture == 0 {
             bail!("glGenTextures returned 0 for intermediate RGBA texture");
@@ -1551,6 +1594,9 @@ fn get_blit_program() -> Result<BlitProgram> {
             texture_target: existing.texture_target,
             texture_target_label: existing.texture_target_label,
             texture_uniform: existing.texture_uniform,
+            black_crush_uniform: existing.black_crush_uniform,
+            color_gain_uniform: existing.color_gain_uniform,
+            hdr_mode_uniform: existing.hdr_mode_uniform,
             uv_rect_uniform: existing.uv_rect_uniform,
             foveation_enabled_uniform: existing.foveation_enabled_uniform,
             view_index_uniform: existing.view_index_uniform,
@@ -1572,6 +1618,57 @@ fn get_blit_program() -> Result<BlitProgram> {
         texture_target: created.texture_target,
         texture_target_label: created.texture_target_label,
         texture_uniform: created.texture_uniform,
+        black_crush_uniform: created.black_crush_uniform,
+        color_gain_uniform: created.color_gain_uniform,
+        hdr_mode_uniform: created.hdr_mode_uniform,
+        uv_rect_uniform: created.uv_rect_uniform,
+        foveation_enabled_uniform: created.foveation_enabled_uniform,
+        view_index_uniform: created.view_index_uniform,
+        position_offset_x_uniform: created.position_offset_x_uniform,
+        foveation_view_ratio_edge_uniform: created.foveation_view_ratio_edge_uniform,
+        foveation_c1_c2_uniform: created.foveation_c1_c2_uniform,
+        foveation_bounds_uniform: created.foveation_bounds_uniform,
+        foveation_left_uniform: created.foveation_left_uniform,
+        foveation_right_uniform: created.foveation_right_uniform,
+        foveation_c_right_uniform: created.foveation_c_right_uniform,
+    });
+    Ok(created)
+}
+
+fn get_external_blit_program() -> Result<BlitProgram> {
+    let mut program = EXTERNAL_BLIT_PROGRAM.lock();
+    if let Some(existing) = program.as_ref() {
+        return Ok(BlitProgram {
+            program: existing.program,
+            texture_target: existing.texture_target,
+            texture_target_label: existing.texture_target_label,
+            texture_uniform: existing.texture_uniform,
+            black_crush_uniform: existing.black_crush_uniform,
+            color_gain_uniform: existing.color_gain_uniform,
+            hdr_mode_uniform: existing.hdr_mode_uniform,
+            uv_rect_uniform: existing.uv_rect_uniform,
+            foveation_enabled_uniform: existing.foveation_enabled_uniform,
+            view_index_uniform: existing.view_index_uniform,
+            position_offset_x_uniform: existing.position_offset_x_uniform,
+            foveation_view_ratio_edge_uniform: existing.foveation_view_ratio_edge_uniform,
+            foveation_c1_c2_uniform: existing.foveation_c1_c2_uniform,
+            foveation_bounds_uniform: existing.foveation_bounds_uniform,
+            foveation_left_uniform: existing.foveation_left_uniform,
+            foveation_right_uniform: existing.foveation_right_uniform,
+            foveation_c_right_uniform: existing.foveation_c_right_uniform,
+        });
+    }
+
+    let created = create_blit_program(true)
+        .context("create GL_TEXTURE_EXTERNAL_OES blit program for direct zero-copy blit")?;
+    *program = Some(BlitProgram {
+        program: created.program,
+        texture_target: created.texture_target,
+        texture_target_label: created.texture_target_label,
+        texture_uniform: created.texture_uniform,
+        black_crush_uniform: created.black_crush_uniform,
+        color_gain_uniform: created.color_gain_uniform,
+        hdr_mode_uniform: created.hdr_mode_uniform,
         uv_rect_uniform: created.uv_rect_uniform,
         foveation_enabled_uniform: created.foveation_enabled_uniform,
         view_index_uniform: created.view_index_uniform,
@@ -1894,6 +1991,16 @@ fn create_blit_program(use_external_texture: bool) -> Result<BlitProgram> {
     } else {
         "precision highp float;\nuniform sampler2D u_texture;"
     };
+    let color_correction_declaration = if use_external_texture {
+        "uniform float u_black_crush;\nuniform float u_color_gain;\nuniform int u_hdr_mode;"
+    } else {
+        ""
+    };
+    let color_correction_body = if use_external_texture {
+        "    color.rgb = (color.rgb - u_black_crush) * u_color_gain;\n    if (u_hdr_mode == 0) {\n        color.rgb = clamp(color.rgb, 0.0, 1.0);\n    }\n"
+    } else {
+        ""
+    };
 
     let vertex_shader = compile_shader(
         GL_VERTEX_SHADER,
@@ -1924,6 +2031,7 @@ void main() {
     let fragment_source = format!(
         r#"#version 300 es
 {sampler_declaration}
+{color_correction_declaration}
 uniform vec4 u_uv_rect;
 uniform int u_enable_foveation;
 uniform int u_view_index;
@@ -1993,7 +2101,8 @@ vec2 apply_foveation(vec2 uv) {{
 void main() {{
     vec2 corrected_uv = clamp(apply_foveation(v_uv), vec2(0.0), vec2(1.0));
     vec2 sample_uv = mix(u_uv_rect.xy, u_uv_rect.zw, corrected_uv);
-    out_color = texture(u_texture, sample_uv);
+    vec4 color = texture(u_texture, sample_uv);
+{color_correction_body}    out_color = color;
 }}
 "#,
     );
@@ -2015,6 +2124,21 @@ void main() {{
         unsafe { glGetUniformLocation(linked, texture_name.as_ptr().cast::<i8>()) };
     let uv_rect_uniform =
         unsafe { glGetUniformLocation(linked, uv_rect_name.as_ptr().cast::<i8>()) };
+    let black_crush_uniform = if use_external_texture {
+        uniform_location(linked, "u_black_crush")?
+    } else {
+        -1
+    };
+    let color_gain_uniform = if use_external_texture {
+        uniform_location(linked, "u_color_gain")?
+    } else {
+        -1
+    };
+    let hdr_mode_uniform = if use_external_texture {
+        uniform_location(linked, "u_hdr_mode")?
+    } else {
+        -1
+    };
     let foveation_enabled_uniform = uniform_location(linked, "u_enable_foveation")?;
     let view_index_uniform = uniform_location(linked, "u_view_index")?;
     let position_offset_x_uniform = uniform_location(linked, "u_position_offset_x")?;
@@ -2039,6 +2163,9 @@ void main() {{
         texture_target,
         texture_target_label,
         texture_uniform,
+        black_crush_uniform,
+        color_gain_uniform,
+        hdr_mode_uniform,
         uv_rect_uniform,
         foveation_enabled_uniform,
         view_index_uniform,
@@ -2498,42 +2625,30 @@ pub(crate) fn render_ahardwarebuffer_zero_copy(
     let image_target =
         get_gl_egl_image_target_texture_2d_oes().context("load glEGLImageTargetTexture2DOES")?;
 
-    // Lazy-destroy EGLImage cache: only create a new one when the buffer
-    // pointer changes. This avoids the ~2-5ms create/destroy overhead on
-    // Adreno drivers when the same buffer is reused across consecutive frames.
-    static CACHED_EGL_IMAGE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
-    static CACHED_BUFFER_PTR: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+    let egl_display = unsafe { eglGetCurrentDisplay() };
+    if egl_display.is_null() {
+        bail!("eglGetCurrentDisplay returned null");
+    }
 
-    let cached_buffer_ptr = CACHED_BUFFER_PTR.load(Ordering::Relaxed);
-    let egl_image = if cached_buffer_ptr == buffer_ptr {
-        CACHED_EGL_IMAGE.load(Ordering::Relaxed)
-    } else {
-        // Buffer changed: destroy old EGLImage if present.
-        let old_image = CACHED_EGL_IMAGE.swap(ptr::null_mut(), Ordering::Relaxed);
-        if !old_image.is_null() {
-            unsafe { destroy_image(eglGetCurrentDisplay(), old_image) };
-        }
-        // Convert AHardwareBuffer pointer to EGLClientBuffer.
-        let client_buffer = unsafe { get_native_client_buffer(buffer_ptr) };
-        if client_buffer.is_null() {
-            bail!("eglGetNativeClientBufferANDROID returned null");
-        }
-        let new_image = unsafe {
-            create_image(
-                eglGetCurrentDisplay(),
-                ptr::null_mut(), // EGL_NO_CONTEXT
-                EGL_NATIVE_BUFFER_ANDROID,
-                client_buffer,
-                ptr::null(), // no attribs
-            )
-        };
-        if new_image.is_null() {
-            bail!("eglCreateImageKHR returned null");
-        }
-        CACHED_BUFFER_PTR.store(buffer_ptr, Ordering::Relaxed);
-        CACHED_EGL_IMAGE.store(new_image, Ordering::Relaxed);
-        new_image
+    let client_buffer = unsafe { get_native_client_buffer(buffer_ptr) };
+    if client_buffer.is_null() {
+        bail!("eglGetNativeClientBufferANDROID returned null");
+    }
+    let egl_image = unsafe {
+        create_image(
+            egl_display,
+            ptr::null_mut(), // EGL_NO_CONTEXT
+            EGL_NATIVE_BUFFER_ANDROID,
+            client_buffer,
+            ptr::null(), // no attribs
+        )
     };
+    if egl_image.is_null() {
+        bail!("eglCreateImageKHR returned null");
+    }
+
+    let count = AHB_BLIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let should_log_stats = count <= 5 || count % 120 == 0;
 
     unsafe {
         // Reuse a persistent GL_TEXTURE_EXTERNAL_OES texture.
@@ -2551,65 +2666,56 @@ pub(crate) fn render_ahardwarebuffer_zero_copy(
         // Bind the EGLImage to the OES texture.
         image_target(GL_TEXTURE_EXTERNAL_OES, egl_image);
 
-        // --- Pass 1: OES → intermediate RGBA FBO ---
-        let intermediate =
-            get_intermediate_fbo(frame_width, frame_height).context("get intermediate FBO")?;
-        let passthrough = get_passthrough_oes_program().context("get passthrough OES shader")?;
+        let direct_blit_program =
+            get_external_blit_program().context("get direct zero-copy OES blit shader")?;
+        if should_log_stats {
+            info!(
+                "zero-copy AHB direct blit: source={}x{} target={}x{} texture_target={}",
+                frame_width,
+                frame_height,
+                left_target.width,
+                left_target.height,
+                direct_blit_program.texture_target_label,
+            );
+        }
 
-        let previous_framebuffer = current_framebuffer_binding();
-
-        glBindFramebuffer(GL_FRAMEBUFFER, intermediate.framebuffer);
-        glViewport(0, 0, intermediate.width, intermediate.height);
-        glUseProgram(passthrough.program);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_EXTERNAL_OES, oes_texture);
-        glUniform1i(passthrough.texture_uniform, 0);
-        let (black_crush, color_gain) = stream_color_adjustment();
-        glUniform1f(passthrough.black_crush_uniform, black_crush);
-        glUniform1f(passthrough.color_gain_uniform, color_gain);
-        glUniform1i(
-            passthrough.hdr_mode_uniform,
-            if hdr_stream_enabled() { 1 } else { 0 },
-        );
-        glDrawArrays(GL_TRIANGLES, 0, 3);
-
-        // --- Pass 2: intermediate RGBA → left eye ---
-        blit_intermediate_to_eye(
-            &intermediate,
+        blit_texture_to_eye(
+            &direct_blit_program,
+            oes_texture,
             left_target,
             VideoFrameEye::Left,
             frame_width as u32,
             frame_height as u32,
+            "zero-copy AHB direct stats",
         )?;
 
-        // --- Pass 2: intermediate RGBA → right eye ---
-        blit_intermediate_to_eye(
-            &intermediate,
+        blit_texture_to_eye(
+            &direct_blit_program,
+            oes_texture,
             right_target,
             VideoFrameEye::Right,
             frame_width as u32,
             frame_height as u32,
+            "zero-copy AHB direct stats",
         )?;
 
         // Cleanup
         glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
         glUseProgram(0);
-        // Keep the source buffer alive until the GPU has finished sampling it.
-        // This avoids buffer reuse races on drivers that recycle decoder output
-        // aggressively once the Image handle is dropped on the next frame.
-        glFinish();
-        glBindFramebuffer(GL_FRAMEBUFFER, previous_framebuffer);
+        destroy_image(egl_display, egl_image);
     }
 
     Ok(())
 }
 
-fn blit_intermediate_to_eye(
-    intermediate: &IntermediateFbo,
+fn blit_texture_to_eye(
+    blit_program: &BlitProgram,
+    texture: u32,
     target: &EyeRenderTarget,
     eye: VideoFrameEye,
     frame_width: u32,
     frame_height: u32,
+    stats_label: &str,
 ) -> Result<()> {
     let source_eye = source_eye_for_target(eye);
     let side_by_side_stereo = frame_width >= frame_height.saturating_mul(2) && frame_width >= 2;
@@ -2632,7 +2738,8 @@ fn blit_intermediate_to_eye(
         VideoFrameEye::Right => 1,
     };
 
-    let blit_program = get_blit_program().context("get blit shader")?;
+    let count = AHB_BLIT_COUNT.load(Ordering::Relaxed);
+    let should_log_stats = count <= 5 || count % 120 == 0;
 
     unsafe {
         glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
@@ -2642,8 +2749,17 @@ fn blit_intermediate_to_eye(
         glClear(GL_COLOR_BUFFER_BIT);
         glUseProgram(blit_program.program);
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, intermediate.texture);
+        glBindTexture(blit_program.texture_target, texture);
         glUniform1i(blit_program.texture_uniform, 0);
+        if blit_program.black_crush_uniform >= 0 {
+            let (black_crush, color_gain) = stream_color_adjustment();
+            glUniform1f(blit_program.black_crush_uniform, black_crush);
+            glUniform1f(blit_program.color_gain_uniform, color_gain);
+            glUniform1i(
+                blit_program.hdr_mode_uniform,
+                if hdr_stream_enabled() { 1 } else { 0 },
+            );
+        }
         glUniform4f(blit_program.uv_rect_uniform, u0, v0, u1, v1);
         glUniform1i(blit_program.foveation_enabled_uniform, 0); // TODO: foveation for zero-copy
         glUniform1i(blit_program.view_index_uniform, view_index);
@@ -2651,8 +2767,27 @@ fn blit_intermediate_to_eye(
             blit_program.position_offset_x_uniform,
             convergence_position_offset_for_eye(eye),
         );
+        let _ = drain_gl_errors();
         glDrawArrays(GL_TRIANGLES, 0, 3);
-        glBindTexture(GL_TEXTURE_2D, 0);
+        let pass2_errors = drain_gl_errors();
+        glBindTexture(blit_program.texture_target, 0);
+        if should_log_stats {
+            let pass2_stats =
+                readback_framebuffer_luma_stats(target.framebuffer, target.width, target.height);
+            info!(
+                "{stats_label}: eye={:?} target={}x{} center_pixel={:?} luma_avg={:.1} dark_pct={:.1} bright_pct={:.1} gl_errors={:?} corrected={} hdr_stream={}",
+                eye,
+                target.width,
+                target.height,
+                pass2_stats.center_pixel,
+                pass2_stats.average_luma,
+                pass2_stats.dark_percent,
+                pass2_stats.bright_percent,
+                pass2_errors,
+                blit_program.black_crush_uniform >= 0,
+                hdr_stream_enabled(),
+            );
+        }
     }
 
     Ok(())

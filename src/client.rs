@@ -103,8 +103,7 @@ use std::{
     io::{Read, Write},
     net::{
         IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener as StdTcpListener,
-        TcpStream as StdTcpStream,
-        UdpSocket as StdUdpSocket,
+        TcpStream as StdTcpStream, UdpSocket as StdUdpSocket,
     },
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -750,9 +749,7 @@ fn drain_alvr_stream_thread(name: &str, session_id: u32, handle: JoinHandle<()>)
     } else {
         warn!(
             "ALVR stream thread did not finish within {:?}; detaching: session_id={} thread={}",
-            ALVR_STREAM_THREAD_JOIN_GRACE,
-            session_id,
-            name
+            ALVR_STREAM_THREAD_JOIN_GRACE, session_id, name
         );
         drop(handle);
     }
@@ -984,8 +981,8 @@ impl AlvrClient {
             protocol_id: self.config.protocol_id(),
             hostname: self.config.client_name.clone(),
         };
-        let socket =
-            StdUdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).context("bind discovery heartbeat socket")?;
+        let socket = StdUdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .context("bind discovery heartbeat socket")?;
         socket
             .set_broadcast(true)
             .context("enable discovery heartbeat broadcast")?;
@@ -1477,13 +1474,8 @@ fn run_minimal_alvr_stream(
     send_framed_locked(&control_writer, &ClientControlPacket::StreamReady)
         .context("send ALVR StreamReady")?;
     let initial_views_config = current_alvr_views_config();
-    send_framed_locked(
-        &control_writer,
-        &ClientControlPacket::LocalViewParams(views_config_to_local_view_params(
-            &initial_views_config,
-        )),
-    )
-    .context("send initial ALVR LocalViewParams")?;
+    send_alvr_local_view_params(&control_writer, &initial_views_config)
+        .context("send initial ALVR LocalViewParams")?;
     request_alvr_idr_best_effort(
         &control_writer,
         "stream startup so the server sends DecoderConfig and a fresh keyframe",
@@ -1677,6 +1669,26 @@ fn request_alvr_idr_best_effort(control_writer: &SharedControlWriter, reason: &s
     }
 }
 
+fn send_alvr_local_view_params(
+    control_writer: &SharedControlWriter,
+    views_config: &ViewsConfig,
+) -> Result<()> {
+    send_framed_locked(
+        control_writer,
+        &ClientControlPacket::LocalViewParams(views_config_to_local_view_params(views_config)),
+    )
+}
+
+#[cfg(target_os = "android")]
+fn take_lifecycle_stream_recovery_request() -> bool {
+    crate::pimax::take_alvr_stream_recovery_request()
+}
+
+#[cfg(not(target_os = "android"))]
+fn take_lifecycle_stream_recovery_request() -> bool {
+    false
+}
+
 fn request_alvr_idr_if_due(
     control_writer: &SharedControlWriter,
     reason: &str,
@@ -1762,7 +1774,9 @@ fn receive_alvr_udp_stream(
                         &buffer[ALVR_STREAM_SHARD_PREFIX_SIZE..len],
                     ) {
                         if shutdown_requested.load(Ordering::Acquire) {
-                            info!("ALVR UDP stream receiver exiting after session shutdown request");
+                            info!(
+                                "ALVR UDP stream receiver exiting after session shutdown request"
+                            );
                             break;
                         }
 
@@ -1918,7 +1932,9 @@ fn receive_alvr_udp_stream(
                         &buffer[ALVR_STREAM_SHARD_PREFIX_SIZE..len],
                     ) {
                         if shutdown_requested.load(Ordering::Acquire) {
-                            info!("ALVR UDP stream receiver exiting after session shutdown request");
+                            info!(
+                                "ALVR UDP stream receiver exiting after session shutdown request"
+                            );
                             break;
                         }
 
@@ -2163,14 +2179,26 @@ fn maintain_alvr_control_socket(writer: SharedControlWriter, shutdown_requested:
             next_keepalive = now + ALVR_KEEPALIVE_INTERVAL;
         }
 
+        if take_lifecycle_stream_recovery_request() {
+            let current_views_config = current_alvr_views_config();
+            if let Err(err) = send_alvr_local_view_params(&writer, &current_views_config) {
+                warn!(
+                    "ALVR control maintenance thread exiting after lifecycle LocalViewParams refresh failure: {err:#}"
+                );
+                request_alvr_control_shutdown(
+                    &writer,
+                    &shutdown_requested,
+                    "lifecycle LocalViewParams refresh failure",
+                );
+                break;
+            }
+            info!("resent ALVR LocalViewParams after native lifecycle recovery");
+            request_alvr_idr_best_effort(&writer, "native lifecycle recovery");
+        }
+
         if let Some(views_config) = latest_alvr_views_config() {
             if Some(views_config.version) != last_views_config_version {
-                if let Err(err) = send_framed_locked(
-                    &writer,
-                    &ClientControlPacket::LocalViewParams(views_config_to_local_view_params(
-                        &views_config.config,
-                    )),
-                ) {
+                if let Err(err) = send_alvr_local_view_params(&writer, &views_config.config) {
                     warn!(
                         "ALVR control maintenance thread exiting after LocalViewParams update failure: {err:#}"
                     );
@@ -2742,7 +2770,10 @@ fn read_exact_until_shutdown(
 }
 
 #[cfg(target_os = "android")]
-fn read_alvr_control_socket(stream: &mut StdTcpStream, buffer: &mut [u8]) -> std::io::Result<usize> {
+fn read_alvr_control_socket(
+    stream: &mut StdTcpStream,
+    buffer: &mut [u8],
+) -> std::io::Result<usize> {
     let result = unsafe {
         libc::recv(
             stream.as_raw_fd(),
@@ -2760,7 +2791,10 @@ fn read_alvr_control_socket(stream: &mut StdTcpStream, buffer: &mut [u8]) -> std
 }
 
 #[cfg(not(target_os = "android"))]
-fn read_alvr_control_socket(stream: &mut StdTcpStream, buffer: &mut [u8]) -> std::io::Result<usize> {
+fn read_alvr_control_socket(
+    stream: &mut StdTcpStream,
+    buffer: &mut [u8],
+) -> std::io::Result<usize> {
     stream.read(buffer)
 }
 
@@ -3248,8 +3282,7 @@ mod tests {
     use crate::protocol::DISCOVERY_PORT;
     use std::sync::LazyLock;
 
-    static DISCOVERY_RECOVERY_TEST_GUARD: LazyLock<Mutex<()>> =
-        LazyLock::new(|| Mutex::new(()));
+    static DISCOVERY_RECOVERY_TEST_GUARD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
     fn discovered_streamer_can_be_debugged() {
@@ -3303,7 +3336,10 @@ mod tests {
             DISCOVERY_PORT,
         );
 
-        assert_eq!(targets, vec![SocketAddr::from((Ipv4Addr::BROADCAST, DISCOVERY_PORT))]);
+        assert_eq!(
+            targets,
+            vec![SocketAddr::from((Ipv4Addr::BROADCAST, DISCOVERY_PORT))]
+        );
     }
 
     #[test]
@@ -3450,7 +3486,9 @@ mod tests {
         assert!(shutdown_requested.load(Ordering::Acquire));
 
         let mut byte = [0_u8; 1];
-        let read = server.read(&mut byte).expect("server observes peer shutdown");
+        let read = server
+            .read(&mut byte)
+            .expect("server observes peer shutdown");
         assert_eq!(read, 0);
     }
 
@@ -3475,7 +3513,8 @@ mod tests {
             shutdown_signal.store(true, Ordering::Release);
         });
 
-        let result = recv_framed_until_shutdown::<ServerControlPacket>(&mut server, &shutdown_requested);
+        let result =
+            recv_framed_until_shutdown::<ServerControlPacket>(&mut server, &shutdown_requested);
         wake_thread.join().expect("join shutdown wake thread");
 
         let err = result.expect_err("shutdown should interrupt framed recv");

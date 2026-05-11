@@ -122,6 +122,15 @@ public final class VrRenderActivity extends NativeActivity {
     /** Runtime permission request code for microphone access. */
     private static final int REQUEST_RECORD_AUDIO = 1001;
 
+    /** Native presentation refresh reason code: activity resumed into the foreground. */
+    private static final int PRESENTATION_REFRESH_REASON_ACTIVITY_RESUME = 1;
+
+    /** Native presentation refresh reason code: window focus returned while resumed. */
+    private static final int PRESENTATION_REFRESH_REASON_WINDOW_FOCUS_GAIN = 2;
+
+    /** Native presentation refresh reason code: native bootstrap completed while resumed. */
+    private static final int PRESENTATION_REFRESH_REASON_NATIVE_READY = 3;
+
     /** Pimax vendor setting used by stock WiFi Airlink's HmdSync while streaming. */
     private static final String PIMAX_EYECHIP_ON_SETTING = "eyechip_on";
 
@@ -143,12 +152,11 @@ public final class VrRenderActivity extends NativeActivity {
      * Keep the Android display wake path asserted for the full lifetime of an active ALVR
      * session, even when the headset proximity sensor reports "far".
      *
-     * <p>This is intentionally more aggressive than stock Pimax behavior because our controlled
-     * launch and debug workflows run off-head. Releasing the activity wake lock on far/screen-off
-     * lets the panel sleep before the native renderer has a chance to present frames, which hides
-     * decoder and color bugs behind an avoidable black-screen automation failure.
+     * <p>Now that lifecycle recovery reasserts presentation and stream state on resume, we can
+     * let normal off-head sleep happen again instead of pinning the panel awake for the entire
+     * streaming session.
      */
-    private static final boolean KEEP_DISPLAY_AWAKE_DURING_STREAMING = true;
+    private static final boolean KEEP_DISPLAY_AWAKE_DURING_STREAMING = false;
 
     // ---- Pimax hardware bridge constants ---------------------------------------------
 
@@ -198,6 +206,9 @@ public final class VrRenderActivity extends NativeActivity {
 
     /** Testable state machine for proximity-driven display wake/sleep decisions. */
     private final ProximityWakePolicy proximityWakePolicy = new ProximityWakePolicy();
+
+    /** Testable state machine for lifecycle-aware native presentation recovery. */
+    private final VrLifecycleState vrLifecycleState = new VrLifecycleState();
 
     /** Latest screen-on/off state that should be forwarded to native when it becomes ready. */
     private boolean pendingNativeScreenOn = true;
@@ -450,20 +461,23 @@ public final class VrRenderActivity extends NativeActivity {
             try {
                 if (LOAD_PXRAPI_EAGERLY) {
                     try {
+                        Log.i(TAG, "loading pxrapi from bootstrap thread");
                         System.loadLibrary("pxrapi");
                         Log.i(TAG, "loaded pxrapi");
                     } catch (UnsatisfiedLinkError error) {
                         Log.w(TAG, "pxrapi library is not in this APK path; continuing with framework-loaded PxrApi", error);
                     }
                 }
+                Log.i(TAG, "loading pimax_alvr_client");
                 System.loadLibrary("pimax_alvr_client");
                 Log.i(TAG, "loaded pimax_alvr_client");
                 nativeLibrariesLoaded = true;
                 nativeNotifyMicrophonePermission(microphonePermissionGranted);
+                Log.i(TAG, "mirrored microphone permission to native: " + microphonePermissionGranted);
                 runOnUiThread(() -> flushDeferredNativeState("native bootstrap complete"));
             } catch (UnsatisfiedLinkError error) {
                 Log.w(TAG, "failed to load native libraries", error);
-            } catch (RuntimeException error) {
+            } catch (Throwable error) {
                 Log.w(TAG, "native bootstrap failed", error);
             }
         }, "PimaxNativeBootstrap");
@@ -499,9 +513,45 @@ public final class VrRenderActivity extends NativeActivity {
         resetNativeShutdown(reason);
         nativeNotifyScreen(pendingNativeScreenOn);
         nativeNotifyProximity(proximityWakePolicy.isHeadsetNear());
+        syncNativeLifecycleState(reason);
+        if (vrLifecycleState.shouldRefreshWhenNativeBecomesReady()) {
+            requestNativePresentationRefresh(PRESENTATION_REFRESH_REASON_NATIVE_READY, reason);
+        }
         registerPimaxHardwareBridge();
         registerProximitySensor();
         startControllerPoller();
+    }
+
+    private void syncNativeLifecycleState(String reason) {
+        Log.i(TAG, "syncing native lifecycle state: phase=" + vrLifecycleState.phase()
+                + " focused=" + vrLifecycleState.hasWindowFocus()
+                + " reason=" + reason);
+        if (!nativeLibrariesLoaded) {
+            return;
+        }
+        try {
+            nativeSetLifecycleState(vrLifecycleState.phase().nativeValue());
+        } catch (UnsatisfiedLinkError error) {
+            Log.w(TAG, "native lifecycle hook unavailable: " + reason, error);
+        } catch (RuntimeException error) {
+            Log.w(TAG, "native lifecycle hook failed: " + reason, error);
+        }
+    }
+
+    private void requestNativePresentationRefresh(int reasonCode, String reason) {
+        if (!nativeLibrariesLoaded) {
+            Log.i(TAG, "deferring native presentation refresh until libraries load: " + reason);
+            return;
+        }
+        try {
+            nativeRequestPresentationRefresh(reasonCode);
+            Log.i(TAG, "requested native presentation refresh: reasonCode=" + reasonCode
+                    + " reason=" + reason);
+        } catch (UnsatisfiedLinkError error) {
+            Log.w(TAG, "native presentation refresh hook unavailable: " + reason, error);
+        } catch (RuntimeException error) {
+            Log.w(TAG, "native presentation refresh hook failed: " + reason, error);
+        }
     }
 
     /**
@@ -551,6 +601,18 @@ public final class VrRenderActivity extends NativeActivity {
      * render session after a previous shutdown was requested.
      */
     private static native void nativeResetShutdown();
+
+    /**
+     * Mirrors the Android activity lifecycle phase into native code for explicit logging and
+     * recovery decisions.
+     */
+    private static native void nativeSetLifecycleState(int state);
+
+    /**
+     * Requests that native reassert Pimax presentation state after a recoverable lifecycle
+     * transition such as resume, focus regain, or delayed native bootstrap completion.
+     */
+    private static native void nativeRequestPresentationRefresh(int reasonCode);
 
     /**
      * Sends an updated IPD (interpupillary distance) value from the Pimax hardware bridge
@@ -631,6 +693,7 @@ public final class VrRenderActivity extends NativeActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         Log.i(TAG, "VrRenderActivity.onCreate");
+        vrLifecycleState.onCreate();
         paused = false;
         proximityWakePolicy.setPaused(false);
         nativeShutdownRequested = false;
@@ -649,6 +712,7 @@ public final class VrRenderActivity extends NativeActivity {
         registerProximitySensor();
         startControllerPoller();
         ensureMicrophonePermission();
+        syncNativeLifecycleState("onCreate");
         startNativeBootstrapIfNeeded("onCreate");
     }
 
@@ -678,6 +742,7 @@ public final class VrRenderActivity extends NativeActivity {
             finishActivity("resume after native shutdown");
             return;
         }
+        boolean shouldRefreshPresentation = vrLifecycleState.onResume();
         resetNativeShutdown("onResume");
         // 90 Hz provides the smoothest head tracking on Pimax Crystal.
         trySetPeakRefreshRate(90.0f, "onResume");
@@ -702,6 +767,12 @@ public final class VrRenderActivity extends NativeActivity {
         registerProximitySensor();
         startControllerPoller();
         ensureMicrophonePermission();
+        syncNativeLifecycleState("onResume");
+        if (shouldRefreshPresentation) {
+            requestNativePresentationRefresh(
+                    PRESENTATION_REFRESH_REASON_ACTIVITY_RESUME,
+                    "onResume");
+        }
         startNativeBootstrapIfNeeded("onResume");
     }
 
@@ -718,6 +789,7 @@ public final class VrRenderActivity extends NativeActivity {
     @Override
     protected void onPause() {
         Log.i(TAG, "VrRenderActivity.onPause");
+        vrLifecycleState.onPause();
         paused = true;
         proximityWakePolicy.setPaused(true);
         // Reduce refresh rate to save power — full 90 Hz is only needed while actively tracking.
@@ -725,6 +797,7 @@ public final class VrRenderActivity extends NativeActivity {
         // Note: native render loop and wake lock remain alive here.
         // Pimax XR entry pauses this activity while keeping the render thread running.
         Log.i(TAG, "keeping native render loop and wake lock alive after onPause; Pimax XR entry pauses the activity");
+        syncNativeLifecycleState("onPause");
         super.onPause();
     }
 
@@ -738,10 +811,12 @@ public final class VrRenderActivity extends NativeActivity {
     @Override
     protected void onStop() {
         Log.i(TAG, "VrRenderActivity.onStop");
+        vrLifecycleState.onStop();
         paused = true;
         proximityWakePolicy.setPaused(true);
         // Note: native render loop and wake lock remain alive here.
         Log.i(TAG, "keeping native render loop and wake lock alive after onStop; Pimax XR entry can stop the activity");
+        syncNativeLifecycleState("onStop");
         super.onStop();
     }
 
@@ -759,10 +834,12 @@ public final class VrRenderActivity extends NativeActivity {
     @Override
     protected void onDestroy() {
         Log.i(TAG, "VrRenderActivity.onDestroy");
+        vrLifecycleState.onDestroy();
         paused = true;
         proximityWakePolicy.setPaused(true);
         // Signal the native render loop to shut down.
         requestNativeShutdown("onDestroy");
+        syncNativeLifecycleState("onDestroy");
         stopControllerPoller();
         stopDisplayWakeRetry("onDestroy");
         stopProximityUnknownSleep("onDestroy");
@@ -805,6 +882,8 @@ public final class VrRenderActivity extends NativeActivity {
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
+        boolean shouldRefreshPresentation = vrLifecycleState.onWindowFocusChanged(hasFocus);
+        syncNativeLifecycleState("windowFocus=" + hasFocus);
         if (hasFocus) {
             Log.i(TAG, "VrRenderActivity.onWindowFocusChanged(true)");
             // Apply immersive sticky mode — hides navigation and status bars.
@@ -813,6 +892,11 @@ public final class VrRenderActivity extends NativeActivity {
                 keepDisplayAwake("window focus");
             } else {
                 allowDisplaySleep("window focus while off-head");
+            }
+            if (shouldRefreshPresentation) {
+                requestNativePresentationRefresh(
+                        PRESENTATION_REFRESH_REASON_WINDOW_FOCUS_GAIN,
+                        "window focus gained");
             }
         }
     }
