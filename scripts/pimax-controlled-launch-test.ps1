@@ -35,6 +35,7 @@ $artifactRootPath = if ([System.IO.Path]::IsPathRooted($ArtifactRoot)) {
 $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
 $artifactDir = Join-Path $artifactRootPath "pimax_controlled_launch_$timestamp"
 $script:AdbArgs = @()
+$script:OriginalPimaxRuntimeState = $null
 
 if (-not [string]::IsNullOrWhiteSpace($Serial)) {
     $script:AdbArgs = @("-s", $Serial)
@@ -139,6 +140,125 @@ function Save-AdbSnapshot {
     $path = Join-Path $artifactDir $FileName
     Set-Content -Encoding UTF8 -Path $path -Value $result.Output
     return $result
+}
+
+function Get-PimaxRuntimeState {
+    $result = Invoke-AdbCommand `
+        -Description "read Pimax runtime state" `
+        -AdbCommandArgs @("shell", 'echo sta_pm=$(getprop persist.sys.pmx.sta.pm.enable); echo psensor_gotosleep=$(getprop persist.sys.pmx.psensor.gotosleep); echo disable_psensor=$(getprop persist.sys.pmx.dbg.disable.psensor); echo pc_switch=$(getprop sys.pmx.pc.switch); echo sta_time=$(getprop persist.sys.pmx.sta.time); echo dim_screen=$(settings get system dim_screen); echo screen_off_timeout=$(settings get system screen_off_timeout); echo pmx_pc_screen_off_timeout=$(settings get system pmx_pc_screen_off_timeout); echo eyechip_on=$(settings get system eyechip_on); echo peak_refresh_rate=$(settings get system peak_refresh_rate)') `
+        -AllowFailure
+
+    $state = @{}
+    foreach ($line in $result.Output) {
+        if ($line -match '^\s*([^=]+)=(.*)\s*$') {
+            $state[$matches[1].Trim()] = $matches[2].Trim()
+        }
+    }
+
+    return [pscustomobject]@{
+        StaPmEnable = $state['sta_pm']
+        PsensorGotoSleep = $state['psensor_gotosleep']
+        DisablePsensor = $state['disable_psensor']
+        PcSwitch = $state['pc_switch']
+        StaTime = $state['sta_time']
+        DimScreen = $state['dim_screen']
+        ScreenOffTimeout = $state['screen_off_timeout']
+        PmxPcScreenOffTimeout = $state['pmx_pc_screen_off_timeout']
+        EyechipOn = $state['eyechip_on']
+        PeakRefreshRate = $state['peak_refresh_rate']
+    }
+}
+
+function Save-OriginalPimaxRuntimeState {
+    if ($null -ne $script:OriginalPimaxRuntimeState) {
+        return
+    }
+
+    $script:OriginalPimaxRuntimeState = Get-PimaxRuntimeState
+    ($script:OriginalPimaxRuntimeState | Format-List | Out-String) |
+        Set-Content -Encoding UTF8 -Path (Join-Path $artifactDir "pimax-runtime-state-original.txt")
+}
+
+function Resolve-RestorePimaxRuntimeState {
+    if ($null -eq $script:OriginalPimaxRuntimeState) {
+        return $null
+    }
+
+    $restoreState = [ordered]@{
+        StaPmEnable = $script:OriginalPimaxRuntimeState.StaPmEnable
+        PsensorGotoSleep = $script:OriginalPimaxRuntimeState.PsensorGotoSleep
+        DisablePsensor = $script:OriginalPimaxRuntimeState.DisablePsensor
+        PcSwitch = $script:OriginalPimaxRuntimeState.PcSwitch
+        StaTime = $script:OriginalPimaxRuntimeState.StaTime
+        DimScreen = $script:OriginalPimaxRuntimeState.DimScreen
+        ScreenOffTimeout = $script:OriginalPimaxRuntimeState.ScreenOffTimeout
+        PmxPcScreenOffTimeout = $script:OriginalPimaxRuntimeState.PmxPcScreenOffTimeout
+        EyechipOn = $script:OriginalPimaxRuntimeState.EyechipOn
+        PeakRefreshRate = $script:OriginalPimaxRuntimeState.PeakRefreshRate
+    }
+
+    $capturedLooksLikeAutomationProfile =
+        $restoreState.PsensorGotoSleep -eq "false" -and
+        $restoreState.DisablePsensor -eq "true"
+
+    if ($capturedLooksLikeAutomationProfile) {
+        Write-Warning "Captured Pimax runtime state already looks like the automation sleep-disabled profile; restoring normal proximity defaults instead."
+        $restoreState.PsensorGotoSleep = "true"
+        $restoreState.DisablePsensor = "false"
+        if ([string]::IsNullOrWhiteSpace($restoreState.StaPmEnable)) {
+            $restoreState.StaPmEnable = "false"
+        }
+    }
+
+    return [pscustomobject]$restoreState
+}
+
+function Restore-PimaxRuntimeState {
+    param(
+        [string]$Reason
+    )
+
+    if ($null -eq $script:OriginalPimaxRuntimeState) {
+        Write-Warning "No original Pimax runtime state was captured; skipping restore for $Reason."
+        return
+    }
+
+    $restoreState = Resolve-RestorePimaxRuntimeState
+    if ($null -eq $restoreState) {
+        Write-Warning "No resolved Pimax runtime state is available; skipping restore for $Reason."
+        return
+    }
+
+    Write-Host "Restoring original Pimax runtime state: $Reason"
+
+    $restoreOperations = @(
+        @{ Description = "restore Pimax station power-management property"; Command = "setprop persist.sys.pmx.sta.pm.enable $($restoreState.StaPmEnable)" ; Value = $restoreState.StaPmEnable },
+        @{ Description = "restore Pimax proximity-sensor sleep property"; Command = "setprop persist.sys.pmx.psensor.gotosleep $($restoreState.PsensorGotoSleep)" ; Value = $restoreState.PsensorGotoSleep },
+        @{ Description = "restore Pimax proximity state-machine property"; Command = "setprop persist.sys.pmx.dbg.disable.psensor $($restoreState.DisablePsensor)" ; Value = $restoreState.DisablePsensor },
+        @{ Description = "restore transient Pimax PC-switch panel gate"; Command = "setprop sys.pmx.pc.switch $($restoreState.PcSwitch)" ; Value = $restoreState.PcSwitch },
+        @{ Description = "restore Pimax station time property"; Command = "setprop persist.sys.pmx.sta.time $($restoreState.StaTime)" ; Value = $restoreState.StaTime },
+        @{ Description = "restore Android dim-screen setting"; Command = "settings put system dim_screen $($restoreState.DimScreen)" ; Value = $restoreState.DimScreen },
+        @{ Description = "restore Android screen-off timeout"; Command = "settings put system screen_off_timeout $($restoreState.ScreenOffTimeout)" ; Value = $restoreState.ScreenOffTimeout },
+        @{ Description = "restore Pimax PC-mode screen-off timeout"; Command = "settings put system pmx_pc_screen_off_timeout $($restoreState.PmxPcScreenOffTimeout)" ; Value = $restoreState.PmxPcScreenOffTimeout },
+        @{ Description = "restore Pimax eyechip setting"; Command = "settings put system eyechip_on $($restoreState.EyechipOn)" ; Value = $restoreState.EyechipOn },
+        @{ Description = "restore peak refresh rate"; Command = "settings put system peak_refresh_rate $($restoreState.PeakRefreshRate)" ; Value = $restoreState.PeakRefreshRate }
+    )
+
+    foreach ($operation in $restoreOperations) {
+        if ([string]::IsNullOrWhiteSpace($operation.Value)) {
+            Write-Warning "Skipping restore for '$($operation.Description)' because the original value was blank."
+            continue
+        }
+
+        Invoke-AdbCommand `
+            -Description $operation.Description `
+            -AdbCommandArgs @("shell", $operation.Command) `
+            -AllowFailure | Out-Null
+    }
+
+    $restoredState = Get-PimaxRuntimeState
+    ($restoredState | Format-List | Out-String) |
+        Set-Content -Encoding UTF8 -Path (Join-Path $artifactDir "pimax-runtime-state-restored-$Reason.txt")
 }
 
 function Wait-For-BootCompleted {
@@ -692,6 +812,7 @@ function Recover-HeadsetAfterRun {
     Save-AdbSnapshot -FileName "recover-reboot.txt" -Description "recover reboot" -AdbCommandArgs @("reboot") -AllowFailure | Out-Null
     Wait-For-BootCompleted
     Initialize-HeadsetForRun -Reason "post-recovery"
+    Restore-PimaxRuntimeState -Reason "post-recovery"
     Stop-AppForCleanLaunch -PidFileName "pid-post-recovery-before-clean-stop.txt" -ForceStopFileName "force-stop-post-recovery.txt" -SnapshotLabel "post-recovery-after-clean-stop"
     Save-DisplaySnapshot -Label "post-recovery"
     Write-DisplaySummary -Label "post-recovery"
@@ -706,6 +827,7 @@ try {
     Write-ProgressMarker "script start"
     Write-Host "Controlled launch artifact: $artifactDir"
     Save-AdbSnapshot -FileName "devices.txt" -Description "adb devices" -AdbCommandArgs @("devices", "-l") | Out-Null
+    Save-OriginalPimaxRuntimeState
 
     if ($RebootBeforeRun) {
         Write-ProgressMarker "pre-run reboot start"
@@ -780,6 +902,12 @@ try {
         }
     }
 } finally {
+    try {
+        Restore-PimaxRuntimeState -Reason "post-run"
+    } catch {
+        Write-Warning "Failed to restore original Pimax runtime state: $($_.Exception.Message)"
+    }
+
     if ($RecoverAfterRun) {
         try {
             Recover-HeadsetAfterRun

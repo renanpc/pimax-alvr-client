@@ -105,6 +105,21 @@ Display (Pimax Crystal lenses)
 - **Diagnostic Pattern**: When not connected, shows simple test pattern without convergence shift (convergence correction requires ALVR video path)
 - **Audio Routing**: Game audio and microphone capture are implemented, but PC-side virtual cable setup is still required
 
+## Audio Setup
+
+For repeatable ALVR audio behavior on Crystal OG, use the following setup:
+
+1. In ALVR Dashboard, enable both `Game Audio` and `Microphone`.
+2. On the PC, choose the headset speaker/output you want ALVR to target from the ALVR audio settings.
+3. If you want the headset microphone to appear in Windows apps or voice chat reliably, route the ALVR microphone output to a virtual input device such as VB-Cable, then select that input inside the target PC application.
+4. Grant `RECORD_AUDIO` permission on the headset when the app asks for it. Game audio does not depend on microphone permission, but microphone forwarding does.
+5. After changing PC-side audio routing, restart the ALVR session once so the new routing is negotiated cleanly.
+
+Expected behavior after setup:
+- headset game audio should start automatically when the ALVR stream starts
+- microphone packets should continue flowing after reconnects
+- permission can be granted after connection and the microphone capture thread will start once it becomes available
+
 ## Build
 
 ```powershell
