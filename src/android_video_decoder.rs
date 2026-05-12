@@ -9,6 +9,7 @@ use std::time::Duration;
 use anyhow::Result;
 use log::{error, info, warn};
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::upstream_video_decoder::{
     self, VideoDecoderConfig, VideoDecoderSink, VideoDecoderSource,
@@ -22,6 +23,16 @@ static UPSTREAM_DECODER_SOURCE: Mutex<Option<VideoDecoderSource>> = Mutex::new(N
 /// Dimensions of the decoded frame, set during configure and read by the
 /// render thread to size the intermediate FBO.
 static UPSTREAM_DECODER_DIMENSIONS: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+static UPSTREAM_DECODER_RESTART_COUNT: AtomicU64 = AtomicU64::new(0);
+static UPSTREAM_DECODER_BACKPRESSURE_COUNT: AtomicU64 = AtomicU64::new(0);
+static UPSTREAM_DECODER_FATAL_ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UpstreamDecoderDiagnosticsSnapshot {
+    pub restart_count: u64,
+    pub backpressure_count: u64,
+    pub fatal_error_count: u64,
+}
 
 /// Thin wrapper around upstream's VideoDecoderSink / VideoDecoderSource pair.
 /// Maintains the same public interface as the legacy AlvrAndroidVideoDecoder
@@ -101,6 +112,7 @@ impl AlvrAndroidVideoDecoder {
                     // render loop when it polls get_frame().
                 }
                 Err(e) => {
+                    UPSTREAM_DECODER_FATAL_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
                     error!("upstream decoder fatal error: {e:#}");
                 }
             }
@@ -123,6 +135,7 @@ impl AlvrAndroidVideoDecoder {
             return false;
         };
 
+        UPSTREAM_DECODER_RESTART_COUNT.fetch_add(1, Ordering::Relaxed);
         info!(
             "restarting upstream decoder for IDR recovery: {} ({}x{})",
             state.codec_label, state.frame_width, state.frame_height
@@ -135,6 +148,10 @@ impl AlvrAndroidVideoDecoder {
                 false
             }
         }
+    }
+
+    pub fn force_stream_recovery(&self) -> bool {
+        self.restart_for_idr()
     }
 
     pub fn push_nal(&self, timestamp_ns: u64, _is_idr: bool, data: Vec<u8>) -> bool {
@@ -168,6 +185,7 @@ impl AlvrAndroidVideoDecoder {
             }
         }
 
+        UPSTREAM_DECODER_BACKPRESSURE_COUNT.fetch_add(1, Ordering::Relaxed);
         warn!("upstream decoder input buffer full, dropping NAL");
         false
     }
@@ -203,4 +221,37 @@ pub fn release_upstream_decoder() {
 /// Return the configured decoder frame dimensions, if any.
 pub fn upstream_decoder_dimensions() -> Option<(i32, i32)> {
     *UPSTREAM_DECODER_DIMENSIONS.lock()
+}
+
+pub fn reset_upstream_decoder_diagnostics() {
+    UPSTREAM_DECODER_RESTART_COUNT.store(0, Ordering::Relaxed);
+    UPSTREAM_DECODER_BACKPRESSURE_COUNT.store(0, Ordering::Relaxed);
+    UPSTREAM_DECODER_FATAL_ERROR_COUNT.store(0, Ordering::Relaxed);
+}
+
+pub fn upstream_decoder_diagnostics_snapshot() -> UpstreamDecoderDiagnosticsSnapshot {
+    UpstreamDecoderDiagnosticsSnapshot {
+        restart_count: UPSTREAM_DECODER_RESTART_COUNT.load(Ordering::Relaxed),
+        backpressure_count: UPSTREAM_DECODER_BACKPRESSURE_COUNT.load(Ordering::Relaxed),
+        fatal_error_count: UPSTREAM_DECODER_FATAL_ERROR_COUNT.load(Ordering::Relaxed),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_upstream_decoder_diagnostics_clears_all_counters() {
+        UPSTREAM_DECODER_RESTART_COUNT.store(2, Ordering::Relaxed);
+        UPSTREAM_DECODER_BACKPRESSURE_COUNT.store(3, Ordering::Relaxed);
+        UPSTREAM_DECODER_FATAL_ERROR_COUNT.store(4, Ordering::Relaxed);
+
+        reset_upstream_decoder_diagnostics();
+
+        let snapshot = upstream_decoder_diagnostics_snapshot();
+        assert_eq!(snapshot.restart_count, 0);
+        assert_eq!(snapshot.backpressure_count, 0);
+        assert_eq!(snapshot.fatal_error_count, 0);
+    }
 }

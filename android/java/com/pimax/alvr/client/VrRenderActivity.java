@@ -415,8 +415,12 @@ public final class VrRenderActivity extends NativeActivity {
                 if (nativeLibrariesLoaded) {
                     nativeNotifyScreen(true);
                 }
+                rearmProximityWakeRecovery("screen-on broadcast");
                 if (shouldKeepDisplayAwakeForProximity()) {
                     keepDisplayAwake("screen-on broadcast");
+                    if (!proximityWakePolicy.isHeadsetNear()) {
+                        startDisplayWakeRetry("screen-on broadcast awaiting fresh proximity");
+                    }
                 } else {
                     allowDisplaySleep("screen-on broadcast while off-head");
                 }
@@ -430,11 +434,15 @@ public final class VrRenderActivity extends NativeActivity {
                 if (nativeLibrariesLoaded) {
                     nativeNotifyScreen(false);
                 }
-                stopDisplayWakeRetry("screen-off broadcast");
                 if (KEEP_DISPLAY_AWAKE_DURING_STREAMING) {
                     forceScreenWakeLock("screen-off broadcast while streaming");
                     Log.i(TAG, "screen turned off; reasserted app wake lock because streaming override is enabled");
+                } else if (shouldKeepDisplayAwakeForProximity()) {
+                    forceScreenWakeLock("screen-off broadcast while awaiting proximity recovery");
+                    startDisplayWakeRetry("screen-off broadcast awaiting proximity recovery");
+                    Log.i(TAG, "screen turned off while proximity recovery is still pending; reasserting wake path");
                 } else {
+                    stopDisplayWakeRetry("screen-off broadcast");
                     releaseScreenWakeLock();
                     Log.i(TAG, "screen turned off; released app wake lock until Pimax reports screen-on");
                 }
@@ -756,6 +764,9 @@ public final class VrRenderActivity extends NativeActivity {
         if (nativeLibrariesLoaded) {
             nativeNotifyScreen(interactive);
         }
+        if (interactive) {
+            rearmProximityWakeRecovery("onResume");
+        }
         if (interactive && shouldKeepDisplayAwakeForProximity()) {
             keepDisplayAwake("onResume");
         } else if (interactive) {
@@ -888,6 +899,7 @@ public final class VrRenderActivity extends NativeActivity {
             Log.i(TAG, "VrRenderActivity.onWindowFocusChanged(true)");
             // Apply immersive sticky mode — hides navigation and status bars.
             getWindow().getDecorView().setSystemUiVisibility(SYSTEM_UI_VISIBILITY_FLAGS);
+            rearmProximityWakeRecovery("window focus");
             if (shouldKeepDisplayAwakeForProximity()) {
                 keepDisplayAwake("window focus");
             } else {
@@ -1125,6 +1137,13 @@ public final class VrRenderActivity extends NativeActivity {
     private boolean shouldKeepDisplayAwakeForProximity() {
         return KEEP_DISPLAY_AWAKE_DURING_STREAMING
                 || proximityWakePolicy.shouldKeepDisplayAwakeForProximity();
+    }
+
+    /** Re-arms a stale off-head proximity state so a fresh near sample can wake the session. */
+    private void rearmProximityWakeRecovery(String reason) {
+        if (proximityWakePolicy.rearmUnknownAfterWakeSignal()) {
+            Log.i(TAG, "re-armed proximity wake recovery after foreground signal: " + reason);
+        }
     }
 
     /** Enables the normal VR keep-awake policy while the headset is being worn. */
@@ -1405,7 +1424,8 @@ public final class VrRenderActivity extends NativeActivity {
 
     /** Retry wake pokes until the display becomes interactive or the retry budget is used up. */
     private void retryDisplayWakeIfNeeded() {
-        if (!proximityWakePolicy.isHeadsetNear()) {
+        if (!shouldKeepDisplayAwakeForProximity()) {
+            Log.i(TAG, "display wake retry stopped because proximity policy now allows sleep");
             return;
         }
         PowerManager powerManager = (PowerManager) getSystemService(POWER_SERVICE);

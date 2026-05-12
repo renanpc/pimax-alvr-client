@@ -211,6 +211,9 @@ static HEADSET_NEAR: AtomicBool = AtomicBool::new(false);
 /// Presentation refresh should wait until the panel path is reported on again, not merely until
 /// the activity is resumed.
 static SCREEN_ON: AtomicBool = AtomicBool::new(true);
+const HEAD_MOTION_RECOVERY_POSITION_THRESHOLD_METERS: f32 = 0.03;
+const HEAD_MOTION_RECOVERY_ANGLE_THRESHOLD_RADIANS: f32 = 8.0_f32.to_radians();
+const HEAD_MOTION_RECOVERY_ACTIVE_FRAMES: i32 = 360;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -340,8 +343,32 @@ fn should_refresh_presentation_now(
     lifecycle_state: PimaxActivityLifecycleState,
     headset_near: bool,
     screen_on: bool,
+    recent_head_motion: bool,
 ) -> bool {
-    lifecycle_state == PimaxActivityLifecycleState::Resumed && headset_near && screen_on
+    lifecycle_state == PimaxActivityLifecycleState::Resumed
+        && screen_on
+        && (headset_near || recent_head_motion)
+}
+
+fn head_motion_indicates_active_use(
+    previous_orientation: glam::Quat,
+    previous_position: glam::Vec3,
+    current_orientation: glam::Quat,
+    current_position: glam::Vec3,
+) -> bool {
+    let position_delta = previous_position.distance(current_position);
+    if position_delta >= HEAD_MOTION_RECOVERY_POSITION_THRESHOLD_METERS {
+        return true;
+    }
+
+    previous_orientation.angle_between(current_orientation).abs()
+        >= HEAD_MOTION_RECOVERY_ANGLE_THRESHOLD_RADIANS
+}
+
+fn has_recent_head_motion(last_motion_frame_index: Option<i32>, frame_index: i32) -> bool {
+    last_motion_frame_index.is_some_and(|last_frame| {
+        frame_index.wrapping_sub(last_frame) <= HEAD_MOTION_RECOVERY_ACTIVE_FRAMES
+    })
 }
 
 #[no_mangle]
@@ -681,7 +708,9 @@ const PIMAX_ANIMATE_DIAGNOSTIC_PATTERN: bool = false;
 const PIMAX_DUMP_SUBMITTED_EYE_FRAMES: bool = true;
 const PIMAX_DUMP_SUBMITTED_EYE_FRAME_LIMIT: u32 = 124;
 const PIMAX_RENDER_WINDOW_SURFACE_MIRROR: bool = false;
-const PIMAX_BOOTSTRAP_WITH_ROTATION_ONLY: bool = true;
+// Crystal OG reports stable positional tracking support, and forcing
+// rotation-only bootstrap makes head movement feel artificially constrained.
+const PIMAX_BOOTSTRAP_WITH_ROTATION_ONLY: bool = false;
 const PIMAX_PROMOTE_TO_POSITIONAL_TRACKING: bool = false;
 // Keep probe() focused on entering the VR frame loop. Several report-only JNI
 // queries have been observed to stall the app on its loading surface.
@@ -841,6 +870,16 @@ fn select_promotion_tracking_mode(
         Some(TRACKING_MODE_ROTATION_POSITION)
     } else {
         None
+    }
+}
+
+fn select_alvr_head_tracking_timestamp(head_pose: &PimaxHeadTrackingPose) -> Duration {
+    if !head_pose.expected_display_timestamp.is_zero() {
+        head_pose.expected_display_timestamp
+    } else if !head_pose.pose_timestamp.is_zero() {
+        head_pose.pose_timestamp
+    } else {
+        head_pose.fetch_timestamp
     }
 }
 
@@ -2818,28 +2857,143 @@ mod tests {
         assert!(should_refresh_presentation_now(
             PimaxActivityLifecycleState::Resumed,
             true,
-            true
+            true,
+            false,
         ));
         assert!(!should_refresh_presentation_now(
             PimaxActivityLifecycleState::Paused,
             true,
-            true
+            true,
+            false,
         ));
         assert!(!should_refresh_presentation_now(
             PimaxActivityLifecycleState::Stopped,
             true,
-            true
+            true,
+            false,
         ));
         assert!(!should_refresh_presentation_now(
             PimaxActivityLifecycleState::Resumed,
             false,
-            true
+            true,
+            false,
         ));
         assert!(!should_refresh_presentation_now(
             PimaxActivityLifecycleState::Resumed,
             true,
-            false
+            false,
+            false,
         ));
+        assert!(should_refresh_presentation_now(
+            PimaxActivityLifecycleState::Resumed,
+            false,
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn head_motion_activity_requires_meaningful_delta() {
+        let orientation = glam::Quat::IDENTITY;
+        let position = glam::Vec3::ZERO;
+
+        assert!(!head_motion_indicates_active_use(
+            orientation,
+            position,
+            orientation,
+            glam::vec3(0.005, 0.0, 0.0),
+        ));
+        assert!(head_motion_indicates_active_use(
+            orientation,
+            position,
+            orientation,
+            glam::vec3(0.05, 0.0, 0.0),
+        ));
+        assert!(head_motion_indicates_active_use(
+            orientation,
+            position,
+            glam::Quat::from_rotation_y(HEAD_MOTION_RECOVERY_ANGLE_THRESHOLD_RADIANS * 1.5),
+            position,
+        ));
+    }
+
+    #[test]
+    fn recent_head_motion_window_expires() {
+        assert!(has_recent_head_motion(Some(100), 100 + HEAD_MOTION_RECOVERY_ACTIVE_FRAMES));
+        assert!(!has_recent_head_motion(
+            Some(100),
+            101 + HEAD_MOTION_RECOVERY_ACTIVE_FRAMES
+        ));
+        assert!(!has_recent_head_motion(None, 200));
+    }
+
+    #[test]
+    fn bootstrap_tracking_mode_prefers_positional_tracking_when_supported() {
+        assert_eq!(
+            select_bootstrap_tracking_mode(Some(TRACKING_MODE_ROTATION_POSITION)),
+            TRACKING_MODE_ROTATION_POSITION
+        );
+    }
+
+    #[test]
+    fn bootstrap_tracking_mode_falls_back_to_rotation_when_position_is_unavailable() {
+        assert_eq!(
+            select_bootstrap_tracking_mode(Some(TRACKING_MODE_ROTATION)),
+            TRACKING_MODE_ROTATION
+        );
+    }
+
+    #[test]
+    fn bootstrap_tracking_mode_defaults_to_positional_when_support_is_unknown() {
+        assert_eq!(
+            select_bootstrap_tracking_mode(None),
+            TRACKING_MODE_ROTATION_POSITION
+        );
+    }
+
+    #[test]
+    fn alvr_head_tracking_timestamp_prefers_expected_display_time() {
+        let head_pose = PimaxHeadTrackingPose {
+            pose_timestamp: Duration::from_nanos(100),
+            expected_display_timestamp: Duration::from_nanos(200),
+            fetch_timestamp: Duration::from_nanos(300),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            select_alvr_head_tracking_timestamp(&head_pose),
+            Duration::from_nanos(200)
+        );
+    }
+
+    #[test]
+    fn alvr_head_tracking_timestamp_falls_back_to_pose_time() {
+        let head_pose = PimaxHeadTrackingPose {
+            pose_timestamp: Duration::from_nanos(100),
+            expected_display_timestamp: Duration::ZERO,
+            fetch_timestamp: Duration::from_nanos(300),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            select_alvr_head_tracking_timestamp(&head_pose),
+            Duration::from_nanos(100)
+        );
+    }
+
+    #[test]
+    fn alvr_head_tracking_timestamp_falls_back_to_fetch_time() {
+        let head_pose = PimaxHeadTrackingPose {
+            pose_timestamp: Duration::ZERO,
+            expected_display_timestamp: Duration::ZERO,
+            fetch_timestamp: Duration::from_nanos(300),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            select_alvr_head_tracking_timestamp(&head_pose),
+            Duration::from_nanos(300)
+        );
     }
 
     #[test]
@@ -5920,6 +6074,8 @@ fn try_begin_and_submit_frame<'local>(
     let mut live_video_frame_count = 0_u64;
     let mut head_tracking_pose_update_count = 0_u64;
     let mut head_tracking_pose_failure_count = 0_u64;
+    let mut last_head_pose_sample = None::<(glam::Quat, glam::Vec3)>;
+    let mut last_head_motion_frame_index = None::<i32>;
     let mut last_video_timestamps_by_slot = vec![None::<u64>; eye_buffers.len()];
     let mut signalled_first_frame = false;
     let mut promoted_tracking_mode = promotion_tracking_mode.is_none();
@@ -6039,11 +6195,18 @@ fn try_begin_and_submit_frame<'local>(
             let lifecycle_state = current_activity_lifecycle_state();
             let headset_near = is_headset_near();
             let screen_on = is_screen_on();
-            if should_refresh_presentation_now(lifecycle_state, headset_near, screen_on) {
+            let recent_head_motion =
+                !headset_near && has_recent_head_motion(last_head_motion_frame_index, frame_index);
+            if should_refresh_presentation_now(
+                lifecycle_state,
+                headset_near,
+                screen_on,
+                recent_head_motion,
+            ) {
                 if clear_presentation_refresh_requested() {
                     info!(
-                        "consuming deferred presentation refresh after lifecycle recovery: lifecycle={} headset_near={headset_near} screen_on={screen_on}",
-                        lifecycle_state.label()
+                        "consuming deferred presentation refresh after lifecycle recovery: lifecycle={} headset_near={headset_near} screen_on={screen_on} recent_head_motion={recent_head_motion}",
+                        lifecycle_state.label(),
                     );
                     if let Some(wake_lock) = display_wake_lock.as_ref() {
                         if let Err(err) = acquire_display_wake_lock(env, wake_lock) {
@@ -6067,8 +6230,8 @@ fn try_begin_and_submit_frame<'local>(
                 }
             } else if frame_index < 5 || frame_index % 120 == 0 {
                 info!(
-                    "deferring presentation refresh until lifecycle is resumed, headset is near, and screen is on: lifecycle={} headset_near={headset_near} screen_on={screen_on}",
-                    lifecycle_state.label()
+                    "deferring presentation refresh until lifecycle is resumed, headset is near or moving, and screen is on: lifecycle={} headset_near={headset_near} screen_on={screen_on} recent_head_motion={recent_head_motion}",
+                    lifecycle_state.label(),
                 );
             }
         }
@@ -6148,19 +6311,32 @@ fn try_begin_and_submit_frame<'local>(
         let pose_state = env.auto_local(pose_state);
         match read_pimax_head_tracking_pose(env, &pose_state) {
             Ok(head_pose) => {
+                if let Some((previous_orientation, previous_position)) = last_head_pose_sample {
+                    if head_motion_indicates_active_use(
+                        previous_orientation,
+                        previous_position,
+                        head_pose.orientation,
+                        head_pose.position,
+                    ) {
+                        last_head_motion_frame_index = Some(frame_index);
+                    }
+                }
+                last_head_pose_sample = Some((head_pose.orientation, head_pose.position));
+                let alvr_timestamp = select_alvr_head_tracking_timestamp(&head_pose);
                 crate::client::update_head_tracking_pose(
                     head_pose.orientation,
                     head_pose.position,
-                    head_pose.fetch_timestamp,
+                    alvr_timestamp,
                 );
                 head_tracking_pose_update_count = head_tracking_pose_update_count.wrapping_add(1);
                 if head_tracking_pose_update_count <= 5
                     || head_tracking_pose_update_count % 120 == 0
                 {
                     info!(
-                        "updated ALVR head tracking pose from Pimax: updates={} frame={frame_index} status={} fetch_ns={} pose_ns={} expected_ns={} position=({:.3},{:.3},{:.3}) orientation=({:.3},{:.3},{:.3},{:.3})",
+                        "updated ALVR head tracking pose from Pimax: updates={} frame={frame_index} status={} alvr_ns={} fetch_ns={} pose_ns={} expected_ns={} position=({:.3},{:.3},{:.3}) orientation=({:.3},{:.3},{:.3},{:.3})",
                         head_tracking_pose_update_count,
                         head_pose.status,
+                        alvr_timestamp.as_nanos(),
                         head_pose.fetch_timestamp.as_nanos(),
                         head_pose.pose_timestamp.as_nanos(),
                         head_pose.expected_display_timestamp.as_nanos(),

@@ -359,6 +359,10 @@ const DEBUG_RGBA_HEADER_LEN: usize = 8 + 4 + 4 + 8 + 4;
 const DEBUG_RGBA_MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 static DEBUG_RGBA_TCP_STARTED: AtomicBool = AtomicBool::new(false);
 static AHB_BLIT_COUNT: AtomicU64 = AtomicU64::new(0);
+static ZERO_COPY_RENDER_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static ZERO_COPY_RENDER_SUCCESS_COUNT: AtomicU64 = AtomicU64::new(0);
+static ZERO_COPY_RENDER_FAILURE_COUNT: AtomicU64 = AtomicU64::new(0);
+static ZERO_COPY_RENDER_GL_ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
 static BLIT_PROGRAM: Mutex<Option<BlitProgram>> = Mutex::new(None);
 static EXTERNAL_BLIT_PROGRAM: Mutex<Option<BlitProgram>> = Mutex::new(None);
 static NV12_BLIT_PROGRAM: Mutex<Option<Nv12BlitProgram>> = Mutex::new(None);
@@ -370,6 +374,7 @@ static PASSTHROUGH_OES_PROGRAM: Mutex<Option<PassthroughProgram>> = Mutex::new(N
 static INTERMEDIATE_FBO: Mutex<Option<IntermediateFbo>> = Mutex::new(None);
 static FOVEATED_ENCODING: Mutex<Option<ActiveFoveationConfig>> = Mutex::new(None);
 static HDR_STREAM_ENABLED: AtomicBool = AtomicBool::new(false);
+static LAST_ZERO_COPY_RENDER_FAILURE: Mutex<Option<String>> = Mutex::new(None);
 // Keep the stream mapping aligned with the source frame unless we have a
 // headset-side repro that proves we need a correction.
 const PIMAX_SWAP_STREAM_EYES: bool = false;
@@ -388,6 +393,15 @@ const PIMAX_USE_HDR_INTERMEDIATE_FBO: bool = false;
 pub const COLOR_BLACK_CRUSH_DEFAULT: f32 = 0.072;
 /// Default BT.709 contrast gain for the passthrough OES shader.
 pub const COLOR_GAIN_DEFAULT: f32 = 1.22;
+
+#[derive(Debug, Clone, Default)]
+pub struct VideoRenderDiagnosticsSnapshot {
+    pub zero_copy_attempts: u64,
+    pub zero_copy_success_count: u64,
+    pub zero_copy_failure_count: u64,
+    pub zero_copy_gl_error_count: u64,
+    pub last_zero_copy_failure: Option<String>,
+}
 
 /// Simple passthrough shader for GL_TEXTURE_EXTERNAL_OES → RGBA conversion (pass 1).
 struct PassthroughProgram {
@@ -842,6 +856,24 @@ pub fn clear_latest_frame(receiver: &AlvrVideoReceiver) {
     info!("Cleared latest ALVR video frame");
 }
 
+pub fn reset_video_render_diagnostics() {
+    ZERO_COPY_RENDER_ATTEMPTS.store(0, Ordering::Relaxed);
+    ZERO_COPY_RENDER_SUCCESS_COUNT.store(0, Ordering::Relaxed);
+    ZERO_COPY_RENDER_FAILURE_COUNT.store(0, Ordering::Relaxed);
+    ZERO_COPY_RENDER_GL_ERROR_COUNT.store(0, Ordering::Relaxed);
+    *LAST_ZERO_COPY_RENDER_FAILURE.lock() = None;
+}
+
+pub fn video_render_diagnostics_snapshot() -> VideoRenderDiagnosticsSnapshot {
+    VideoRenderDiagnosticsSnapshot {
+        zero_copy_attempts: ZERO_COPY_RENDER_ATTEMPTS.load(Ordering::Relaxed),
+        zero_copy_success_count: ZERO_COPY_RENDER_SUCCESS_COUNT.load(Ordering::Relaxed),
+        zero_copy_failure_count: ZERO_COPY_RENDER_FAILURE_COUNT.load(Ordering::Relaxed),
+        zero_copy_gl_error_count: ZERO_COPY_RENDER_GL_ERROR_COUNT.load(Ordering::Relaxed),
+        last_zero_copy_failure: LAST_ZERO_COPY_RENDER_FAILURE.lock().clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -894,6 +926,24 @@ mod tests {
         assert_eq!(*receiver.state.lock(), ReceiverState::Streaming);
         assert!(receiver.latest_frame.lock().is_none());
         assert!(receiver.connected.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn reset_video_render_diagnostics_clears_counters_and_last_failure() {
+        ZERO_COPY_RENDER_ATTEMPTS.store(3, Ordering::Relaxed);
+        ZERO_COPY_RENDER_SUCCESS_COUNT.store(2, Ordering::Relaxed);
+        ZERO_COPY_RENDER_FAILURE_COUNT.store(1, Ordering::Relaxed);
+        ZERO_COPY_RENDER_GL_ERROR_COUNT.store(4, Ordering::Relaxed);
+        *LAST_ZERO_COPY_RENDER_FAILURE.lock() = Some("boom".to_owned());
+
+        reset_video_render_diagnostics();
+
+        let snapshot = video_render_diagnostics_snapshot();
+        assert_eq!(snapshot.zero_copy_attempts, 0);
+        assert_eq!(snapshot.zero_copy_success_count, 0);
+        assert_eq!(snapshot.zero_copy_failure_count, 0);
+        assert_eq!(snapshot.zero_copy_gl_error_count, 0);
+        assert!(snapshot.last_zero_copy_failure.is_none());
     }
 }
 
@@ -2606,106 +2656,116 @@ pub(crate) fn render_ahardwarebuffer_zero_copy(
     buffer_ptr: *mut c_void,
     _timestamp_ns: u64,
 ) -> Result<()> {
-    if buffer_ptr.is_null() {
-        bail!("render_ahardwarebuffer_zero_copy called with null buffer_ptr");
-    }
+    ZERO_COPY_RENDER_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
 
-    let (frame_width, frame_height) = crate::android_video_decoder::upstream_decoder_dimensions()
-        .unwrap_or_else(|| {
-            // Fallback to target dimensions if decoder dimensions are unknown.
-            // For side-by-side stereo, source width is roughly 2x eye width.
-            (left_target.width * 2, left_target.height)
-        });
-
-    // Load cached EGL extension procs.
-    let get_native_client_buffer =
-        get_egl_native_client_buffer().context("load eglGetNativeClientBufferANDROID")?;
-    let create_image = get_egl_create_image_khr().context("load eglCreateImageKHR")?;
-    let destroy_image = get_egl_destroy_image_khr().context("load eglDestroyImageKHR")?;
-    let image_target =
-        get_gl_egl_image_target_texture_2d_oes().context("load glEGLImageTargetTexture2DOES")?;
-
-    let egl_display = unsafe { eglGetCurrentDisplay() };
-    if egl_display.is_null() {
-        bail!("eglGetCurrentDisplay returned null");
-    }
-
-    let client_buffer = unsafe { get_native_client_buffer(buffer_ptr) };
-    if client_buffer.is_null() {
-        bail!("eglGetNativeClientBufferANDROID returned null");
-    }
-    let egl_image = unsafe {
-        create_image(
-            egl_display,
-            ptr::null_mut(), // EGL_NO_CONTEXT
-            EGL_NATIVE_BUFFER_ANDROID,
-            client_buffer,
-            ptr::null(), // no attribs
-        )
-    };
-    if egl_image.is_null() {
-        bail!("eglCreateImageKHR returned null");
-    }
-
-    let count = AHB_BLIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    let should_log_stats = count <= 5 || count % 120 == 0;
-
-    unsafe {
-        // Reuse a persistent GL_TEXTURE_EXTERNAL_OES texture.
-        let oes_texture = get_zero_copy_oes_texture();
-        if oes_texture == 0 {
-            bail!("glGenTextures returned 0 for OES texture");
+    let result = (|| {
+        if buffer_ptr.is_null() {
+            bail!("render_ahardwarebuffer_zero_copy called with null buffer_ptr");
         }
 
-        glBindTexture(GL_TEXTURE_EXTERNAL_OES, oes_texture);
-        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        let (frame_width, frame_height) =
+            crate::android_video_decoder::upstream_decoder_dimensions().unwrap_or_else(|| {
+                (left_target.width * 2, left_target.height)
+            });
 
-        // Bind the EGLImage to the OES texture.
-        image_target(GL_TEXTURE_EXTERNAL_OES, egl_image);
+        let get_native_client_buffer =
+            get_egl_native_client_buffer().context("load eglGetNativeClientBufferANDROID")?;
+        let create_image = get_egl_create_image_khr().context("load eglCreateImageKHR")?;
+        let destroy_image = get_egl_destroy_image_khr().context("load eglDestroyImageKHR")?;
+        let image_target = get_gl_egl_image_target_texture_2d_oes()
+            .context("load glEGLImageTargetTexture2DOES")?;
 
-        let direct_blit_program =
-            get_external_blit_program().context("get direct zero-copy OES blit shader")?;
-        if should_log_stats {
-            info!(
-                "zero-copy AHB direct blit: source={}x{} target={}x{} texture_target={}",
-                frame_width,
-                frame_height,
-                left_target.width,
-                left_target.height,
-                direct_blit_program.texture_target_label,
-            );
+        let egl_display = unsafe { eglGetCurrentDisplay() };
+        if egl_display.is_null() {
+            bail!("eglGetCurrentDisplay returned null");
         }
 
-        blit_texture_to_eye(
-            &direct_blit_program,
-            oes_texture,
-            left_target,
-            VideoFrameEye::Left,
-            frame_width as u32,
-            frame_height as u32,
-            "zero-copy AHB direct stats",
-        )?;
+        let client_buffer = unsafe { get_native_client_buffer(buffer_ptr) };
+        if client_buffer.is_null() {
+            bail!("eglGetNativeClientBufferANDROID returned null");
+        }
+        let egl_image = unsafe {
+            create_image(
+                egl_display,
+                ptr::null_mut(),
+                EGL_NATIVE_BUFFER_ANDROID,
+                client_buffer,
+                ptr::null(),
+            )
+        };
+        if egl_image.is_null() {
+            bail!("eglCreateImageKHR returned null");
+        }
 
-        blit_texture_to_eye(
-            &direct_blit_program,
-            oes_texture,
-            right_target,
-            VideoFrameEye::Right,
-            frame_width as u32,
-            frame_height as u32,
-            "zero-copy AHB direct stats",
-        )?;
+        let count = AHB_BLIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        let should_log_stats = count <= 5 || count % 120 == 0;
 
-        // Cleanup
-        glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
-        glUseProgram(0);
-        destroy_image(egl_display, egl_image);
+        unsafe {
+            let oes_texture = get_zero_copy_oes_texture();
+            if oes_texture == 0 {
+                bail!("glGenTextures returned 0 for OES texture");
+            }
+
+            glBindTexture(GL_TEXTURE_EXTERNAL_OES, oes_texture);
+            glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            image_target(GL_TEXTURE_EXTERNAL_OES, egl_image);
+
+            let direct_blit_program =
+                get_external_blit_program().context("get direct zero-copy OES blit shader")?;
+            if should_log_stats {
+                info!(
+                    "zero-copy AHB direct blit: source={}x{} target={}x{} texture_target={}",
+                    frame_width,
+                    frame_height,
+                    left_target.width,
+                    left_target.height,
+                    direct_blit_program.texture_target_label,
+                );
+            }
+
+            blit_texture_to_eye(
+                &direct_blit_program,
+                oes_texture,
+                left_target,
+                VideoFrameEye::Left,
+                frame_width as u32,
+                frame_height as u32,
+                "zero-copy AHB direct stats",
+            )?;
+
+            blit_texture_to_eye(
+                &direct_blit_program,
+                oes_texture,
+                right_target,
+                VideoFrameEye::Right,
+                frame_width as u32,
+                frame_height as u32,
+                "zero-copy AHB direct stats",
+            )?;
+
+            glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+            glUseProgram(0);
+            destroy_image(egl_display, egl_image);
+        }
+
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            ZERO_COPY_RENDER_SUCCESS_COUNT.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        Err(err) => {
+            ZERO_COPY_RENDER_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
+            *LAST_ZERO_COPY_RENDER_FAILURE.lock() = Some(format!("{err:#}"));
+            warn!("zero-copy render failure [class=compositor-submit]: {err:#}");
+            Err(err)
+        }
     }
-
-    Ok(())
 }
 
 fn blit_texture_to_eye(
@@ -2770,6 +2830,10 @@ fn blit_texture_to_eye(
         let _ = drain_gl_errors();
         glDrawArrays(GL_TRIANGLES, 0, 3);
         let pass2_errors = drain_gl_errors();
+        if !pass2_errors.is_empty() {
+            ZERO_COPY_RENDER_GL_ERROR_COUNT
+                .fetch_add(pass2_errors.len() as u64, Ordering::Relaxed);
+        }
         glBindTexture(blit_program.texture_target, 0);
         if should_log_stats {
             let pass2_stats =

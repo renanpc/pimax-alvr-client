@@ -49,7 +49,7 @@ final class ProximityWakePolicy {
     }
 
     boolean shouldKeepDisplayAwakeForProximity() {
-        return !proximityStateKnown || headsetNear;
+        return !proximityStateKnown || headsetNear || proximityFarPending;
     }
 
     Action onUnknownSleepGraceElapsed() {
@@ -60,6 +60,14 @@ final class ProximityWakePolicy {
         headsetNear = false;
         proximityFarPending = false;
         return Action.UNKNOWN_FAR;
+    }
+
+    boolean rearmUnknownAfterWakeSignal() {
+        if (paused || !proximityStateKnown || headsetNear || proximityFarPending) {
+            return false;
+        }
+        proximityStateKnown = false;
+        return true;
     }
 
     Action onProximitySample(boolean isNear) {

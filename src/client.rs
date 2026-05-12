@@ -118,6 +118,185 @@ use std::os::fd::AsRawFd;
 
 use anyhow::{anyhow, bail, Context, Result};
 use log::{info, warn};
+
+#[derive(Debug, Default, Clone)]
+struct AlvrUdpStreamDiagnostics {
+    total_shards: u64,
+    video_shards: u64,
+    audio_shards: u64,
+    completed_video_packets: u64,
+    completed_audio_packets: u64,
+    waiting_for_idr_drops: u64,
+    pre_decoder_config_drops: u64,
+    packet_gap_resets: u64,
+    decoder_backpressure_resets: u64,
+    decoder_idr_unavailable_resets: u64,
+    short_datagrams: u64,
+    udp_terminal_errors: u64,
+    idr_requests: u64,
+}
+
+impl AlvrUdpStreamDiagnostics {
+    fn note_idr_request(&mut self) {
+        self.idr_requests = self.idr_requests.wrapping_add(1);
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct RuntimeVideoRecoveryState {
+    queued: bool,
+    in_flight: bool,
+    last_requested_at: Option<Instant>,
+    last_started_at: Option<Instant>,
+    last_completed_at: Option<Instant>,
+}
+
+impl RuntimeVideoRecoveryState {
+    fn queue_if_due(&mut self, now: Instant) -> bool {
+        self.expire_if_timed_out(now);
+
+        if self.in_flight {
+            return false;
+        }
+
+        if let Some(previous) = self
+            .last_completed_at
+            .or(self.last_requested_at)
+            .or(self.last_started_at)
+        {
+            if now.duration_since(previous) < ALVR_RUNTIME_VIDEO_RECOVERY_COOLDOWN {
+                return false;
+            }
+        }
+
+        self.queued = true;
+        self.last_requested_at = Some(now);
+        true
+    }
+
+    fn take_queued(&mut self, now: Instant) -> bool {
+        self.expire_if_timed_out(now);
+
+        if !self.queued || self.in_flight {
+            return false;
+        }
+
+        self.queued = false;
+        self.in_flight = true;
+        self.last_started_at = Some(now);
+        true
+    }
+
+    fn mark_completed(&mut self, now: Instant) -> bool {
+        self.expire_if_timed_out(now);
+
+        if !self.in_flight {
+            return false;
+        }
+
+        self.in_flight = false;
+        self.queued = false;
+        self.last_completed_at = Some(now);
+        true
+    }
+
+    fn expire_if_timed_out(&mut self, now: Instant) {
+        if self
+            .last_started_at
+            .is_some_and(|started| now.duration_since(started) >= ALVR_RUNTIME_VIDEO_RECOVERY_TIMEOUT)
+        {
+            self.in_flight = false;
+            self.queued = false;
+            self.last_started_at = None;
+        }
+    }
+
+    #[cfg(test)]
+    fn with_times(
+        queued: bool,
+        in_flight: bool,
+        last_requested_at: Option<Instant>,
+        last_started_at: Option<Instant>,
+        last_completed_at: Option<Instant>,
+    ) -> Self {
+        Self {
+            queued,
+            in_flight,
+            last_requested_at,
+            last_started_at,
+            last_completed_at,
+        }
+    }
+}
+
+fn classify_alvr_failure_class(
+    stream: &AlvrUdpStreamDiagnostics,
+    render: &crate::video_receiver::VideoRenderDiagnosticsSnapshot,
+) -> &'static str {
+    if render.zero_copy_failure_count > 0 || render.zero_copy_gl_error_count > 0 {
+        "compositor-submit"
+    } else if stream.decoder_backpressure_resets > 0 || stream.waiting_for_idr_drops > 0 {
+        "decoder-or-stream-recovery"
+    } else if stream.packet_gap_resets > 0 {
+        "network-packet-gap"
+    } else if stream.udp_terminal_errors > 0 {
+        "udp-terminal-error"
+    } else {
+        "none-observed"
+    }
+}
+
+fn log_alvr_diagnostics_summary(
+    session_id: u32,
+    reason: &str,
+    uptime: Duration,
+    stream: &AlvrUdpStreamDiagnostics,
+) {
+    #[cfg(target_os = "android")]
+    let (decoder_backpressure_count, decoder_restart_count, decoder_fatal_error_count) = {
+        let decoder = crate::android_video_decoder::upstream_decoder_diagnostics_snapshot();
+        (
+            decoder.backpressure_count,
+            decoder.restart_count,
+            decoder.fatal_error_count,
+        )
+    };
+    #[cfg(not(target_os = "android"))]
+    let (decoder_backpressure_count, decoder_restart_count, decoder_fatal_error_count) =
+        (0_u64, 0_u64, 0_u64);
+
+    let render = crate::video_receiver::video_render_diagnostics_snapshot();
+    let failure_class = classify_alvr_failure_class(stream, &render);
+
+    info!(
+        "ALVR diagnostics summary: session_id={} reason=\"{}\" uptime_ms={} failure_class={} stream={{shards_total={},video_shards={},audio_shards={},video_packets={},audio_packets={},short_datagrams={},udp_terminal_errors={}}} recovery={{idr_requests={},packet_gap_resets={},waiting_for_idr_drops={},pre_decoder_config_drops={},decoder_backpressure_resets={},decoder_idr_unavailable_resets={}}} decoder={{backpressure_count={},restart_count={},fatal_error_count={}}} render={{zero_copy_attempts={},zero_copy_success_count={},zero_copy_failure_count={},zero_copy_gl_error_count={},last_zero_copy_failure={:?}}}",
+        session_id,
+        reason,
+        uptime.as_millis(),
+        failure_class,
+        stream.total_shards,
+        stream.video_shards,
+        stream.audio_shards,
+        stream.completed_video_packets,
+        stream.completed_audio_packets,
+        stream.short_datagrams,
+        stream.udp_terminal_errors,
+        stream.idr_requests,
+        stream.packet_gap_resets,
+        stream.waiting_for_idr_drops,
+        stream.pre_decoder_config_drops,
+        stream.decoder_backpressure_resets,
+        stream.decoder_idr_unavailable_resets,
+        decoder_backpressure_count,
+        decoder_restart_count,
+        decoder_fatal_error_count,
+        render.zero_copy_attempts,
+        render.zero_copy_success_count,
+        render.zero_copy_failure_count,
+        render.zero_copy_gl_error_count,
+        render.last_zero_copy_failure,
+    );
+}
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::{
     net::{TcpStream, UdpSocket as TokioUdpSocket},
@@ -301,11 +480,17 @@ impl VideoDecoderBridge {
     fn push_nal(&self, _timestamp_ns: u64, _is_idr: bool, _data: Vec<u8>) -> bool {
         true
     }
+
+    fn force_stream_recovery(&self) -> bool {
+        true
+    }
 }
 
 const HANDSHAKE_ACTION_TIMEOUT: Duration = Duration::from_secs(5);
 const ALVR_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(500);
 const ALVR_RUNTIME_IDR_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(500);
+const ALVR_RUNTIME_VIDEO_RECOVERY_COOLDOWN: Duration = Duration::from_secs(3);
+const ALVR_RUNTIME_VIDEO_RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const ALVR_CONTROL_RECV_TIMEOUT: Duration = Duration::from_millis(500);
 const ALVR_STREAM_THREAD_JOIN_GRACE: Duration = Duration::from_millis(500);
 const ALVR_DISCOVERY_RECOVERY_ATTEMPTS: usize = 30;
@@ -341,6 +526,9 @@ static ALVR_CONTROL_LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
 static ALVR_STREAM_SESSION_COUNTER: AtomicU32 = AtomicU32::new(1);
 static ALVR_DISCOVERY_RECOVERY_OWNER: AtomicU32 = AtomicU32::new(0);
 static ALVR_DISCOVERY_RECOVERY_GENERATION: AtomicU32 = AtomicU32::new(1);
+static ALVR_RUNTIME_VIDEO_RECOVERY_REQUESTED: AtomicBool = AtomicBool::new(false);
+static ALVR_RUNTIME_VIDEO_RECOVERY_STATE: LazyLock<Mutex<RuntimeVideoRecoveryState>> =
+    LazyLock::new(|| Mutex::new(RuntimeVideoRecoveryState::default()));
 static ALVR_MDNS_DAEMON: LazyLock<Mutex<Option<mdns_sd::ServiceDaemon>>> =
     LazyLock::new(|| Mutex::new(None));
 static LATEST_HEAD_TRACKING_POSE: Mutex<Option<AlvrHeadTrackingPose>> = Mutex::new(None);
@@ -1487,6 +1675,13 @@ fn run_minimal_alvr_stream(
 
     let video_decoder = Arc::new(VideoDecoderBridge::new());
     let decoder_config_ready = Arc::new(AtomicBool::new(false));
+    #[cfg(target_os = "android")]
+    crate::android_video_decoder::reset_upstream_decoder_diagnostics();
+    crate::video_receiver::reset_video_render_diagnostics();
+    ALVR_RUNTIME_VIDEO_RECOVERY_REQUESTED.store(false, Ordering::Release);
+    *ALVR_RUNTIME_VIDEO_RECOVERY_STATE
+        .lock()
+        .expect("lock runtime video recovery state") = RuntimeVideoRecoveryState::default();
     let mut stream_session =
         AlvrStreamSession::new(session_id, microphone_capture, game_audio_output);
     let session_shutdown = stream_session.shutdown_signal();
@@ -1546,6 +1741,7 @@ fn run_minimal_alvr_stream(
                 let session_shutdown = Arc::clone(&session_shutdown);
                 move || {
                     receive_alvr_udp_stream(
+                        session_id,
                         udp,
                         receive_packet_size,
                         video_decoder,
@@ -1599,6 +1795,7 @@ fn run_minimal_alvr_stream(
                 decoder_configured = true;
                 last_decoder_config = Some((config.codec, decoder_config_buffer));
                 decoder_config_ready.store(true, Ordering::Release);
+                complete_runtime_video_stream_recovery("decoder config received");
                 request_alvr_idr_best_effort(&control_writer, "decoder configuration completed");
             }
             Ok(ServerControlPacket::ReservedBuffer(buffer)) => {
@@ -1689,6 +1886,50 @@ fn take_lifecycle_stream_recovery_request() -> bool {
     false
 }
 
+fn request_runtime_video_stream_recovery(reason: &str) -> bool {
+    let now = Instant::now();
+    let queued = {
+        let mut state = ALVR_RUNTIME_VIDEO_RECOVERY_STATE
+            .lock()
+            .expect("lock runtime video recovery state");
+        state.queue_if_due(now)
+    };
+
+    if queued {
+        ALVR_RUNTIME_VIDEO_RECOVERY_REQUESTED.store(true, Ordering::Release);
+        info!("queued ALVR runtime video stream recovery: {reason}");
+    } else {
+        info!("suppressed duplicate ALVR runtime video stream recovery during cooldown/in-flight state: {reason}");
+    }
+
+    queued
+}
+
+fn take_runtime_video_stream_recovery_request() -> bool {
+    let requested = ALVR_RUNTIME_VIDEO_RECOVERY_REQUESTED.swap(false, Ordering::AcqRel);
+    if !requested {
+        return false;
+    }
+
+    let mut state = ALVR_RUNTIME_VIDEO_RECOVERY_STATE
+        .lock()
+        .expect("lock runtime video recovery state");
+    state.take_queued(Instant::now())
+}
+
+fn complete_runtime_video_stream_recovery(reason: &str) {
+    let completed = {
+        let mut state = ALVR_RUNTIME_VIDEO_RECOVERY_STATE
+            .lock()
+            .expect("lock runtime video recovery state");
+        state.mark_completed(Instant::now())
+    };
+
+    if completed {
+        info!("completed ALVR runtime video stream recovery: {reason}");
+    }
+}
+
 fn request_alvr_idr_if_due(
     control_writer: &SharedControlWriter,
     reason: &str,
@@ -1718,6 +1959,7 @@ fn enter_waiting_for_idr(
 }
 
 fn receive_alvr_udp_stream(
+    session_id: u32,
     socket: StdUdpSocket,
     packet_size: usize,
     video_decoder: Arc<VideoDecoderBridge>,
@@ -1726,6 +1968,7 @@ fn receive_alvr_udp_stream(
     shutdown_requested: Arc<AtomicBool>,
     game_audio_output: Option<crate::audio::GameAudioOutput>,
 ) {
+    let session_start = Instant::now();
     let mut buffer = vec![0_u8; packet_size.max(ALVR_STREAM_SHARD_PREFIX_SIZE)];
     let mut video_assembler =
         VideoPacketAssembler::new(packet_size - ALVR_STREAM_SHARD_PREFIX_SIZE);
@@ -1738,12 +1981,30 @@ fn receive_alvr_udp_stream(
     let mut last_completed_video_packet_index = None::<u32>;
     let mut last_idr_request_at = None::<Instant>;
     let mut decoder_backpressure_drops = 0_u64;
+    let mut diagnostics = AlvrUdpStreamDiagnostics::default();
     let game_audio_output = game_audio_output;
 
     loop {
         if shutdown_requested.load(Ordering::Acquire) {
             info!("ALVR UDP stream receiver exiting after session shutdown request");
             break;
+        }
+
+        if take_runtime_video_stream_recovery_request() {
+            enter_waiting_for_idr(
+                &mut waiting_for_idr,
+                &mut video_assembler,
+                &mut last_completed_video_packet_index,
+                "native lifecycle recovery",
+            );
+            if video_decoder.force_stream_recovery() {
+                info!("restarted ALVR decoder bridge for native lifecycle recovery");
+            } else {
+                warn!("failed to restart ALVR decoder bridge for native lifecycle recovery");
+            }
+            diagnostics.decoder_idr_unavailable_resets = diagnostics
+                .decoder_idr_unavailable_resets
+                .wrapping_add(1);
         }
 
         match socket.recv(&mut buffer) {
@@ -1754,6 +2015,7 @@ fn receive_alvr_udp_stream(
                 }
 
                 shards += 1;
+                diagnostics.total_shards = shards;
 
                 let stream_id = u16::from_le_bytes(buffer[0..2].try_into().unwrap());
                 let packet_index = u32::from_le_bytes(buffer[2..6].try_into().unwrap());
@@ -1767,6 +2029,7 @@ fn receive_alvr_udp_stream(
 
                 if stream_id == ALVR_VIDEO_STREAM_ID {
                     video_shards += 1;
+                    diagnostics.video_shards = video_shards;
                     if let Some(packet) = video_assembler.push(
                         packet_index,
                         shard_count,
@@ -1791,6 +2054,8 @@ fn receive_alvr_udp_stream(
                                             packet_index
                                         );
                                     } else {
+                                        diagnostics.packet_gap_resets =
+                                            diagnostics.packet_gap_resets.wrapping_add(1);
                                         enter_waiting_for_idr(
                                             &mut waiting_for_idr,
                                             &mut video_assembler,
@@ -1828,6 +2093,7 @@ fn receive_alvr_udp_stream(
                                 start.elapsed().as_millis()
                             );
                         }
+                        diagnostics.completed_video_packets = packet.completed_count;
                         report_alvr_video_packet_received(packet.header.timestamp);
                         if packet.header.is_idr && decoder_config_ready.load(Ordering::Acquire) {
                             waiting_for_idr = false;
@@ -1835,11 +2101,14 @@ fn receive_alvr_udp_stream(
                         }
 
                         if waiting_for_idr {
+                            diagnostics.note_idr_request();
                             request_alvr_idr_if_due(
                                 &control_writer,
                                 "corrupted video stream while waiting for IDR",
                                 &mut last_idr_request_at,
                             );
+                            diagnostics.waiting_for_idr_drops =
+                                diagnostics.waiting_for_idr_drops.wrapping_add(1);
                             if packet.completed_count <= 10
                                 || packet.completed_count % ALVR_STREAM_LOG_EVERY == 0
                             {
@@ -1854,11 +2123,14 @@ fn receive_alvr_udp_stream(
                         }
 
                         if !decoder_config_ready.load(Ordering::Acquire) {
+                            diagnostics.note_idr_request();
                             request_alvr_idr_if_due(
                                 &control_writer,
                                 "decoder configuration not yet received",
                                 &mut last_idr_request_at,
                             );
+                            diagnostics.pre_decoder_config_drops =
+                                diagnostics.pre_decoder_config_drops.wrapping_add(1);
                             if packet.completed_count <= 10
                                 || packet.completed_count % ALVR_STREAM_LOG_EVERY == 0
                             {
@@ -1889,7 +2161,21 @@ fn receive_alvr_udp_stream(
                         );
                         if submitted {
                             decoder_backpressure_drops = 0;
+                            if packet.header.is_idr {
+                                complete_runtime_video_stream_recovery(
+                                    "fresh IDR accepted by decoder",
+                                );
+                            }
                         } else {
+                            if packet.header.is_idr {
+                                diagnostics.decoder_idr_unavailable_resets = diagnostics
+                                    .decoder_idr_unavailable_resets
+                                    .wrapping_add(1);
+                            } else {
+                                diagnostics.decoder_backpressure_resets = diagnostics
+                                    .decoder_backpressure_resets
+                                    .wrapping_add(1);
+                            }
                             enter_waiting_for_idr(
                                 &mut waiting_for_idr,
                                 &mut video_assembler,
@@ -1909,6 +2195,7 @@ fn receive_alvr_udp_stream(
                                 },
                                 &mut last_idr_request_at,
                             );
+                            diagnostics.note_idr_request();
                             decoder_backpressure_drops = decoder_backpressure_drops.wrapping_add(1);
                             if decoder_backpressure_drops <= 5
                                 || decoder_backpressure_drops % ALVR_STREAM_LOG_EVERY == 0
@@ -1925,6 +2212,7 @@ fn receive_alvr_udp_stream(
                     }
                 } else if stream_id == ALVR_AUDIO_STREAM_ID {
                     audio_shards += 1;
+                    diagnostics.audio_shards = audio_shards;
                     if let Some(payload) = audio_assembler.push(
                         packet_index,
                         shard_count,
@@ -1951,6 +2239,7 @@ fn receive_alvr_udp_stream(
                                 start.elapsed().as_millis()
                             );
                         }
+                        diagnostics.completed_audio_packets = audio_assembler.completed_count();
                     }
                 }
 
@@ -1974,6 +2263,7 @@ fn receive_alvr_udp_stream(
                 }
             }
             Ok(len) => {
+                diagnostics.short_datagrams = diagnostics.short_datagrams.wrapping_add(1);
                 warn!("received short ALVR UDP stream datagram: {len} bytes");
             }
             Err(err)
@@ -1990,11 +2280,23 @@ fn receive_alvr_udp_stream(
                 continue;
             }
             Err(err) => {
+                diagnostics.udp_terminal_errors = diagnostics.udp_terminal_errors.wrapping_add(1);
                 warn!("ALVR UDP stream receiver exiting: {err:#}");
                 break;
             }
         }
     }
+
+    log_alvr_diagnostics_summary(
+        session_id,
+        if shutdown_requested.load(Ordering::Acquire) {
+            "session shutdown"
+        } else {
+            "udp receiver exit"
+        },
+        session_start.elapsed(),
+        &diagnostics,
+    );
 }
 
 fn send_minimal_tracking_stream(
@@ -2153,6 +2455,7 @@ fn maintain_alvr_control_socket(writer: SharedControlWriter, shutdown_requested:
     let mut buttons_sent = 0_u64;
     let mut active_profiles_sent = 0_u64;
     let mut last_left_button_debug_key: Option<(u32, u32, bool, bool)> = None;
+    let mut last_lifecycle_recovery_idr_request_at = None::<Instant>;
 
     loop {
         if shutdown_requested.load(Ordering::Acquire) {
@@ -2193,7 +2496,13 @@ fn maintain_alvr_control_socket(writer: SharedControlWriter, shutdown_requested:
                 break;
             }
             info!("resent ALVR LocalViewParams after native lifecycle recovery");
-            request_alvr_idr_best_effort(&writer, "native lifecycle recovery");
+            if request_runtime_video_stream_recovery("native lifecycle recovery") {
+                request_alvr_idr_if_due(
+                    &writer,
+                    "native lifecycle recovery",
+                    &mut last_lifecycle_recovery_idr_request_at,
+                );
+            }
         }
 
         if let Some(views_config) = latest_alvr_views_config() {
@@ -3378,6 +3687,49 @@ mod tests {
         ALVR_DISCOVERY_RECOVERY_GENERATION.store(1, Ordering::Release);
     }
 
+    #[test]
+    fn diagnostics_classification_prefers_compositor_failures() {
+        let stream = AlvrUdpStreamDiagnostics {
+            decoder_backpressure_resets: 3,
+            ..Default::default()
+        };
+        let render = crate::video_receiver::VideoRenderDiagnosticsSnapshot {
+            zero_copy_failure_count: 1,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            classify_alvr_failure_class(&stream, &render),
+            "compositor-submit"
+        );
+    }
+
+    #[test]
+    fn diagnostics_classification_marks_decoder_recovery() {
+        let stream = AlvrUdpStreamDiagnostics {
+            waiting_for_idr_drops: 2,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            classify_alvr_failure_class(&stream, &Default::default()),
+            "decoder-or-stream-recovery"
+        );
+    }
+
+    #[test]
+    fn diagnostics_classification_marks_packet_gaps_without_decoder_signals() {
+        let stream = AlvrUdpStreamDiagnostics {
+            packet_gap_resets: 1,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            classify_alvr_failure_class(&stream, &Default::default()),
+            "network-packet-gap"
+        );
+    }
+
     // Regression: bincode 2 with `config::standard()` encodes enum variant
     // indices as varints. The ALVR master server matches by ordinal — reorder
     // the variants and the server mis-decodes every control packet. Variant
@@ -3547,5 +3899,52 @@ mod tests {
         assert!(same_decoder_config(&previous, &same));
         assert!(!same_decoder_config(&previous, &different_codec));
         assert!(!same_decoder_config(&previous, &different_bytes));
+    }
+
+    #[test]
+    fn runtime_video_stream_recovery_request_is_one_shot() {
+        ALVR_RUNTIME_VIDEO_RECOVERY_REQUESTED.store(false, Ordering::Release);
+        *ALVR_RUNTIME_VIDEO_RECOVERY_STATE
+            .lock()
+            .expect("lock runtime video recovery state") = RuntimeVideoRecoveryState::default();
+
+        request_runtime_video_stream_recovery("test");
+
+        assert!(take_runtime_video_stream_recovery_request());
+        assert!(!take_runtime_video_stream_recovery_request());
+    }
+
+    #[test]
+    fn runtime_video_recovery_state_suppresses_duplicates_while_in_flight() {
+        let now = Instant::now();
+        let mut state = RuntimeVideoRecoveryState::default();
+
+        assert!(state.queue_if_due(now));
+        assert!(state.take_queued(now));
+        assert!(!state.queue_if_due(now + Duration::from_millis(500)));
+        assert!(state.mark_completed(now + Duration::from_secs(1)));
+        assert!(!state.queue_if_due(now + Duration::from_secs(2)));
+        assert!(state.queue_if_due(
+            now + Duration::from_secs(1) + ALVR_RUNTIME_VIDEO_RECOVERY_COOLDOWN
+        ));
+    }
+
+    #[test]
+    fn runtime_video_recovery_state_expires_stale_in_flight_request() {
+        let now = Instant::now();
+        let mut state = RuntimeVideoRecoveryState::with_times(
+            false,
+            true,
+            Some(now),
+            Some(now),
+            None,
+        );
+
+        assert!(state.queue_if_due(
+            now + ALVR_RUNTIME_VIDEO_RECOVERY_TIMEOUT + Duration::from_millis(1)
+        ));
+        assert!(state.take_queued(
+            now + ALVR_RUNTIME_VIDEO_RECOVERY_TIMEOUT + Duration::from_millis(1)
+        ));
     }
 }
