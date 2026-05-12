@@ -10,7 +10,7 @@ A native Rust client for the Pimax Crystal OG standalone headset, implementing t
 |---------|--------|-------------|
 | **Discovery** | ✅ | UDP broadcast on port 9943 to find ALVR servers |
 | **Discovery Response** | ✅ | Receive and parse server hostname/IP |
-| **TCP Control** | ✅ | Port 9944 - handshake, keepalive, configuration |
+| **TCP Control** | ✅ | Port 9943 - handshake, keepalive, configuration |
 | **UDP Video Stream** | ✅ | Port 9944 - packet sharding and reassembly |
 | **H.264 Codec** | ✅ | Hardware decoding via Android MediaCodec |
 | **H.265/HEVC Codec** | ✅ | Hardware decoding via Android MediaCodec |
@@ -30,7 +30,8 @@ A native Rust client for the Pimax Crystal OG standalone headset, implementing t
 | Feature | Status | Description |
 |---------|--------|-------------|
 | **Zero-Copy Upload** | ✅ | EGLImageKHR from AHardwareBuffer |
-| **Two-Pass Blit** | ✅ | Pass 1: OES→RGBA, Pass 2: RGBA→eye |
+| **Direct Zero-Copy Blit** | ✅ | OES→eye blit with BT.709 correction on the active zero-copy path |
+| **Intermediate Fallback Path** | ✅ | OES/texture upload can still route through an RGBA intermediate path when needed |
 | **Convergence Shift** | ✅ | Corrects Pimax compositor divergent warp |
 | **Color Correction** | ✅ | BT.709 black crush and gain adjustment |
 | **Foveation Shader** | ✅ | Un-distort foveated encoding |
@@ -42,7 +43,7 @@ A native Rust client for the Pimax Crystal OG standalone headset, implementing t
 | `convergence_shift_ndc` | 0.0 - 0.5 | Pre-shift to cancel Pimax warp (~0.124 default) |
 | `ipd_scale` | 0.0 - 2.0 | ALVR stereo strength (1.0 = full physical IPD) |
 | `fov_scale` | 0.8 - 1.2 | Fine-tune headset FOV for Pimax warp alignment |
-| `eye_render_scale` | 0.5 - 2.0 | Scale eye render targets for sharper/stabler output |
+| `eye_render_scale` | 0.5 - 1.5 | Scale eye render targets for sharper/stabler output |
 | `color_black_crush` | 0.0 - 0.3 | BT.709 black level (0.072 default) |
 | `color_gain` | 0.5 - 2.0 | BT.709 contrast gain (1.22 default) |
 
@@ -52,8 +53,8 @@ A native Rust client for the Pimax Crystal OG standalone headset, implementing t
 |---------|--------|-------------|
 | **Pimax XR Runtime** | ✅ | Enter VR mode via PxrApi |
 | **Head Tracking** | ✅ | Receive poses from PxrServiceApi |
-| **Proximity Sensor** | ⚠️ | Callback wired up but log-only; no functional response |
-| **Screen State** | ⚠️ | Callback wired up but log-only; screen-off shutdown disabled for development |
+| **Proximity Sensor** | ✅ | Drives wake/sleep recovery and off-head display-sleep policy |
+| **Screen State** | ✅ | Feeds lifecycle-aware presentation recovery and wake handling |
 | **IPD Sync** | ✅ | Receive IPD from Pimax hardware |
 | **EGL Context** | ✅ | Headset-backed context for rendering |
 | **Texture Submission** | ✅ | Submit layers to Pimax compositor |
@@ -72,7 +73,7 @@ A native Rust client for the Pimax Crystal OG standalone headset, implementing t
 ```
 ALVR Server (PC)
      │
-     │ H.264/H.265/AV1 over UDP
+     │ H.264/H.265 over UDP
      ▼
 TCP Control (9943) ◄─── Server connects to client
 UDP Video (9944) ───── Sharded video packets
@@ -82,12 +83,14 @@ Android MediaCodec (Hardware Decoder)
      │
      │ AHardwareBuffer
      ▼
-GL_TEXTURE_EXTERNAL_OES ──► EGLImageKHR ──► GL Texture
+GL_TEXTURE_EXTERNAL_OES ──► EGLImageKHR
      │
-     ▼
-Two-Pass Blit Shader
-- Pass 1: OES → RGBA (color correction)
-- Pass 2: RGBA → Eye (convergence shift + foveation)
+     ├── Primary path: direct eye blit
+     │   - BT.709 black crush / gain correction
+     │   - convergence shift
+     │   - foveation handling
+     │
+     └── Fallback path: RGBA intermediate blit when required
      │
      ▼
 Pimax Compositor (sxrSubmitFrame)
@@ -104,6 +107,7 @@ Display (Pimax Crystal lenses)
 - **Guardian Boot Flow**: On first headset boot, Pimax Guardian takes focus. Complete the boundary setup once, then restart the app.
 - **Diagnostic Pattern**: When not connected, shows simple test pattern without convergence shift (convergence correction requires ALVR video path)
 - **Audio Routing**: Game audio and microphone capture are implemented, but PC-side virtual cable setup is still required
+- **Decode Load Ceiling**: Crystal OG is currently most stable around `2400x2400 @ 72 Hz`; heavier profiles can trigger decoder backpressure and extra IDR recovery
 
 ## Audio Setup
 
@@ -122,20 +126,75 @@ Expected behavior after setup:
 
 ## Build
 
+### Local debug build
+
 ```powershell
-# Set up Android NDK
+# Set up Android SDK / NDK
 $env:ANDROID_NDK_ROOT='C:\Android\android-sdk\ndk\27.3.13750724'
 $env:ANDROID_HOME='C:\Android\android-sdk'
 
-# Build the APK
+# Build only
 powershell -ExecutionPolicy Bypass -File scripts\build-android-client.ps1
 
-# Install and launch
-adb install -r target\debug\apk\pimax-alvr-client.apk
-adb shell am start -n com.pimax.alvr.client/.VrRenderActivity
+# Build + install
+powershell -ExecutionPolicy Bypass -File scripts\build-android-client.ps1 -Install
 
-# View logs
-adb logcat -v time | findstr PimaxALVR
+# Build + install + launch
+powershell -ExecutionPolicy Bypass -File scripts\build-android-client.ps1 -Install -Launch
+```
+
+Default debug APK output:
+- `target\debug\apk\pimax-alvr-client.apk`
+
+### Local release build
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build-android-client.ps1 -Profile release
+```
+
+Default release APK output:
+- `target\release\apk\pimax-alvr-client.apk`
+
+Note:
+- Android release packaging depends on the native runtime libraries in [android/runtime-libs](D:/Code/pimax-alvr-client/android/runtime-libs)
+- `cargo apk build --release` also requires release signing metadata; CI injects a temporary signing section during the release workflow
+
+### Release workflow
+
+GitHub Actions now includes a tag-driven APK release workflow:
+- workflow file: [.github/workflows/release.yaml](D:/Code/pimax-alvr-client/.github/workflows/release.yaml)
+- trigger: push a tag matching `v*`
+- outputs:
+  - release APK artifact
+  - GitHub Release asset
+  - `SHA256SUMS.txt`
+
+## Test Workflow
+
+### Controlled launch
+
+For repeatable headset validation, use:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\pimax-controlled-launch-test.ps1 -Serial bf18c368 -RebootBeforeRun -NetworkWaitTimeoutSeconds 60
+```
+
+Useful flags:
+- `-RecoverAfterRun`: reboot and restore normal headset runtime state after the test
+- `-SnapshotSeconds 5 20 45`: change snapshot timing
+- `-SkipSteamVRRestart`: skip the PC-side SteamVR restart step
+- `-LeaveRunningWhenDisplayOff`: keep the app running if the panel turns off during the run
+
+Outputs:
+- artifact directory under `.tmp\pimax_controlled_launch_<timestamp>`
+- `logcat-app.txt`
+- `diagnostic-summary.txt`
+- display/power/activity snapshots for each capture point
+
+### Simple manual launch
+
+```powershell
+adb shell am start -n com.pimax.alvr.client/.VrRenderActivity
 ```
 
 ## Configuration
@@ -149,8 +208,8 @@ adb logcat -v time | findstr PimaxALVR
 ```json
 {
   "client_name": "pimax-crystal-og",
-  "version_string": "20.14.1",
-  "generated_for_version": "20.14.1",
+  "version_string": "21.0.0-dev13",
+  "generated_for_version": "21.0.0-dev13",
   "discovery_port": 9943,
   "stream_port": 9944,
   "last_server_ip": "192.168.1.100",
@@ -185,7 +244,7 @@ Open `http://<headset-ip>:7878/` in a browser on the same network to access:
 
 ### View Logs
 ```bash
-adb logcat -d -s PimaxALVR
+adb logcat -d -s PimaxALVR PimaxALVRActivity
 ```
 
 ### Controlled-Launch Diagnostics
@@ -220,6 +279,13 @@ For Crystal OG, the current known-good baseline remains:
 That baseline is especially helpful when deciding whether a failure is transport-related or simply a
 decode-load issue on the headset.
 
+### Release-build troubleshooting
+
+If a release build fails in CI with a missing runtime-libs path, verify that:
+- [android/runtime-libs](D:/Code/pimax-alvr-client/android/runtime-libs) is present in the checkout
+- the `arm64-v8a` loader libraries and `libpxrapi.so` are included
+- the release workflow is using the current [.github/workflows/release.yaml](D:/Code/pimax-alvr-client/.github/workflows/release.yaml)
+
 ### Check Config
 ```bash
 adb shell cat /sdcard/Android/data/com.pimax.alvr.client/files/PimaxALVR/client.json
@@ -228,7 +294,7 @@ adb shell cat /sdcard/Android/data/com.pimax.alvr.client/files/PimaxALVR/client.
 ### Test Connection
 1. Ensure ALVR Server is running on PC
 2. Note the IP shown in ALVR dashboard
-3. Enter IP in browser UI at http://192.168.x.x:7878/
+3. Enter the PC's IP in the browser UI at `http://<headset-ip>:7878/`
 4. Click "Connect"
 
 ## License
