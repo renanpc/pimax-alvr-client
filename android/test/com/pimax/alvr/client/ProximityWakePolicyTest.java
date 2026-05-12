@@ -13,7 +13,10 @@ public final class ProximityWakePolicyTest {
         nearCancelsPendingFarBeforeSleep();
         pausedFarSampleIsIgnored();
         pausedFarConfirmationIsIgnored();
+        initialFarSampleStillKeepsDisplayAwakeUntilStable();
         unknownStartupGraceAllowsOffHeadSleep();
+        wakeSignalRearmsUnknownAfterStableFar();
+        wakeSignalDoesNotRearmWhenAlreadyNear();
         System.out.println("ProximityWakePolicyTest passed");
     }
 
@@ -114,6 +117,57 @@ public final class ProximityWakePolicyTest {
         assertFalse(
                 "unknown grace allows display sleep",
                 policy.shouldKeepDisplayAwakeForProximity());
+    }
+
+    private static void initialFarSampleStillKeepsDisplayAwakeUntilStable() {
+        ProximityWakePolicy policy = new ProximityWakePolicy();
+
+        assertEquals(
+                "initial far still schedules confirmation",
+                ProximityWakePolicy.Action.FAR_PENDING,
+                policy.onProximitySample(false));
+        assertTrue("initial far marks state known", policy.isProximityStateKnown());
+        assertTrue("initial far leaves confirmation pending", policy.isProximityFarPending());
+        assertTrue(
+                "initial far should still keep display awake until grace expires",
+                policy.shouldKeepDisplayAwakeForProximity());
+
+        assertEquals(
+                "stable initial far confirms sleep",
+                ProximityWakePolicy.Action.FAR_STABLE,
+                policy.onFarSleepGraceElapsed());
+        assertFalse("stable far clears confirmation", policy.isProximityFarPending());
+        assertFalse(
+                "stable far finally allows display sleep",
+                policy.shouldKeepDisplayAwakeForProximity());
+    }
+
+    private static void wakeSignalRearmsUnknownAfterStableFar() {
+        ProximityWakePolicy policy = new ProximityWakePolicy();
+        policy.onProximitySample(true);
+        policy.onProximitySample(false);
+        policy.onFarSleepGraceElapsed();
+
+        assertTrue("stable far is known before wake recovery", policy.isProximityStateKnown());
+        assertFalse("stable far marks headset off-head", policy.isHeadsetNear());
+        assertTrue(
+                "wake signal rearms unknown state",
+                policy.rearmUnknownAfterWakeSignal());
+        assertFalse("wake recovery clears known state", policy.isProximityStateKnown());
+        assertTrue(
+                "wake recovery temporarily keeps display awake until a fresh sample arrives",
+                policy.shouldKeepDisplayAwakeForProximity());
+    }
+
+    private static void wakeSignalDoesNotRearmWhenAlreadyNear() {
+        ProximityWakePolicy policy = new ProximityWakePolicy();
+        policy.onProximitySample(true);
+
+        assertFalse(
+                "wake signal should not rearm when headset is already near",
+                policy.rearmUnknownAfterWakeSignal());
+        assertTrue("near state remains known", policy.isProximityStateKnown());
+        assertTrue("near state remains active", policy.isHeadsetNear());
     }
 
     private static void assertTrue(String message, boolean value) {

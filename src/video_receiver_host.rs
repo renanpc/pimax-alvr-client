@@ -12,6 +12,15 @@ pub const PIMAX_BLIT_CONVERGENCE_SHIFT_NDC_DEFAULT: f32 = 0.124;
 pub const COLOR_BLACK_CRUSH_DEFAULT: f32 = 0.072;
 pub const COLOR_GAIN_DEFAULT: f32 = 1.22;
 
+#[derive(Debug, Clone, Default)]
+pub struct VideoRenderDiagnosticsSnapshot {
+    pub zero_copy_attempts: u64,
+    pub zero_copy_success_count: u64,
+    pub zero_copy_failure_count: u64,
+    pub zero_copy_gl_error_count: u64,
+    pub last_zero_copy_failure: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct FoveatedEncodingConfig {
     pub expanded_view_width: u32,
@@ -46,6 +55,12 @@ pub fn get_video_receiver() -> Arc<AlvrVideoReceiver> {
 
 pub fn disconnect(receiver: &AlvrVideoReceiver) {
     receiver.connected.store(false, Ordering::SeqCst);
+}
+
+pub fn reset_video_render_diagnostics() {}
+
+pub fn video_render_diagnostics_snapshot() -> VideoRenderDiagnosticsSnapshot {
+    VideoRenderDiagnosticsSnapshot::default()
 }
 
 #[cfg(test)]

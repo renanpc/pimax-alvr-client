@@ -806,6 +806,67 @@ function Save-Logcat {
     Write-ProgressMarker "logcat $Label end"
 }
 
+function Write-DiagnosticSummary {
+    param(
+        [string]$Label = ""
+    )
+
+    $suffix = if ([string]::IsNullOrWhiteSpace($Label)) { "" } else { "-$Label" }
+    $appLogPath = Join-Path $artifactDir "logcat-app$suffix.txt"
+    $summaryPath = Join-Path $artifactDir "diagnostic-summary$suffix.txt"
+    if (-not (Test-Path $appLogPath)) {
+        return
+    }
+
+    $lines = Get-Content $appLogPath
+    $summary = [System.Collections.Generic.List[string]]::new()
+
+    $diagnosticSummaryMatch = $lines | Select-String -Pattern "ALVR diagnostics summary:" | Select-Object -Last 1
+    $diagnosticSummaryLine = if ($null -ne $diagnosticSummaryMatch) { $diagnosticSummaryMatch.Line } else { $null }
+    if (-not [string]::IsNullOrWhiteSpace($diagnosticSummaryLine)) {
+        $summary.Add("client_summary=$diagnosticSummaryLine")
+    }
+
+    $negotiatedMatch = $lines | Select-String -Pattern "received ALVR stream config:" | Select-Object -Last 1
+    $negotiatedLine = if ($null -ne $negotiatedMatch) { $negotiatedMatch.Line } else { $null }
+    if (-not [string]::IsNullOrWhiteSpace($negotiatedLine)) {
+        $summary.Add("negotiated_stream=$negotiatedLine")
+    }
+
+    $counts = [ordered]@{
+        stream_shard_logs = ($lines | Select-String -Pattern "received ALVR stream shard:" | Measure-Object).Count
+        video_packet_logs = ($lines | Select-String -Pattern "completed ALVR video packet:" | Measure-Object).Count
+        audio_packet_logs = ($lines | Select-String -Pattern "completed ALVR audio packet:" | Measure-Object).Count
+        idr_requests = ($lines | Select-String -Pattern "requested ALVR IDR after" | Measure-Object).Count
+        decoder_backpressure = ($lines | Select-String -Pattern "upstream decoder input buffer full" | Measure-Object).Count
+        packet_gap = ($lines | Select-String -Pattern "detected ALVR video packet gap" | Measure-Object).Count
+        waiting_for_idr_drops = ($lines | Select-String -Pattern "dropping ALVR video packet while waiting for IDR" | Measure-Object).Count
+        pre_decoder_config_drops = ($lines | Select-String -Pattern "dropping ALVR video packet before decoder config" | Measure-Object).Count
+        compositor_failures = ($lines | Select-String -Pattern "zero-copy render failure \\[class=compositor-submit\\]" | Measure-Object).Count
+        lifecycle_recovery = ($lines | Select-String -Pattern "consuming deferred presentation refresh after lifecycle recovery|requested ALVR IDR after native lifecycle recovery|Pimax requested ALVR stream recovery" | Measure-Object).Count
+        control_disconnects = ($lines | Select-String -Pattern "ALVR control receive loop ended:" | Measure-Object).Count
+    }
+
+    foreach ($entry in $counts.GetEnumerator()) {
+        $summary.Add("$($entry.Key)=$($entry.Value)")
+    }
+
+    $failureClass = if ($counts.compositor_failures -gt 0) {
+        "compositor-submit"
+    } elseif ($counts.decoder_backpressure -gt 0 -or $counts.waiting_for_idr_drops -gt 0) {
+        "decoder-or-stream-recovery"
+    } elseif ($counts.packet_gap -gt 0) {
+        "network-packet-gap"
+    } elseif ($counts.control_disconnects -gt 0) {
+        "control-connection"
+    } else {
+        "none-observed"
+    }
+    $summary.Add("dominant_failure_class=$failureClass")
+
+    $summary | Set-Content -Encoding UTF8 -Path $summaryPath
+}
+
 function Recover-HeadsetAfterRun {
     Write-ProgressMarker "recovery start"
     Write-Warning "Recovering headset after run by rebooting and reasserting Guardian."
@@ -889,6 +950,7 @@ try {
     }
 
     Save-Logcat
+    Write-DiagnosticSummary
     $logcatSaved = $true
 } catch {
     $runError = $_
@@ -896,6 +958,7 @@ try {
     if (-not $logcatSaved) {
         try {
             Save-Logcat -Label "failure"
+            Write-DiagnosticSummary -Label "failure"
             $logcatSaved = $true
         } catch {
             Write-Warning "Failed to save failure logcat: $($_.Exception.Message)"
@@ -912,6 +975,7 @@ try {
         try {
             Recover-HeadsetAfterRun
             Save-Logcat -Label "post-recovery"
+            Write-DiagnosticSummary -Label "post-recovery"
         } catch {
             Write-Warning "Post-run recovery failed: $($_.Exception.Message)"
         }
