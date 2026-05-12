@@ -107,9 +107,10 @@ impl AlvrAndroidVideoDecoder {
 
         let (sink, source) = upstream_video_decoder::create_decoder(config, |result| {
             match result {
-                Ok(_timestamp) => {
-                    // Frame decoded callback; statistics are handled by the
-                    // render loop when it polls get_frame().
+                Ok(timestamp) => {
+                    // Feed the decode timestamp into ALVR client stats so
+                    // diagnostics keep a real decoder stage instead of a gap.
+                    crate::client::report_alvr_frame_decoded(timestamp);
                 }
                 Err(e) => {
                     UPSTREAM_DECODER_FATAL_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);

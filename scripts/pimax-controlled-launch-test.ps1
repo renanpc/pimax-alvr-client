@@ -851,10 +851,17 @@ function Write-DiagnosticSummary {
         $summary.Add("$($entry.Key)=$($entry.Value)")
     }
 
-    $failureClass = if ($counts.compositor_failures -gt 0) {
+    $failureClass = if ([string]::IsNullOrWhiteSpace($negotiatedLine) -and [string]::IsNullOrWhiteSpace($diagnosticSummaryLine) -and
+        $counts.stream_shard_logs -eq 0 -and $counts.video_packet_logs -eq 0 -and $counts.audio_packet_logs -eq 0) {
+        "no-stream-observed"
+    } elseif ($counts.compositor_failures -gt 0) {
         "compositor-submit"
-    } elseif ($counts.decoder_backpressure -gt 0 -or $counts.waiting_for_idr_drops -gt 0) {
-        "decoder-or-stream-recovery"
+    } elseif ($counts.pre_decoder_config_drops -gt 0) {
+        "decoder-config-timing"
+    } elseif ($counts.decoder_backpressure -gt 0) {
+        "decoder-backpressure"
+    } elseif ($counts.waiting_for_idr_drops -gt 0) {
+        "stream-waiting-for-idr"
     } elseif ($counts.packet_gap -gt 0) {
         "network-packet-gap"
     } elseif ($counts.control_disconnects -gt 0) {
@@ -863,6 +870,8 @@ function Write-DiagnosticSummary {
         "none-observed"
     }
     $summary.Add("dominant_failure_class=$failureClass")
+
+    $summary.Add("failure_class_guide=no-stream-observed=no ALVR negotiation or stream markers were captured, compositor-submit=render path/GL submit, decoder-config-timing=video arrived before decoder config, decoder-backpressure=MediaCodec could not accept input fast enough, stream-waiting-for-idr=client is discarding video until a fresh keyframe arrives, network-packet-gap=missing/late UDP packets, control-connection=TCP control loop disconnected, none-observed=no dominant failure seen")
 
     $summary | Set-Content -Encoding UTF8 -Path $summaryPath
 }
