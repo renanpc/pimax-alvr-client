@@ -80,14 +80,15 @@ jobs:
           New-Item -ItemType Directory -Force -Path $releaseKeystoreDir | Out-Null
           Copy-Item (Join-Path $env:USERPROFILE ".android\\debug.keystore") $releaseKeystorePath -Force
           $tomlKeystorePath = $releaseKeystorePath.Replace('\', '/')
-          @"
-
-[package.metadata.android.signing.release]
-path = "$tomlKeystorePath"
-keystore_password = "android"
-key_alias = "androiddebugkey"
-key_password = "android"
-"@ | Add-Content Cargo.toml
+          $signingSection = @(
+            ''
+            '[package.metadata.android.signing.release]'
+            "path = `"$tomlKeystorePath`""
+            'keystore_password = "android"'
+            'key_alias = "androiddebugkey"'
+            'key_password = "android"'
+          ) -join "`n"
+          Add-Content -Path Cargo.toml -Value $signingSection
 
       - name: Build release APK
         shell: pwsh
