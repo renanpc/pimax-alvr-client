@@ -26,10 +26,7 @@ jadx_output/
 .Spotlight-V100
 .Trashes
 
-# Build artifacts
-/android/runtime-libs/
-
-
+# Android runtime libraries are required for reproducible APK builds in CI.
 **__pycache__/
 # Added by code-review-graph
 .code-review-graph/
