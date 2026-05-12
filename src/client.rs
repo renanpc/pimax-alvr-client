@@ -235,8 +235,12 @@ fn classify_alvr_failure_class(
 ) -> &'static str {
     if render.zero_copy_failure_count > 0 || render.zero_copy_gl_error_count > 0 {
         "compositor-submit"
-    } else if stream.decoder_backpressure_resets > 0 || stream.waiting_for_idr_drops > 0 {
-        "decoder-or-stream-recovery"
+    } else if stream.pre_decoder_config_drops > 0 {
+        "decoder-config-timing"
+    } else if stream.decoder_backpressure_resets > 0 || stream.decoder_idr_unavailable_resets > 0 {
+        "decoder-backpressure"
+    } else if stream.waiting_for_idr_drops > 0 {
+        "stream-waiting-for-idr"
     } else if stream.packet_gap_resets > 0 {
         "network-packet-gap"
     } else if stream.udp_terminal_errors > 0 {
@@ -3713,7 +3717,7 @@ mod tests {
 
         assert_eq!(
             classify_alvr_failure_class(&stream, &Default::default()),
-            "decoder-or-stream-recovery"
+            "stream-waiting-for-idr"
         );
     }
 
@@ -3727,6 +3731,32 @@ mod tests {
         assert_eq!(
             classify_alvr_failure_class(&stream, &Default::default()),
             "network-packet-gap"
+        );
+    }
+
+    #[test]
+    fn diagnostics_classification_marks_decoder_config_timing() {
+        let stream = AlvrUdpStreamDiagnostics {
+            pre_decoder_config_drops: 1,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            classify_alvr_failure_class(&stream, &Default::default()),
+            "decoder-config-timing"
+        );
+    }
+
+    #[test]
+    fn diagnostics_classification_marks_decoder_backpressure() {
+        let stream = AlvrUdpStreamDiagnostics {
+            decoder_backpressure_resets: 1,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            classify_alvr_failure_class(&stream, &Default::default()),
+            "decoder-backpressure"
         );
     }
 

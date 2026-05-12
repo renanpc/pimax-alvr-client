@@ -188,6 +188,38 @@ Open `http://<headset-ip>:7878/` in a browser on the same network to access:
 adb logcat -d -s PimaxALVR
 ```
 
+### Controlled-Launch Diagnostics
+
+Each controlled launch artifact now includes `diagnostic-summary.txt`, which gives a quick
+classification of the session without hand-grepping the whole logcat capture.
+
+Important fields:
+- `negotiated_stream`: the final ALVR stream config accepted by the client
+- `idr_requests`: how often the client had to ask for a fresh keyframe
+- `decoder_backpressure`: MediaCodec input-buffer pressure on the headset
+- `waiting_for_idr_drops`: video packets discarded while the client waited for a clean keyframe
+- `packet_gap`: UDP continuity gaps detected after packet reassembly
+- `compositor_failures`: zero-copy render / GL submission failures
+- `dominant_failure_class`: the most likely failure family for the run
+
+Current failure classes:
+- `no-stream-observed`: the artifact did not capture ALVR negotiation or stream markers at all
+- `compositor-submit`: render path / GL submission failure
+- `decoder-config-timing`: video arrived before the decoder was configured
+- `decoder-backpressure`: MediaCodec could not accept input quickly enough
+- `stream-waiting-for-idr`: stream continuity was reset and the client is waiting for a fresh keyframe
+- `network-packet-gap`: missing or out-of-order UDP video packets
+- `control-connection`: the ALVR TCP control loop disconnected
+- `none-observed`: no dominant failure class was seen in the captured window
+
+For Crystal OG, the current known-good baseline remains:
+- `2400x2400`
+- `72 Hz`
+- optional `HDR` / `10-bit` based on visual preference
+
+That baseline is especially helpful when deciding whether a failure is transport-related or simply a
+decode-load issue on the headset.
+
 ### Check Config
 ```bash
 adb shell cat /sdcard/Android/data/com.pimax.alvr.client/files/PimaxALVR/client.json
