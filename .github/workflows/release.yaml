@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  APP_NAME: pimax-alvr-client
+  APK_PATH: target/release/apk/pimax-alvr-client.apk
+  ANDROID_PLATFORM: android-32
+  ANDROID_BUILD_TOOLS: "36.0.0"
+  ANDROID_NDK_VERSION: "27.3.13750724"
+
+jobs:
+  build-apk:
+    name: Build Release APK
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK components
+        shell: pwsh
+        run: |
+          sdkmanager --install `
+            "platform-tools" `
+            "platforms;${{ env.ANDROID_PLATFORM }}" `
+            "build-tools;${{ env.ANDROID_BUILD_TOOLS }}" `
+            "ndk;${{ env.ANDROID_NDK_VERSION }}"
+
+      - name: Install cargo-apk
+        shell: pwsh
+        run: cargo install cargo-apk --locked
+
+      - name: Create Android debug keystore
+        shell: pwsh
+        run: |
+          $keystoreDir = Join-Path $env:USERPROFILE ".android"
+          $keystorePath = Join-Path $keystoreDir "debug.keystore"
+          New-Item -ItemType Directory -Force -Path $keystoreDir | Out-Null
+          if (-not (Test-Path $keystorePath)) {
+            keytool -genkeypair `
+              -v `
+              -storetype PKCS12 `
+              -keystore $keystorePath `
+              -storepass android `
+              -alias androiddebugkey `
+              -keypass android `
+              -keyalg RSA `
+              -keysize 2048 `
+              -validity 10000 `
+              -dname "CN=Android Debug,O=Android,C=US"
+          }
+
+      - name: Inject temporary release signing metadata
+        shell: pwsh
+        run: |
+          $releaseKeystoreDir = Join-Path $env:GITHUB_WORKSPACE ".tmp"
+          $releaseKeystorePath = Join-Path $releaseKeystoreDir "release.keystore"
+          New-Item -ItemType Directory -Force -Path $releaseKeystoreDir | Out-Null
+          Copy-Item (Join-Path $env:USERPROFILE ".android\\debug.keystore") $releaseKeystorePath -Force
+          $tomlKeystorePath = $releaseKeystorePath.Replace('\', '/')
+          @"
+
+[package.metadata.android.signing.release]
+path = "$tomlKeystorePath"
+keystore_password = "android"
+key_alias = "androiddebugkey"
+key_password = "android"
+"@ | Add-Content Cargo.toml
+
+      - name: Build release APK
+        shell: pwsh
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}\ndk\${{ env.ANDROID_NDK_VERSION }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}\ndk\${{ env.ANDROID_NDK_VERSION }}
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts\build-android-client.ps1 -Profile release
+
+      - name: Package release asset
+        id: package
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${{ env.APK_PATH }}")) {
+            throw "Release APK not found at ${{ env.APK_PATH }}"
+          }
+          $apkName = "${{ env.APP_NAME }}-${{ github.ref_name }}.apk"
+          Copy-Item "${{ env.APK_PATH }}" $apkName -Force
+          "apkName=$apkName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-apk
+          path: ${{ steps.package.outputs.apkName }}
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: build-apk
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download release artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: ./release-assets
+
+      - name: Create checksums
+        shell: bash
+        run: |
+          find ./release-assets -type f -name "*.apk" -exec sha256sum {} \; > SHA256SUMS.txt
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" > /dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" ./release-assets/*/* SHA256SUMS.txt --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --generate-notes \
+              ./release-assets/*/* \
+              SHA256SUMS.txt
+          fi
