@@ -361,7 +361,9 @@ fn head_motion_indicates_active_use(
         return true;
     }
 
-    previous_orientation.angle_between(current_orientation).abs()
+    previous_orientation
+        .angle_between(current_orientation)
+        .abs()
         >= HEAD_MOTION_RECOVERY_ANGLE_THRESHOLD_RADIANS
 }
 
@@ -2919,7 +2921,10 @@ mod tests {
 
     #[test]
     fn recent_head_motion_window_expires() {
-        assert!(has_recent_head_motion(Some(100), 100 + HEAD_MOTION_RECOVERY_ACTIVE_FRAMES));
+        assert!(has_recent_head_motion(
+            Some(100),
+            100 + HEAD_MOTION_RECOVERY_ACTIVE_FRAMES
+        ));
         assert!(!has_recent_head_motion(
             Some(100),
             101 + HEAD_MOTION_RECOVERY_ACTIVE_FRAMES
