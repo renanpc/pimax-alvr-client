@@ -42,6 +42,8 @@ use std::{
 
 use log::{info, warn};
 
+use crate::protocol::DiscoveryPacket;
+
 // =============================================================================
 // Atomic Storage for Tuning Parameters
 // =============================================================================
@@ -458,6 +460,46 @@ pub fn get_server_status() -> String {
     (*SERVER_STATUS.lock().unwrap()).clone()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static DISCOVERY_TEST_GUARD: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn discovery_packet_uses_config_identity() {
+        let config = crate::config::ClientConfig::default();
+        let packet = discovery_packet_for_config(&config);
+
+        assert_eq!(packet.protocol_id, config.protocol_id());
+        assert_eq!(packet.hostname, config.client_name);
+    }
+
+    #[test]
+    fn discovered_server_entries_update_on_ip_or_hostname_change() {
+        let _guard = DISCOVERY_TEST_GUARD.lock().unwrap();
+        clear_discovered_servers();
+
+        add_discovered_server("server-a".to_string(), "192.168.1.10".to_string());
+        add_discovered_server("server-a".to_string(), "192.168.1.20".to_string());
+
+        assert_eq!(
+            get_discovered_servers(),
+            vec![("server-a".to_string(), "192.168.1.20".to_string())]
+        );
+
+        add_discovered_server("server-b".to_string(), "192.168.1.20".to_string());
+
+        assert_eq!(
+            get_discovered_servers(),
+            vec![("server-b".to_string(), "192.168.1.20".to_string())]
+        );
+
+        clear_discovered_servers();
+    }
+}
+
 /// Add a discovered ALVR server to the list.
 ///
 /// # Arguments
@@ -471,9 +513,27 @@ pub fn get_server_status() -> String {
 /// from multiple discovery broadcasts.
 pub fn add_discovered_server(hostname: String, ip: String) {
     let mut servers = DISCOVERED_SERVERS.lock().unwrap();
-    if !servers.iter().any(|(h, i)| h == &hostname || i == &ip) {
+    if let Some(index) = servers.iter().position(|(existing_hostname, existing_ip)| {
+        existing_hostname == &hostname || existing_ip == &ip
+    }) {
+        let previous = servers[index].clone();
+        if previous.0 != hostname || previous.1 != ip {
+            info!(
+                "tune: updated discovered server {} at {} -> {} at {}",
+                previous.0, previous.1, hostname, ip
+            );
+            servers[index] = (hostname, ip);
+        }
+    } else {
         info!("tune: discovered server {} at {}", hostname, ip);
         servers.push((hostname, ip));
+    }
+}
+
+fn discovery_packet_for_config(config: &crate::config::ClientConfig) -> DiscoveryPacket {
+    DiscoveryPacket {
+        protocol_id: config.protocol_id(),
+        hostname: config.client_name.clone(),
     }
 }
 
@@ -783,13 +843,20 @@ fn discover_servers_http() {
     socket.set_broadcast(true).ok();
     socket.set_read_timeout(Some(Duration::from_secs(1))).ok();
 
-    // Send discovery broadcast
-    let discovery_packet = b"ALVR\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0DISCOVERY";
+    // Send discovery broadcast using the shared ALVR packet format.
+    let config_path = crate::config::default_config_path();
+    let config = crate::config::ClientConfig::load_or_create(&config_path).unwrap_or_else(|err| {
+        warn!("tune: failed to load config for discovery packet, using defaults: {err:#}");
+        crate::config::ClientConfig::default()
+    });
+
+    let discovery_packet = discovery_packet_for_config(&config);
     let broadcast_addr: SocketAddr = "255.255.255.255:9943".parse().unwrap();
 
-    // Send 3 times for redundancy
+    // Send 3 times for redundancy.
+    let encoded_packet = discovery_packet.encode();
     for _ in 0..3 {
-        socket.send_to(discovery_packet, broadcast_addr).ok();
+        socket.send_to(&encoded_packet, broadcast_addr).ok();
         std::thread::sleep(Duration::from_millis(200));
     }
 
@@ -798,13 +865,11 @@ fn discover_servers_http() {
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(3) {
         if let Ok((len, addr)) = socket.recv_from(&mut buf) {
-            if len > 18 {
-                // Extract hostname from response (bytes 18-49)
-                let hostname = String::from_utf8_lossy(&buf[18..(18 + 32).min(len)])
-                    .trim_end_matches('\0')
-                    .to_string();
-                let ip = addr.ip().to_string();
-                add_discovered_server(hostname.clone(), ip.clone());
+            if let Some(decoded) = DiscoveryPacket::decode(&buf[..len]) {
+                if decoded.protocol_id == discovery_packet.protocol_id {
+                    let ip = addr.ip().to_string();
+                    add_discovered_server(decoded.hostname, ip);
+                }
             }
         }
     }

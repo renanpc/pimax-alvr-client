@@ -2664,9 +2664,8 @@ pub(crate) fn render_ahardwarebuffer_zero_copy(
         }
 
         let (frame_width, frame_height) =
-            crate::android_video_decoder::upstream_decoder_dimensions().unwrap_or_else(|| {
-                (left_target.width * 2, left_target.height)
-            });
+            crate::android_video_decoder::upstream_decoder_dimensions()
+                .unwrap_or_else(|| (left_target.width * 2, left_target.height));
 
         let get_native_client_buffer =
             get_egl_native_client_buffer().context("load eglGetNativeClientBufferANDROID")?;
@@ -2831,8 +2830,7 @@ fn blit_texture_to_eye(
         glDrawArrays(GL_TRIANGLES, 0, 3);
         let pass2_errors = drain_gl_errors();
         if !pass2_errors.is_empty() {
-            ZERO_COPY_RENDER_GL_ERROR_COUNT
-                .fetch_add(pass2_errors.len() as u64, Ordering::Relaxed);
+            ZERO_COPY_RENDER_GL_ERROR_COUNT.fetch_add(pass2_errors.len() as u64, Ordering::Relaxed);
         }
         glBindTexture(blit_program.texture_target, 0);
         if should_log_stats {

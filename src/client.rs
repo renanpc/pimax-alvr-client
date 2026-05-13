@@ -201,10 +201,9 @@ impl RuntimeVideoRecoveryState {
     }
 
     fn expire_if_timed_out(&mut self, now: Instant) {
-        if self
-            .last_started_at
-            .is_some_and(|started| now.duration_since(started) >= ALVR_RUNTIME_VIDEO_RECOVERY_TIMEOUT)
-        {
+        if self.last_started_at.is_some_and(|started| {
+            now.duration_since(started) >= ALVR_RUNTIME_VIDEO_RECOVERY_TIMEOUT
+        }) {
             self.in_flight = false;
             self.queued = false;
             self.last_started_at = None;
@@ -1492,31 +1491,18 @@ fn handle_alvr_server_control(mut stream: StdTcpStream, config: &ClientConfig) -
         .context("set ALVR control write timeout")?;
 
     info!("ALVR server connected to client control listener from {peer}");
-    let capabilities = VideoStreamingCapabilities {
-        // Match the Crystal panel resolution so ALVR negotiates the real per-eye size.
-        default_view_resolution: glam::UVec2::splat(ALVR_BUFFER_MODE_VIEW_RESOLUTION),
-        max_view_resolution: glam::UVec2::splat(ALVR_BUFFER_MODE_VIEW_RESOLUTION),
-        refresh_rates: vec![72.0, 90.0],
-        microphone_sample_rate: 48_000,
-        foveated_encoding: true,
-        encoder_high_profile: true,
-        // Match the upstream Android client so the server can negotiate HDR-capable encoding.
-        encoder_10_bits: true,
-        encoder_av1: false,
-        prefer_10bit: false,
-        preferred_encoding_gamma: 1.0,
-        prefer_hdr: true,
-        ext_str: String::new(),
-    };
-
+    if let Some(reason) = handshake_rejection_reason(config) {
+        warn!("rejecting ALVR control connection from {peer}: {reason}");
+        send_framed(&mut stream, &ClientConnectionResult::ClientStandby)
+            .context("send ALVR ClientStandby rejection")?;
+        return Ok(());
+    }
     send_framed(
         &mut stream,
-        &ClientConnectionResult::ConnectionAccepted(Box::new(ConnectionAcceptedInfo {
-            client_protocol_id: config.protocol_id().as_u64(),
-            platform_string: "Pimax Crystal OG ALVR Dev".to_string(),
-            server_ip: peer.ip(),
-            streaming_capabilities: Some(capabilities),
-        })),
+        &ClientConnectionResult::ConnectionAccepted(Box::new(build_connection_accepted_info(
+            config,
+            peer.ip(),
+        ))),
     )
     .context("send ALVR ConnectionAccepted")?;
     info!(
@@ -2006,9 +1992,8 @@ fn receive_alvr_udp_stream(
             } else {
                 warn!("failed to restart ALVR decoder bridge for native lifecycle recovery");
             }
-            diagnostics.decoder_idr_unavailable_resets = diagnostics
-                .decoder_idr_unavailable_resets
-                .wrapping_add(1);
+            diagnostics.decoder_idr_unavailable_resets =
+                diagnostics.decoder_idr_unavailable_resets.wrapping_add(1);
         }
 
         match socket.recv(&mut buffer) {
@@ -2172,13 +2157,11 @@ fn receive_alvr_udp_stream(
                             }
                         } else {
                             if packet.header.is_idr {
-                                diagnostics.decoder_idr_unavailable_resets = diagnostics
-                                    .decoder_idr_unavailable_resets
-                                    .wrapping_add(1);
+                                diagnostics.decoder_idr_unavailable_resets =
+                                    diagnostics.decoder_idr_unavailable_resets.wrapping_add(1);
                             } else {
-                                diagnostics.decoder_backpressure_resets = diagnostics
-                                    .decoder_backpressure_resets
-                                    .wrapping_add(1);
+                                diagnostics.decoder_backpressure_resets =
+                                    diagnostics.decoder_backpressure_resets.wrapping_add(1);
                             }
                             enter_waiting_for_idr(
                                 &mut waiting_for_idr,
@@ -3235,6 +3218,36 @@ struct ConnectionAcceptedInfo {
     streaming_capabilities: Option<VideoStreamingCapabilities>,
 }
 
+const CONNECTION_PLATFORM_STRING: &str = "Pimax Crystal OG";
+
+fn build_connection_accepted_info(
+    config: &ClientConfig,
+    server_ip: IpAddr,
+) -> ConnectionAcceptedInfo {
+    ConnectionAcceptedInfo {
+        client_protocol_id: config.protocol_id().as_u64(),
+        platform_string: CONNECTION_PLATFORM_STRING.to_string(),
+        server_ip,
+        streaming_capabilities: Some(build_video_streaming_capabilities()),
+    }
+}
+
+fn handshake_rejection_reason(config: &ClientConfig) -> Option<String> {
+    if config.version_string != crate::config::ALVR_PROTOCOL_VERSION {
+        return Some(format!(
+            "stale ALVR client version_string={} expected={}",
+            config.version_string,
+            crate::config::ALVR_PROTOCOL_VERSION,
+        ));
+    }
+
+    if config.client_name.trim().is_empty() {
+        return Some("client name is empty".to_string());
+    }
+
+    None
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct VideoStreamingCapabilities {
     default_view_resolution: glam::UVec2,
@@ -3249,6 +3262,26 @@ struct VideoStreamingCapabilities {
     preferred_encoding_gamma: f32,
     prefer_hdr: bool,
     ext_str: String,
+}
+
+fn build_video_streaming_capabilities() -> VideoStreamingCapabilities {
+    VideoStreamingCapabilities {
+        // Match the Crystal panel resolution so ALVR negotiates the real per-eye size.
+        default_view_resolution: glam::UVec2::splat(ALVR_BUFFER_MODE_VIEW_RESOLUTION),
+        max_view_resolution: glam::UVec2::splat(ALVR_BUFFER_MODE_VIEW_RESOLUTION),
+        refresh_rates: vec![72.0, 90.0],
+        microphone_sample_rate: 48_000,
+        foveated_encoding: true,
+        encoder_high_profile: true,
+        // Match upstream Android client behavior: advertise HDR capability, but do not
+        // prefer HDR unless the server explicitly selects it.
+        encoder_10_bits: true,
+        encoder_av1: false,
+        prefer_10bit: false,
+        preferred_encoding_gamma: 1.0,
+        prefer_hdr: false,
+        ext_str: String::new(),
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -3608,6 +3641,39 @@ mod tests {
         assert!(text.contains("pimax"));
     }
 
+    #[test]
+    fn connection_accepted_info_matches_current_parity_policy() {
+        let config = crate::config::ClientConfig::default();
+        let peer = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 44));
+        let info = build_connection_accepted_info(&config, peer);
+
+        assert_eq!(info.client_protocol_id, config.protocol_id().as_u64());
+        assert_eq!(info.platform_string, CONNECTION_PLATFORM_STRING);
+        assert_eq!(info.server_ip, peer);
+
+        let capabilities = info
+            .streaming_capabilities
+            .expect("streaming capabilities should be advertised");
+        assert_eq!(
+            capabilities.default_view_resolution,
+            glam::UVec2::splat(ALVR_BUFFER_MODE_VIEW_RESOLUTION)
+        );
+        assert_eq!(
+            capabilities.max_view_resolution,
+            glam::UVec2::splat(ALVR_BUFFER_MODE_VIEW_RESOLUTION)
+        );
+        assert_eq!(capabilities.refresh_rates, vec![72.0, 90.0]);
+        assert_eq!(capabilities.microphone_sample_rate, 48_000);
+        assert!(capabilities.foveated_encoding);
+        assert!(capabilities.encoder_high_profile);
+        assert!(capabilities.encoder_10_bits);
+        assert!(!capabilities.encoder_av1);
+        assert!(!capabilities.prefer_10bit);
+        assert_eq!(capabilities.preferred_encoding_gamma, 1.0);
+        assert!(!capabilities.prefer_hdr);
+        assert!(capabilities.ext_str.is_empty());
+    }
+
     // Regression: ALVR v20 mDNS protocol TXT record uses the major version only
     // for stable releases ("20"), and "<major>-<pre>" for prereleases. Anything
     // else and the server filters us out of discovery.
@@ -3626,6 +3692,50 @@ mod tests {
     #[test]
     fn alvr_protocol_string_unparseable_falls_back_to_input() {
         assert_eq!(alvr_protocol_string("not-a-version"), "not-a-version");
+    }
+
+    #[test]
+    fn handshake_rejection_reason_flags_stale_protocol_version() {
+        let mut config = crate::config::ClientConfig::default();
+        config.version_string = "0.0.0".to_string();
+
+        let reason = handshake_rejection_reason(&config).expect("stale version should reject");
+
+        assert!(reason.contains("stale ALVR client version_string=0.0.0"));
+        assert!(reason.contains(crate::config::ALVR_PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn handshake_rejection_reason_flags_empty_client_name() {
+        let mut config = crate::config::ClientConfig::default();
+        config.client_name = "   ".to_string();
+
+        let reason = handshake_rejection_reason(&config).expect("empty name should reject");
+
+        assert_eq!(reason, "client name is empty");
+    }
+
+    #[test]
+    fn client_connection_result_variant_indices_match_alvr_master() {
+        fn variant_index(packet: ClientConnectionResult) -> u8 {
+            let bytes = bincode::serde::encode_to_vec(&packet, bincode::config::standard())
+                .expect("serialize connection result");
+            assert!(!bytes.is_empty());
+            bytes[0]
+        }
+
+        assert_eq!(
+            variant_index(ClientConnectionResult::ConnectionAccepted(Box::new(
+                ConnectionAcceptedInfo {
+                    client_protocol_id: 1,
+                    platform_string: CONNECTION_PLATFORM_STRING.to_string(),
+                    server_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    streaming_capabilities: None,
+                },
+            ))),
+            0
+        );
+        assert_eq!(variant_index(ClientConnectionResult::ClientStandby), 1);
     }
 
     #[test]
@@ -3954,27 +4064,21 @@ mod tests {
         assert!(!state.queue_if_due(now + Duration::from_millis(500)));
         assert!(state.mark_completed(now + Duration::from_secs(1)));
         assert!(!state.queue_if_due(now + Duration::from_secs(2)));
-        assert!(state.queue_if_due(
-            now + Duration::from_secs(1) + ALVR_RUNTIME_VIDEO_RECOVERY_COOLDOWN
-        ));
+        assert!(
+            state.queue_if_due(now + Duration::from_secs(1) + ALVR_RUNTIME_VIDEO_RECOVERY_COOLDOWN)
+        );
     }
 
     #[test]
     fn runtime_video_recovery_state_expires_stale_in_flight_request() {
         let now = Instant::now();
-        let mut state = RuntimeVideoRecoveryState::with_times(
-            false,
-            true,
-            Some(now),
-            Some(now),
-            None,
-        );
+        let mut state =
+            RuntimeVideoRecoveryState::with_times(false, true, Some(now), Some(now), None);
 
-        assert!(state.queue_if_due(
-            now + ALVR_RUNTIME_VIDEO_RECOVERY_TIMEOUT + Duration::from_millis(1)
-        ));
-        assert!(state.take_queued(
-            now + ALVR_RUNTIME_VIDEO_RECOVERY_TIMEOUT + Duration::from_millis(1)
-        ));
+        assert!(state
+            .queue_if_due(now + ALVR_RUNTIME_VIDEO_RECOVERY_TIMEOUT + Duration::from_millis(1)));
+        assert!(
+            state.take_queued(now + ALVR_RUNTIME_VIDEO_RECOVERY_TIMEOUT + Duration::from_millis(1))
+        );
     }
 }
